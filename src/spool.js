@@ -29,18 +29,18 @@ function serialize(event) {
   const size = () => Buffer.byteLength(JSON.stringify(event) + '\n');
   // Reserved metadata is added here, so enforce the envelope cap again.
   while (size() > 32768 && event.detail) {
-    const lines = event.detail.split('\n');
-    const marker = /^\[errmeter: truncated to last \d+ lines\]$/.test(lines[0]);
-    if (lines.length > (marker ? 2 : 1)) {
-      lines.splice(marker ? 1 : 0, 1);
-      event.detail = lines.join('\n');
-    } else if (marker && lines.length > 1) {
-      const chars = Array.from(lines[1]);
-      chars.shift();
-      event.detail = lines[0] + '\n' + chars.join('');
+    const lines = event.detail.split(/\r\n|\r|\n/);
+    if (/^\[errmeter: truncated to last \d+ lines\]$/.test(lines[0])) lines.shift();
+    if (lines.at(-1) === '') lines.pop();
+    if (lines.length > 1) lines.shift();
+    else if (lines.length) {
+      lines[0] = Array.from(lines[0]).slice(1).join('');
+      if (!lines[0]) lines.pop();
     } else {
-      event.detail = Array.from(event.detail).slice(1).join('');
+      event.detail = '';
+      continue;
     }
+    event.detail = `[errmeter: truncated to last ${lines.length} lines]\n` + lines.join('\n');
   }
   if (event.meta) {
     for (const key of Object.keys(event.meta)) {
@@ -98,6 +98,7 @@ function exists(io, file) {
 
 function counterLine(event) {
   const heartbeat = event.kind === 'heartbeat';
+  // Heartbeat overflow uses '-' for fingerprint and 0 for fpv as sentinels.
   const prefix = [heartbeat ? '-' : event.fingerprint, heartbeat ? 0 : event.fpv,
     event.agent, event.host, event.ts].join('\t') + '\t';
   const budget = 320 - Buffer.byteLength(prefix) - 1;
@@ -152,6 +153,8 @@ function writeAt(home, event, limits, io) {
   const count = entries.filter(name => name.endsWith('.json') && name !== 'overflow-exceeded.json').length;
   if (count >= limits.pending_hard_limit) {
     if (event.kind === 'heartbeat') {
+      // Literal agent names cannot form filenames for watcher/<id> agents.
+      // Flush (#4) must decode the percent-encoded agent and host components.
       const name = 'heartbeat-' + encodeURIComponent(event.agent) + '@' + encodeURIComponent(event.host) + '.json';
       const destination = path.join(pending, name);
       const heartbeats = entries.filter(entry => entry.startsWith('heartbeat-') && entry.endsWith('.json')).length;

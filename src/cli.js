@@ -1,7 +1,8 @@
 'use strict';
 
 const USAGE = 'Usage: errmeter <emit|flush> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
-  'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n';
+  'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n' +
+  'Values starting with -- must be passed as --flag=value.\n';
 class UsageError extends Error {}
 function parse(argv) {
   const result = { kind: 'error', meta: Object.create(null) };

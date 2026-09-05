@@ -19,8 +19,10 @@ function resolveConfig(flags = {}, env = process.env) {
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) config = parsed;
   } catch (_) { /* Emit works without a usable configuration. */ }
+  let warning;
   if (typeof config.schema === 'number' && config.schema > 1) {
-    throw new ConfigError('emit: unsupported config schema');
+    warning = `emit: config schema ${config.schema} not supported, using defaults`;
+    config = {};
   }
   const extra = config.spool && typeof config.spool === 'object' && !Array.isArray(config.spool) ? config.spool : {};
   const spool = { ...extra, ...DEFAULTS };
@@ -28,6 +30,6 @@ function resolveConfig(flags = {}, env = process.env) {
     const value = config.spool?.[key];
     if (Number.isSafeInteger(value) && value >= 0) spool[key] = value;
   }
-  return { home, configPath, config: { ...config, spool } };
+  return { home, configPath, warning, config: { ...config, spool } };
 }
 module.exports = { DEFAULTS, resolveConfig, ConfigError };

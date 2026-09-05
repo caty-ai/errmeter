@@ -38,7 +38,7 @@ test('mask list reads nested credential files, lines and sensitive environment n
 test('literal masks use longest-first matching and PEM wins over its masked body', () => {
   assert.equal(redact('abcdefgh123 abcdefgh123', ['abcdefgh', 'abcdefgh123', 'short']), '[REDACTED] [REDACTED]');
   assert.equal(redact(['-----BEGIN', 'PRIVATE KEY-----\nabcdefgh123\n-----END', 'PRIVATE KEY-----'].join(' '), ['abcdefgh123']), '[REDACTED PEM]');
-  assert.equal(redact('token=' + 'ghp_' + 'abcdefghijklmnopqrstuvwxyz' + ' Authorization: Bearer ' + 'ghp_' + 'abcdefghijklmnopqrstuvwxyz'), 'token=[REDACTED TOKEN] Authorization: [REDACTED]');
+  assert.equal(redact('token=' + 'ghp_' + 'abcdefghijklmnopqrstuvwxyz' + ' Authorization: Bearer ' + 'ghp_' + 'abcdefghijklmnopqrstuvwxyz'), 'token=[REDACTED]');
 });
 test('all known token families are redacted', () => {
   const tokens = ['ghp_' + 'a'.repeat(20), 'github_pat_' + 'a'.repeat(20), ...'ousr'.split('').map(c => 'gh' + c + '_' + 'a'.repeat(20)), 'sk-' + 'a'.repeat(16), ...'abprs'.split('').map(c => 'xox' + c + '-' + 'a'.repeat(10)), 'AKIA' + 'A'.repeat(16), 'AIza' + 'a'.repeat(35), '123456789:AA' + 'a'.repeat(30), 'https://hooks.slack.com/services/A/B/C', 'https://discord.com/api/webhooks/abc/xyz', 'https://discordapp.com/api/webhooks/abc/xyz'];
@@ -50,4 +50,26 @@ test('tail keeps final lines and marker, treating terminal newline as line endin
   assert.deepEqual(tailLines('one\r\ntwo\r\nthree\r\n', 2), { text: '[errmeter: truncated to last 2 lines]\ntwo\r\nthree\r\n', truncated: true });
   assert.deepEqual(tailLines('', 2), { text: '', truncated: false });
   assert.deepEqual(tailLines('one', 0), { text: '[errmeter: truncated to last 0 lines]\n', truncated: true });
+});
+
+test('value boundaries preserve quotes, query extent and ordinary lines', () => {
+  const cases = [
+    ['token=abc status=200', 'token=[REDACTED]'],
+    ['a=1; token=xyz; b=2', 'a=1; token=[REDACTED]; b=2'],
+    ['status: 200 ok', 'status: 200 ok'],
+    ['status: 200 token=abc def', 'status: 200 token=[REDACTED]'],
+    ['password: "abc def, ghi" status: 200', 'password: "[REDACTED]" status: 200'],
+    ["key: 'safe'; password: 'abc def, ghi'", "key: 'safe'; password: '[REDACTED]'"],
+    ['password="Bearer abc def"', 'password="[REDACTED]"'],
+    ['password="abc \' def"', 'password="[REDACTED]"'],
+    ['password="abc\nstatus: 200 ok', 'password="[REDACTED]\nstatus: 200 ok'],
+    ['Bearer abc def, status=200; ok', 'Bearer [REDACTED], status=200; ok'],
+    ['?token=abc#fragment status: 200 ok', '?token=[REDACTED]#fragment status: 200 ok'],
+    ['?token=abc&safe=ok status: 200 ok', '?token=[REDACTED]&safe=ok status: 200 ok'],
+    ['password: abc def\r\nstatus: 200 ok', 'password: [REDACTED]\r\nstatus: 200 ok'],
+    ['https://user:p@ss@host/x', 'https://[REDACTED]@host/x'],
+    ['https://user:p@ss@host?x=@safe', 'https://[REDACTED]@host?x=@safe'],
+    ['https://user:p@ss@host#@safe', 'https://[REDACTED]@host#@safe']
+  ];
+  for (const [input, expected] of cases) assert.equal(redact(input), expected, input);
 });

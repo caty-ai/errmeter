@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const childProcess = require('node:child_process');
 const { parse, UsageError, USAGE } = require('./cli');
 const { resolveConfig, ConfigError } = require('./config');
-const { redact, buildMaskList, tailLines } = require('./redact');
+const { redact, buildMaskList, tailLines, sensitiveKey } = require('./redact');
 const { fingerprint, FPV } = require('./fingerprint');
 const spool = require('./spool');
 const version = require('../package.json').version;
@@ -36,17 +36,17 @@ function capDetail(text, maxBytes, tail) {
   const remaining = maxBytes - Buffer.byteLength(marker) - 1;
   return remaining < 0 ? marker : marker + '\n' + suffixBytes(body, remaining);
 }
-function fitEvent(event, tail) {
+function fitEvent(event) {
   // Reserve room for both spool-owned metadata entries and their JSON punctuation.
   const limit = 32768 - 64;
   const size = () => Buffer.byteLength(JSON.stringify(event) + '\n');
   if (size() > limit && event.detail) {
-    const marker = `[errmeter: truncated to last ${tail} lines]`;
-    let lines = event.detail.split('\n');
-    if (lines[0] === marker) lines.shift();
+    let lines = event.detail.split(/\r\n|\r|\n/);
+    if (/^\[errmeter: truncated to last \d+ lines\]$/.test(lines[0])) lines.shift();
+    if (lines.at(-1) === '') lines.pop();
     while (size() > limit && lines.length) {
       lines.shift();
-      event.detail = lines.length ? marker + '\n' + lines.join('\n') : '';
+      event.detail = `[errmeter: truncated to last ${lines.length} lines]\n` + lines.join('\n');
     }
   }
   while (size() > limit) {
@@ -74,10 +74,11 @@ function emit(argv, env = process.env, io = {}) {
       if (!flags.quiet) write(stdout, flags.version ? version + '\n' : USAGE);
       return 0;
     }
-    const { home, configPath, config } = resolveConfig(flags, env);
+    const { home, configPath, config, warning } = resolveConfig(flags, env);
+    if (warning) diagnose(warning);
     const masks = buildMaskList(config, env);
     const clean = value => redact(String(value), masks);
-    const identity = (value, allowed) => clean(value).toLowerCase().replace(allowed, '-').slice(0, 64) || 'unknown';
+    const identity = (value, allowed) => prefix(clean(value).toLowerCase().replace(allowed, '-'), 64) || 'unknown';
     const agent = identity(flags.agent ?? env.ERRMETER_AGENT ?? config.agent ?? 'unknown', /[^a-z0-9._/-]/g);
     const host = identity(config.host ?? os.hostname().split('.')[0], /[^a-z0-9._-]/g);
     const event = {
@@ -85,13 +86,13 @@ function emit(argv, env = process.env, io = {}) {
       agent, host, message: prefix(clean(flags.message ?? '').replace(/[\r\n]+/g, ' '), 500),
       emitter: 'errmeter/' + version, attempts: 0
     };
-    if (typeof config.family === 'string' && config.family.length <= 64) event.family = prefix(clean(config.family), 64);
-    if (flags.task !== undefined) {
-      const task = clean(flags.task);
-      if (task.length <= 200) event.task = task;
-    }
+    if (typeof config.family === 'string') event.family = prefix(clean(config.family), 64);
+    if (flags.task !== undefined) event.task = prefix(clean(flags.task), 200);
     const meta = Object.create(null);
-    for (const key of Object.keys(flags.meta)) meta[key] = prefix(clean(flags.meta[key]), 256);
+    for (const key of Object.keys(flags.meta)) {
+      const value = clean(flags.meta[key]);
+      meta[key] = sensitiveKey.test(key) ? '[REDACTED]' : prefix(value, 256);
+    }
     if (Object.keys(meta).length) event.meta = meta;
     const tail = flags.tail ?? config.spool.tail_lines;
     if (event.kind === 'error') {
@@ -104,7 +105,7 @@ function emit(argv, env = process.env, io = {}) {
       } catch (_) { diagnose('emit: unable to read detail'); }
       if (detail !== undefined) event.detail = capDetail(tailLines(clean(detail), tail).text, config.spool.detail_max_bytes, tail);
     }
-    fitEvent(event, tail);
+    fitEvent(event);
     let result;
     try {
       result = (io.writeEvent ?? spool.writeEvent)(home, event, { spool: config.spool, stderr: diagnose });

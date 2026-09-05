@@ -29,7 +29,7 @@ function events(home) {
 test('event and JSON summary contain redacted schema fields and normative fingerprint', t => {
   const home = workspace(t, { host: 'My-Host', family: 'family', agent: 'config' });
   const secret = 'credential-value-123';
-  const result = run(home, ['--agent=Nora', '--message', secret + '\r\nfailed ghp_abcdefghijklmnopqrstuvwxyz0123', '--task=task', '--meta=run_id=abc', '--no-flush', '--json'], {}, { APP_PASSWORD: secret });
+  const result = run(home, ['--agent=Nora', '--message', secret + '\r\nfailed ' + 'ghp_' + 'abcdefghijklmnopqrstuvwxyz0123', '--task=task', '--meta=run_id=abc', '--no-flush', '--json'], {}, { APP_PASSWORD: secret });
   assert.equal(result.code, 0); assert.equal(result.stderr, '');
   const output = JSON.parse(result.stdout); const { event, name } = events(home)[0];
   assert.equal(output.agent, 'nora'); assert.equal(event.host, 'my-host'); assert.equal(event.family, 'family');
@@ -46,7 +46,7 @@ test('identity precedence, sanitization, optional limits and metadata limits', t
   const event = events(home)[0].event;
   assert.equal(event.agent, 'env-a/'); assert.equal(event.host, 'host---');
   assert.equal(event.message.length, 500); assert.equal(event.meta.a.length, 256);
-  assert.equal(event.task, undefined); assert.equal(event.family, undefined);
+  assert.equal(event.task, 't'.repeat(200)); assert.equal(event.family, 'f'.repeat(64));
 });
 test('detail redaction precedes tail; stdin and byte cap preserve UTF-8 and marker', t => {
   const home = workspace(t, { spool: { tail_lines: 2, detail_max_bytes: 100 } });
@@ -62,7 +62,7 @@ test('whole serialized event cap includes newline and highly escaped metadata', 
   run(home, args, { readStdin: () => ('\u0000'.repeat(2000) + '\n').repeat(100) });
   const { name, event } = events(home)[0];
   assert.ok(fs.statSync(path.join(home, 'spool/pending', name)).size <= 32768);
-  assert.equal(event.detail, '[errmeter: truncated to last 500 lines]\n');
+  assert.equal(event.detail, '[errmeter: truncated to last 0 lines]\n');
 });
 test('heartbeat omits error fields and detail, role only caller supplied', t => {
   const home = workspace(t);
@@ -114,11 +114,14 @@ test('every configured credential file remains available to masking, including s
   const result = run(home, ['--message=' + secret, '--no-flush']);
   assert.equal(result.code, 0); assert.equal(events(home)[0].event.message, '[REDACTED]');
 });
-test('higher configuration schema is refused clearly without breaking the hook', t => {
-  const home = workspace(t, { schema: 2 });
+test('higher configuration schema warns and writes the event using defaults', t => {
+  const home = workspace(t, { schema: 2, agent: 'ignored', family: 'ignored', spool: { pending_hard_limit: 0 } });
   const result = run(home, ['--message=x', '--no-flush']);
-  assert.equal(result.code, 0); assert.equal(result.stderr, 'emit: unsupported config schema\n');
-  assert.equal(fs.existsSync(path.join(home, 'spool')), false);
+  assert.equal(result.code, 0); assert.equal(result.stderr, 'emit: config schema 2 not supported, using defaults\n');
+  const event = events(home)[0].event;
+  assert.equal(event.message, 'x'); assert.equal(event.agent, 'unknown');
+  assert.equal(event.family, undefined);
+  assert.match(result.stdout, /^emit normal /);
 });
 test('configured small limits reach compact, counter, and dropped through emit', t => {
   const home = workspace(t, { spool: { pending_soft_limit: 0, pending_hard_limit: 1, overflow_max_bytes: 1, overflow_guard_bytes: 1000 } });
@@ -127,4 +130,46 @@ test('configured small limits reach compact, counter, and dropped through emit',
   const third = JSON.parse(run(home, ['--message=x', '--no-flush', '--json']).stdout);
   assert.equal(first.mode, 'compact'); assert.equal(second.mode, 'counter'); assert.equal(third.mode, 'dropped');
   assert.equal(events(home).find(item => item.event.kind === 'error').event.meta._compact, '1');
+});
+
+test('sensitive metadata keys mask values while ordinary keys stay intact', t => {
+  const home = workspace(t);
+  run(home, ['--message=x', '--meta=api_key=zzz.secret-1234', '--meta=run_id=abc', '--no-flush']);
+  assert.deepEqual(events(home)[0].event.meta, { api_key: '[REDACTED]', run_id: 'abc' });
+});
+test('family and task redact before truncating on surrogate boundaries', t => {
+  const secret = 'private.' + 'x'.repeat(100);
+  const home = workspace(t, { family: secret });
+  run(home, ['--message=x', '--task=' + 't'.repeat(199) + '😀tail', '--no-flush'], {}, { PASSWORD: secret });
+  const event = events(home)[0].event;
+  assert.equal(event.family, '[REDACTED]'); assert.equal(event.task, 't'.repeat(199));
+});
+test('envelope shrink marks the surviving detail count even below tail_lines', t => {
+  const home = workspace(t, { spool: { tail_lines: 40, detail_max_bytes: 100000 } });
+  run(home, ['--message=x', '--detail=-', '--no-flush'], {
+    readStdin: () => Array.from({ length: 20 }, (_, i) => i + ':' + 'x'.repeat(2000)).join('\n')
+  });
+  const { name, event } = events(home)[0];
+  const [marker, ...lines] = event.detail.split('\n');
+  assert.ok(lines.length > 0 && lines.length < 20);
+  assert.equal(marker, `[errmeter: truncated to last ${lines.length} lines]`);
+  assert.ok(fs.statSync(path.join(home, 'spool/pending', name)).size <= 32768);
+});
+
+test('multi-word secrets are fully masked in spooled message, task and detail', t => {
+  const cases = [
+    ['password: correct horse battery staple', 'password: [REDACTED]'],
+    ['{"api_key": "abc def"}', '{"api_key": "[REDACTED]"}'],
+    ['Authorization: Bearer abc def', 'Authorization: [REDACTED]'],
+    ['session: started at 10:00', 'session: [REDACTED]'],
+    ["password: 'abc def, ghi'", "password: '[REDACTED]'"],
+    ['password="abc def"', 'password="[REDACTED]"']
+  ];
+  for (const [input, expected] of cases) {
+    const home = workspace(t);
+    run(home, ['--message=' + input, '--task=' + input, '--detail=-', '--no-flush'], { readStdin: () => input + '\nstatus: 200 ok' });
+    const event = events(home)[0].event;
+    assert.equal(event.message, expected); assert.equal(event.task, expected);
+    assert.equal(event.detail, expected + '\nstatus: 200 ok');
+  }
 });

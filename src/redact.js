@@ -44,13 +44,22 @@ function redact(text, maskList = []) {
     .sort((a, b) => b.length - a.length || a.localeCompare(b));
   for (const mask of masks) result = result.split(mask).join('[REDACTED]');
   result = result.replace(/ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gh[ousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+|https:\/\/discord(app)?\.com\/api\/webhooks\/[^\s]+/g, '[REDACTED TOKEN]');
-  result = result.replace(new RegExp('\\bAuthorization:[ \\t]*(?:' + marker + '|[^\\s]+[ \\t]+(?:' + marker + '|[^\\s,;]+))', 'gi'), 'Authorization: [REDACTED]');
-  result = result.replace(new RegExp('\\bBearer[ \\t]+(?:' + marker + '|[^\\s,;]+)', 'gi'), 'Bearer [REDACTED]');
-  result = result.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, '$1[REDACTED]@');
-  result = result.replace(new RegExp('([?&])([^\\s=&?#]+)=(' + marker + '|[^\\s&#"\']*)', 'g'), (all, separator, key, value) =>
-    sensitiveKey.test(key) ? separator + key + '=[REDACTED]' : all);
-  result = result.replace(new RegExp('(["\']?)([A-Za-z0-9_.-]+)\\1([ \\t]*[:=][ \\t]*)(["\']?)(' + marker + '|[^\\s&,;"\']+)', 'g'), (all, quote, key, separator, valueQuote, value) =>
-    sensitiveKey.test(key) ? quote + key + quote + separator + valueQuote + ( /^\[REDACTED(?: PEM| TOKEN)?\]$/.test(value) ? value : '[REDACTED]') : all);
+  result = result.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]*@/gi, '$1[REDACTED]@');
+  // Match query parameters first so rule 4 cannot expand their single-token extent.
+  // Only sensitive ordinary keys consume a value; safe keys cannot hide later secrets.
+  const values = /"(?:\\[^\r\n]|[^"\\\r\n])*(?:"|(?=\r|\n|$))|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|(?=\r|\n|$))|[^\r\n&;]*/.source;
+  const pairs = new RegExp('([?&])([^\\s=&?#]+)=(' + marker + '|[^\\s&#"\']*)|' +
+    '(["\']?)((?=[A-Za-z0-9_.-]*' + sensitiveKey.source + ')[A-Za-z0-9_.-]+)\\4([ \\t]*[:=][ \\t]*)(' + values + ')', 'gi');
+  result = result.replace(pairs, (all, query, queryKey, queryValue, quote, key, sensitive, separator, value) => {
+    if (query) return sensitiveKey.test(queryKey) ? query + queryKey + '=[REDACTED]' : all;
+    const valueQuote = /^["']/.test(value) ? value[0] : '';
+    const closed = valueQuote && value.length > 1 && value.endsWith(valueQuote);
+    const body = valueQuote ? value.slice(1, closed ? -1 : undefined) : value;
+    const replacement = /^\[REDACTED(?: PEM| TOKEN)?\]$/.test(body) ? body : '[REDACTED]';
+    return quote + key + quote + separator + valueQuote + replacement + (closed ? valueQuote : '');
+  });
+  result = result.replace(/\bAuthorization:[ \t]*[^\r\n]*/gi, 'Authorization: [REDACTED]');
+  result = result.replace(/\bBearer[ \t]+[^\r\n,;]*/gi, 'Bearer [REDACTED]');
   const home = os.homedir();
   if (home) result = result.split(home).join('~');
   return result.replace(/%USERPROFILE%/g, '~');
@@ -66,4 +75,4 @@ function tailLines(text, n) {
   return { text: `[errmeter: truncated to last ${n} lines]\n` + tail, truncated: true };
 }
 
-module.exports = { buildMaskList, redact, tailLines };
+module.exports = { buildMaskList, redact, tailLines, sensitiveKey };

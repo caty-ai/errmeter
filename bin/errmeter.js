@@ -1,9 +1,9 @@
 #!/usr/bin/env node
+'use strict';
 if (Number(process.versions.node.split('.')[0]) < 18) {
   process.stderr.write('errmeter: Node.js 18 or newer is required\n');
   process.exit(2);
 }
-'use strict';
 const command = process.argv[2];
 if (command === 'emit') {
   require('../src/emit').main(process.argv.slice(3));

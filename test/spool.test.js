@@ -208,6 +208,18 @@ test('serialized event remains at most 32 KiB after fallback metadata is added',
   const result = writeEvent(home, original, { tmpdir: root });
   assert.equal(result.ok, true);
   assert.ok(fs.statSync(result.path).size <= 32768);
-  assert.ok(read(result).detail.startsWith('[errmeter: truncated to last 40 lines]\n'));
+  assert.ok(read(result).detail.startsWith('[errmeter: truncated to last 1 lines]\n'));
   assert.equal(read(result).meta._spool_fallback, '1');
+});
+
+test('spool envelope shrink adds or updates the actual surviving line count', t => {
+  const home = temporary(t);
+  for (const leading of ['', '[errmeter: truncated to last 40 lines]\n']) {
+    const result = writeEvent(home, event({ detail: leading + ('x'.repeat(2000) + '\n').repeat(20) }));
+    assert.equal(result.ok, true);
+    const [marker, ...lines] = read(result).detail.split('\n');
+    assert.ok(lines.length > 0 && lines.length < 20);
+    assert.equal(marker, `[errmeter: truncated to last ${lines.length} lines]`);
+    assert.ok(fs.statSync(result.path).size <= 32768);
+  }
 });
