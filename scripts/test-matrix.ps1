@@ -90,10 +90,12 @@ try {
         $bashCommand = Get-Command bash -CommandType Application -ErrorAction SilentlyContinue
     }
     if ($null -eq $bashCommand) { throw 'Git Bash is required for check-node18.sh; add bash.exe to PATH.' }
-    $bashPlatform = Invoke-Captured $bashCommand.Source @('-lc', 'uname -s')
-    $bashSystem = ($bashPlatform.Output -join "`n").Trim()
-    if ($bashPlatform.Code -ne 0 -or $bashSystem -notmatch '^(MINGW|MSYS)') {
-        throw "Resolved bash is not Git Bash (uname -s: $bashSystem); WSL bash is the likely cause."
+    $bashPlatform = Invoke-Captured $bashCommand.Source @('-c', 'uname -s')
+    $isGitBash = @($bashPlatform.Output | Where-Object { $_.Trim() -match '^(MINGW|MSYS)' }).Count -gt 0
+    $bashSystem = (($bashPlatform.Output -join ' ') -replace '[\r\n]+', ' ').Trim()
+    if ($bashSystem.Length -gt 200) { $bashSystem = $bashSystem.Substring(0, 200) }
+    if ($bashPlatform.Code -ne 0 -or -not $isGitBash) {
+        throw "Resolved bash is not Git Bash (uname -s: $bashSystem); WSL or Cygwin bash is the likely cause."
     }
     # Hard-code the contract glob invocation, not package.json scripts (another
     # lane owns them). Expand explicitly: PowerShell passes wildcards literally,
@@ -179,12 +181,12 @@ try {
         $result = 'FAIL'
         $counts = '-'
         if (Test-Path $nodePath -PathType Leaf) {
+            # Keep the LAST resolved Node for the static check, matching
+            # the .sh script (which reassigns `runtime` every iteration).
+            $staticNode = $nodePath
             $env:PATH = (Split-Path -Parent $nodePath) + [IO.Path]::PathSeparator + $originalPath
             $actual = Invoke-Captured $nodePath @('--version')
             if ($actual.Code -eq 0 -and ($actual.Output -join '').Trim() -eq "v$release") {
-                # Keep the LAST resolved Node for the static check, matching
-                # the .sh script (which reassigns `runtime` every iteration).
-                $staticNode = $nodePath
                 $run = Invoke-Captured $nodePath (@('--test') + $testFiles)
                 $total = Get-Count $run.Output 'tests'
                 $pass = Get-Count $run.Output 'pass'
