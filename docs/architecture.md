@@ -1,6 +1,6 @@
 # errmeter architecture (v1)
 
-Status: **frozen candidate v1.4** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
+Status: **frozen candidate v1.5** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
 
 ## 1. The one drawing
 
