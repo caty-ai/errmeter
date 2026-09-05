@@ -1,6 +1,6 @@
 # errmeter architecture (v1)
 
-Status: **frozen candidate v1.3** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
+Status: **frozen candidate v1.4** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
 
 ## 1. The one drawing
 
@@ -115,7 +115,7 @@ One `setTimeout` loop, one tick every `interval_sec`. Two roles, same process, s
 | **Two hosts create the same fingerprint at once** | Both Issues exist briefly; the next flush that lists them closes the higher number as `duplicate-of` and caches the lower. | Two long-lived Issues for one problem. |
 | **All watchers down** | Watcher heartbeat markers stop advancing. Every flush (any host, either role) runs the dead-man check (§6). The alert is board-first with a single winner, so N hosts → 1 notification per `renotify_sec`. The alert Issue also @mentions the owner (GitHub notification, no secret needed). | Alert storms. False alert when the family has *no* watcher records yet (empty set → no alert; `status` reports "no watcher known"). |
 | **Whole family dead** (no host runs any loop or emits) | Nothing. Accepted limit X-3; heartbeat Issues have stable titles for an external pinger. | — |
-| **Spool grows (storm / long outage)** | Compact mode above the soft limit, counter mode at the hard limit (contract §3.3). Board writes bounded by grouping + `max_comments_per_issue_per_hour` (shared via marker timestamps). | Disk full (bounded by `hard_limit × 32 KiB`). Eviction of unsent events. Rate-limit lockout (per-pass budget). |
+| **Spool grows (storm / long outage)** | Compact mode above the soft limit, counter mode at the hard limit (contract §3.3). Board writes bounded by grouping + `max_comments_per_issue_per_hour` (shared via marker timestamps). | Disk full (bounded by `hard_limit × 32 KiB` + `overflow_max_bytes`; beyond the ceiling counts are dropped and an alert says so — the one documented loss boundary). Silent eviction of unsent events. Rate-limit lockout (per-pass budget). |
 | **Dispatch hook hangs / dies** | Killed at `timeout_sec` or at the lease fence; outcome `dispatch-failed`. After `escalate_after` consecutive failures → `needs-human` + one owner alert. | Infinite retries. Two hooks on one Issue (fence + `timeout ≤ ttl − grace`). |
 | **Watcher dies mid-dispatch** | The runner kills the hook at the absolute deadline `expires − grace`. The claim expires at `expires`; another watcher takes over. Worst case: a gap of `claim_ttl_sec`, never an overlap. On restart the watcher kills any pid recorded in `state/dispatch/`. | Overlap. Stuck Issue. |
 | **Repeated failed repairs** | Consecutive `dispatch-failed` outcomes are counted across occurrences (only a `repaired` outcome resets them); at `escalate_after` the Issue gets `needs-human` and the owner is alerted once. | An Issue that fails forever without paging anyone. |
