@@ -117,7 +117,7 @@ function emit(argv, env = process.env, io = {}) {
     if (result.ok && !flags['no-flush']) {
       try {
         const child = (io.spawn ?? childProcess.spawn)(process.execPath,
-          [path.resolve(__dirname, '../bin/errmeter.js'), 'flush', '--home', home, '--config', configPath],
+          [path.resolve(__dirname, '../bin/errmeter.js'), 'flush', '--home', home, '--config', configPath, '--linger'],
           { detached: process.platform !== 'win32', stdio: 'ignore', windowsHide: true });
         if (child.on) child.on('error', () => {});
         child.unref();
