@@ -1,6 +1,6 @@
 # errmeter contract (v1) — FROZEN INTERFACES
 
-Status: **freeze candidate v1.1** for issue #2 (v1.0 → v1.1: round-1 five-seat review, all findings folded in; see the changelog at the end). Once the owner approves, every section marked **[frozen]** may change only through a new contract issue that bumps the relevant version field. Sections marked **[default]** are tunable defaults that implementations MUST honour but families MAY override in config.
+Status: **freeze candidate v1.2** for issue #2 (v1.0 → v1.1 → v1.2: two review rounds folded in; see the changelog at the end). Once the owner approves, every section marked **[frozen]** may change only through a new contract issue that bumps the relevant version field. Sections marked **[default]** are tunable defaults that implementations MUST honour but families MAY override in config.
 
 Companions: [requirements.md](requirements.md), [architecture.md](architecture.md). Requirement ids (`R-*`, `N-*`) and decision ids (`D-*`) refer to those files.
 
@@ -125,18 +125,19 @@ Home: `ERRMETER_HOME` → else `path.join(os.homedir(), ".errmeter")`. Same on m
 ### 3.2 Flush lock (single-flight per home)
 
 - Acquire: `open(flush.lock, "wx")` and write `{ "pid", "nonce", "ts", "host" }`. Failure = someone holds it → exit 0 silently (emit-spawned) or return "busy" (`flush` command, exit 1).
-- Refresh: the holder rewrites `ts` every `lock_refresh_sec` (30) while working. The holder MUST NOT sleep longer than `lock_refresh_sec` inside one pass; backoff waits longer than that are done by **exiting** and leaving events pending (§5.1 backoff is remembered in `state/last_flush.json`, not slept in-process).
+- Refresh: the holder rewrites `ts` every `lock_refresh_sec` (30) while alive.
+- **Linger** (autonomous retry without a loop): when a pass ends with events still pending because of a transport failure, an **emit-spawned** flush does not exit; it keeps the lock, sleeps the current backoff (refreshing the lock every 30 s), re-lists `pending/` and retries, until either nothing is pending or `flush_linger_sec` (3600) has elapsed since it started, then exits. A one-shot agent on a laptop therefore gets up to an hour of automatic retry after the network returns, with no daemon. Loop-driven and manual flushes do not linger (they exit and rely on the next tick). Backoff longer than `flush_linger_sec` is remembered in `state/last_flush.json`, not slept.
 - Steal: a lock whose `ts` is older than `lock_stale_sec` (600) MAY be stolen **only** by `rename(flush.lock, flush.lock.stale-<my nonce>)` followed by a fresh `wx` create. The rename is atomic; a second stealer's rename fails with `ENOENT` and it exits. Never `unlink` then create.
 
 ### 3.3 Capacity: nothing unacknowledged is ever evicted
 
 - Below `pending_soft_limit` (5000 files): normal.
 - Between soft and hard limit: **compact mode** — emit writes events with empty `detail` and `meta._compact = "1"`. Content is reduced, every event still exists.
-- At or above `pending_hard_limit` (20000 files): **counter mode** — emit does not create a new event file; it upserts `pending/<fingerprint>.count.json` (increment `count`, update `last_ts`; write via tmp+rename of the counter file; a lost increment under a concurrent race is accepted). Heartbeats in counter mode are still written as files (they are coalesced by flush and are ≤ 1 per agent per pass).
-- flush delivers a counter as one occurrence comment with `count` and `first/last`, then deletes it. **No pending file is ever moved to `dead/` for capacity reasons.** Disk bound = `pending_hard_limit × 32 KiB` ≈ 640 MB worst case, in practice far lower because compact mode starts at the soft limit.
+- At or above `pending_hard_limit` (20000 files): **counter mode** — emit does not create a new event file; it upserts `pending/<fingerprint>.count.json` under an exclusive lock `pending/<fingerprint>.count.lock` (`wx`, retried for up to 200 ms). If the lock cannot be taken in time, emit falls back to writing a **compact event file** instead, so **no occurrence is ever lost to a race**. Heartbeats in counter mode are upserted into `pending/heartbeat-<agent>@<host>.json` (one file per agent, overwritten via tmp+rename) instead of new files, so the file count stays bounded.
+- flush delivers a counter as one occurrence comment carrying `counter_first=<first_ts>` in the marker, then deletes the counter file. Crash recovery: a counter whose `first_ts` already appears as `counter_first=` on the Issue is deleted without a new write (counter idempotency key). **No pending file is ever moved to `dead/` for capacity reasons.** Disk bound = `pending_hard_limit × 32 KiB` ≈ 640 MB worst case, in practice far lower because compact mode starts at the soft limit.
 - Requirements wording that follows from this: "nothing lost" means *no event below the hard limit is lost; above it, content is folded into counts* (R-F2, §6 of requirements.md).
 
-Limits [default]: `detail_max_bytes` 8192 · `tail_lines` 40 · `pending_soft_limit` 5000 · `pending_hard_limit` 20000 · `sent_retention_days` 7 · `dead_retention_days` 30 · `lock_refresh_sec` 30 · `lock_stale_sec` 600 · `max_events_per_pass` 500.
+Limits [default]: `detail_max_bytes` 8192 · `tail_lines` 40 · `pending_soft_limit` 5000 · `pending_hard_limit` 20000 · `sent_retention_days` 7 · `dead_retention_days` 30 · `lock_refresh_sec` 30 · `lock_stale_sec` 600 · `flush_linger_sec` 3600 · `max_events_per_pass` 500.
 
 ---
 
@@ -144,7 +145,7 @@ Limits [default]: `detail_max_bytes` 8192 · `tail_lines` 40 · `pending_soft_li
 
 The redactor is one pure function `redact(text, maskList) → text`. It is applied to **every string that leaves the machine or is written by errmeter**: at emit (`task`, `message`, `detail`, `meta` values → spool), at flush (same fields again before egress), by watch to **hook stdout/stderr excerpts and outcome summaries** before `writeOutcome`, to alert bodies, and to every line of `errmeter.log`.
 
-Mask list construction: at process start each command reads the secret files it *can* read (board token, notify secrets — read-only, never sent by emit) and adds their contents to the mask list; if a file is unreadable the mask list simply lacks it. emit therefore masks the board token in the spool whenever the token file is readable by the emitting user (the common case: same user, same home). Env values are added for env var names matching rule 4.
+Mask list construction: at process start each command reads the secret files it *can* read (board token, notify secrets, and **every `*_file` credential named in config**, including the webhook sink's `headers_file` — read-only, never sent by emit) and adds their contents to the mask list; if a file is unreadable the mask list simply lacks it. emit therefore masks the board token in the spool whenever the token file is readable by the emitting user (the common case: same user, same home). Env values are added for env var names matching rule 4.
 
 | # | rule | replacement |
 |---|---|---|
@@ -192,7 +193,9 @@ HeartbeatRecord = { ref, agent, host, role: "watcher"|"agent-host"|null, lastSee
 Event           = the §2 object
 ```
 
-Idempotency keys the sink MUST honour: event `id` (never two board writes for one id), `fingerprint` (never two *open* failure records for one fingerprint — with the reconciliation in §5.2), alert `key` (one open alert record per key).
+Idempotency keys the sink MUST honour: event `id` (never two board writes for one id), counter `first_ts` (§3.3), `fingerprint` (never two *open* failure records for one fingerprint — with the reconciliation in §5.2), alert `key` (one open alert record per key).
+
+`deliverHeartbeat` lookup order: `state/heartbeats.json` cache (`agent@host → ref`) → list open Issues labelled `errmeter:heartbeat` (full pagination) and match `agent=`/`host=` in the marker → create. Delivery = `PATCH` of the Issue body (marker `ts` = the event's `ts`; an older event never overwrites a newer marker).
 
 ### 5.1 `github-issue` board layout [frozen]
 
@@ -223,20 +226,21 @@ Labels (created by `errmeter init`):
 | `errmeter:dispatch-failed` | last outcome failed |
 | `errmeter:needs-human` | escalated; owner notified |
 
-Comment throttle [default]: `max_comments_per_issue_per_hour` 12, counted from the `ts=` of occurrence markers on that Issue (read from the board, so all hosts share the count). Beyond the cap, flush leaves the events pending (they fold into the next comment when the window frees). Heartbeat and claim writes are not throttled.
+Comment throttle [default]: `max_comments_per_issue` 400 (rollover, §5.2) · `max_comments_per_issue_per_hour` 12, counted from the `ts=` of occurrence markers on that Issue (read from the board, so all hosts share the count). Beyond the cap, flush leaves the events pending (they fold into the next comment when the window frees). Heartbeat and claim writes are not throttled.
 
 ### 5.2 Fingerprint lookup and reconciliation [frozen]
 
 Order: `state/fingerprints.json` cache (`fp → { ref, state }`) → list open Issues with label `errmeter:failure` (`per_page=100`, all pages, budgeted §5.4) and match `fp=` in the failure marker → not found = create.
 
 - Budget exhausted before the listing completed → **unknown**: do not create, leave events pending, record `lookup_incomplete` in `state/last_flush.json`. Never create on an incomplete listing.
-- Two open Issues with the same `fp` (concurrent create from two hosts): the **lowest Issue number** is canonical. The finder posts on the other `<!-- errmeter:duplicate-of ref=<n> -->`, closes it (the one thing errmeter may close), and updates the cache.
-- Cache hit whose Issue is closed and **not** by errmeter as a duplicate: create a new Issue (a returning problem is a new record) and update the cache.
+- Two open Issues with the same `fp` (concurrent create from two hosts): the **lowest Issue number** is canonical. The finder first **migrates** every id from the duplicate's markers to the canonical Issue with one comment `<!-- errmeter:occurrence ids=<all ids of the duplicate> count=<n> first= last= migrated_from=<dup> -->`, then posts `<!-- errmeter:duplicate-of ref=<canonical> -->` on the duplicate and closes it (one of the two things errmeter may close), and updates the cache (`fp → canonical`, plus `duplicates: [dup]`). Crash recovery (§5.1) checks the canonical Issue **and** any Issue labelled/marked as its duplicate, so an event written to the duplicate before the migration is never re-posted.
+- **Rollover**: when an Issue's comment count reaches `max_comments_per_issue` (400 — below GitHub's 1000-comment pagination horizon at 100/page × `max_pages_per_list`), flush posts `<!-- errmeter:rolled-over -->`, closes it (the second thing errmeter may close), creates a fresh Issue for the fingerprint with `continues=<old>` in its marker, and updates the cache. Claim reads on the new Issue are complete again.
+- Cache hit whose Issue is closed and **not** by errmeter (duplicate or rollover): create a new Issue (a returning problem is a new record) and update the cache.
 - `deliverFailureGroup` when the Issue exists: filter `events` to ids not already in any marker, then one occurrence comment; `delivered` = the ids actually written.
 
 ### 5.3 Alerts: board-first, single winner [frozen]
 
-`upsertAlert` = ensure the alert Issue exists → post an episode comment → re-read → the episode comment with the **lowest id** whose `ts` is within `renotify_sec` of now is the winner. Return `{ winner: <my comment is the winner> }`. **Only the winner calls `notify`.** Losers delete their own episode comment (by the id they just created; never another id). This is the claim protocol (§6) reused for alerts.
+`upsertAlert` = find the alert Issue by listing open Issues labelled `errmeter:alert` and matching `key=` (full pagination; if two exist, the **lowest number** is canonical and the other is closed as `duplicate-of`, exactly as in §5.2) → create it if absent → post an episode comment → re-read → the episode comment with the **lowest id** whose `ts` is within `renotify_sec` of now is the winner. Return `{ winner: <my comment is the winner> }`. **Only the winner calls `notify`**, then edits its own episode comment to add `notified=<ISO>`. Losers delete their own episode comment (by the id they just created; never another id). **Winner crash cover**: a candidate that sees the winning episode still lacking `notified=` after `notify_confirm_sec` (120) of board time may notify and mark it itself; the check-and-mark race is bounded to one duplicate notification in the worst case, which is accepted. This is the claim protocol (§6) reused for alerts.
 
 ### 5.4 Pagination and API budget [frozen]
 
@@ -266,18 +270,18 @@ All `expires` comparisons use **board time**: the `Date` header of the response 
 2. A claim is **live** if `expires` > board time and no later `errmeter:release` or `errmeter:outcome` by the same `watcher=` exists.
 3. The **holder** is the `watcher=` of the live claim with the **lowest comment id** among all comments **listed ascending with full pagination** (§5.4). Comment ids are used as returned by the list endpoint; the contract relies on list order, not on any global id property.
 4. **Eligible for claim** = Issue open, no `errmeter:needs-human`, no live claim, **and** (no outcome yet **or** an occurrence marker with `last=` later than the last outcome's `ts=`). A `repaired` or `dispatch-failed` record is therefore not re-dispatched until the problem happens again.
-5. **Consecutive failures** = number of trailing `dispatch-failed` outcomes since the last occurrence marker. `≥ escalate_after` → `needs-human` (§9).
+5. **Consecutive failures** = number of trailing `dispatch-failed` outcomes since the last `repaired` outcome or, if none, since Issue creation. **Occurrence markers do not reset the count** (they only re-open eligibility under rule 4). `≥ escalate_after` → `needs-human` (§9). Worked example with `escalate_after = 2`: occurrence → fail (1) → new occurrence → fail (2) → `needs-human`.
 
 ### 6.2 Operations
 
 - **claim**: post `errmeter:claim ref=new expires=<board now + ttlSec>` → re-read all comments → if holder: add label `errmeter:claimed`, return `{ won: true, claimRef: <own comment id> }`; else delete **exactly the comment id just created** (fallback: post `errmeter:release` for it), return `{ won: false }`.
 - **renew**: post `errmeter:claim ref=<claimRef> expires=<board now + ttlSec>`. Counts as renewed **only** on a 2xx response. Renewed every `renew_sec`; `renew_sec` MUST be ≤ `claim_ttl_sec / 3`.
 - **release**: post `errmeter:release ref=<claimRef>`; remove label.
-- **fence** (the rule that prevents two hooks): a watcher MUST terminate its running hook (§9 kill sequence) immediately when a renew fails or is not confirmed by `expires − renew_sec`, and in any case no later than `expires − kill_grace_sec` (30). A hook is never allowed to outlive the claim it runs under. If the watcher process itself dies, the hook may survive until its own `timeout_sec`; therefore **`dispatch.timeout_sec` MUST be ≤ `claim_ttl_sec − kill_grace_sec`** (validated at startup) — so a takeover after expiry can never overlap a still-running orphan hook. Watcher restart also kills any pid recorded in `state/dispatch/*.json` before its first tick.
+- **fence** (the rule that prevents two hooks): the hook always has an **absolute deadline** `D = expires − kill_grace_sec` (board time, converted once at spawn to a local monotonic deadline: `local_now + (D − board_now)`), and a duration cap `timeout_sec`. It is killed at `min(spawn + timeout_sec, D)`, and earlier if a renew fails or is not confirmed by `expires − renew_sec`. A renewed claim moves `expires` and therefore `D` forward; the watcher re-arms the deadline on every confirmed renew. The deadline is enforced by the **runner** (§9: `errmeter _run`), a tiny wrapper that is the hook's parent and process-group leader and that survives the watcher's death — so an orphan hook dies at `D` even if the watcher hard-crashed the instant after spawning. `dispatch.timeout_sec ≤ claim_ttl_sec − kill_grace_sec` is still validated at startup so the duration cap never exceeds a single lease. Watcher restart additionally kills any pid recorded in `state/dispatch/*.json` before its first tick.
 
-Defaults [default]: `claim_ttl_sec` 900 · `renew_sec` 180 · `kill_grace_sec` 30 · `dispatch.timeout_sec` 840 (≤ 900 − 30; families with long repairs raise both together) · `escalate_after` 2 · `max_concurrent` 1.
+Defaults [default]: `claim_ttl_sec` 900 · `renew_sec` 180 · `kill_grace_sec` 30 · `dispatch.timeout_sec` 840 (families with long repairs raise both together) · `escalate_after` 2 · `max_concurrent` 1.
 
-Worst-case window with these defaults: a watcher that hard-crashes leaves the Issue idle for at most `claim_ttl_sec` before takeover (a *gap*, never an *overlap*).
+Worst-case with these defaults: a watcher that hard-crashes leaves the Issue idle until `expires` (≤ `claim_ttl_sec`) before takeover — a *gap*, never an *overlap*, because the orphan is dead at `D < expires` by construction.
 
 ---
 
@@ -343,7 +347,7 @@ Environment variables read [frozen names]: `ERRMETER_HOME`, `ERRMETER_CONFIG`, `
 
 Invocation by `watch --role watcher` after `claim` returned `won: true`:
 
-- `spawn(command[0], command.slice(1), { cwd, env, stdio: ['pipe','pipe','pipe'], shell: false, windowsHide: true, detached: process.platform !== 'win32' })`. POSIX: the hook is its own process group (`detached: true`) so the whole tree can be signalled; Windows: killed with `taskkill /PID <pid> /T /F`. (Platform-specific behaviour #2 allowed by N-4.)
+- The watcher spawns the **runner**: `node bin/errmeter.js _run --deadline <local ms epoch> --timeout <sec> --state <home>/state/dispatch/<issue>.json -- <command...>` with `{ detached: process.platform !== 'win32', stdio: ['pipe','pipe','pipe'], windowsHide: true }`. The runner spawns the hook (`shell: false`, same stdio), records both pids in the state file, and **kills the hook tree at the deadline or the timeout whichever is first, regardless of whether the watcher is still alive**. The watcher re-arms the runner's deadline after each confirmed renew by writing the new deadline into the state file (the runner re-reads it every 5 s; a missing or unparsable file means "keep the current deadline"). POSIX: the runner is a process-group leader (`detached: true`) and kills the group; Windows: `taskkill /PID <hook pid> /T /F`. (Platform-specific behaviour #2 allowed by N-4.)
 - **env**: **not inherited**. Built from `pass_env` (config; default list in §7) copied from the watcher's environment, plus: `ERRMETER_ISSUE_NUMBER`, `ERRMETER_ISSUE_URL`, `ERRMETER_AGENT`, `ERRMETER_HOST`, `ERRMETER_FINGERPRINT`, `ERRMETER_EVENT_FILE`, `ERRMETER_WATCHER_ID`, `ERRMETER_CLAIM_EXPIRES` (ISO). `ERRMETER_HOME`, `ERRMETER_GITHUB_TOKEN`, and every `ERRMETER_*` not listed here are never passed.
 - **stdin**: the dispatch payload JSON, then EOF. `ERRMETER_EVENT_FILE`: the same JSON at `<home>/state/dispatch/<issue>.json` (also records `pid` for restart cleanup).
 - Payload:
@@ -363,7 +367,7 @@ Invocation by `watch --role watcher` after `claim` returned `won: true`:
 
 - **Exit code** `0` = repair attempted; the **last non-empty stdout line** (redacted, ≤ 500 chars) is the outcome summary (a PR URL by convention). Any other exit, a timeout (`timeout_sec`; kill = `SIGTERM` to the group, `SIGKILL` after 10 s; Windows `taskkill /T /F`), a fence kill (§6.2), or a spawn error = `dispatch-failed`; the last 20 lines of stderr are recorded **after redaction**.
 - After `escalate_after` consecutive failures: label `errmeter:needs-human`, owner notified once via `upsertAlert` key `needs-human:<issue>`.
-- **Boundary (D-6)**: the hook MAY open pull requests and comment in target repos with its own credentials. It MUST NOT merge, push to protected branches, or close the inbox Issue; `repaired` means "a fix was proposed". errmeter cannot police the hook's credentials; this rule is restated in `docs/integrations/` for hook authors. errmeter's own token structurally cannot do any of these (§8).
+- **Boundary (D-6)**: the hook MAY open pull requests and comment in target repos with its own credentials. It MUST NOT merge, push to protected branches, or close the inbox Issue; `repaired` means "a fix was proposed". errmeter cannot police the hook's credentials; this rule is restated in `docs/integrations/` for hook authors. errmeter's own token structurally cannot do any of these (§8). **Process boundary, stated honestly**: the hook runs as the watcher's OS user and can read whatever that user can, including `<home>/github-token`. errmeter does not hand the token over, but it cannot hide it from a same-user process; families that need that isolation run `watch --role watcher` under a dedicated OS user with its own home (documented in `docs/integrations/`).
 
 ---
 
@@ -393,6 +397,7 @@ Allowed and expected: `node:fs` (incl. `promises`, `rmSync`, `mkdirSync({recursi
 | `init` | `--repo`, `--family`, `--host`, `--role`, `--force`, `--check` | `0` ok (warnings printed for over-scope); `3` token/permission problem (names the failing probe); `4` refused to overwrite |
 | `status` | `--check` (network), `--notify-test` | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present, zero watcher heartbeats known); `3` cannot check |
 | `install` / `uninstall` | `--role`, `--dry-run`, `--user\|--system` | defined in #6 within these exit-code meanings |
+| `_run` (internal) | `--deadline <ms>`, `--timeout <sec>`, `--state <file>`, `-- <command...>` | exit code of the hook; `124` on timeout/deadline kill; `125` spawn error. Not part of the public surface; may change without a version bump. |
 
 Output: without `--json`, one summary line on stdout, diagnostics on stderr. With `--json`, one JSON object on stdout.
 
@@ -407,5 +412,7 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- **v1.2 (2026-09-05)** after round-2 delta review (Gemini GO, Muse GO, Grok GO-WITH-MINOR, GLM NO-GO, Codex NO-GO): consecutive-failure count no longer reset by occurrences (`needs-human` was unreachable — found independently by GLM and Codex); absolute deadline enforced by an `_run` runner that survives watcher death (1-second overlap at spawn delay); counter increments under a `wx` lock with compact-file fallback + counter idempotency key; heartbeat files upserted in counter mode; duplicate-Issue id migration before close; Issue rollover at 400 comments; alert Issue reconciliation + winner-crash cover; emit-spawned flush lingers up to 1 h for autonomous retry; `deliverHeartbeat` lookup order; all `*_file` credentials in the mask list; same-user process boundary stated. Owner decision requested on N-4 (three named platform branches vs the brief's literal "only boot registration").
 
 - **v1.1 (2026-09-05)** after round-1 five-seat review (GLM 5.3 / Gemini 3.8 Flash / Muse Spark 1.3 / Grok 4.6 / Codex GPT-5.6 Sol, all NO-GO): fence rule + `timeout ≤ ttl − grace` + board-time clock (W3); `repaired` not re-dispatched until a new occurrence; alerts board-first single-winner + empty-set rule + `agent-host` role so the dead-man has a periodic trigger (W4); no capacity eviction — compact/counter modes (W2); `ids=` on every marker + duplicate-Issue reconciliation + lookup fail-closed on incomplete listing (W2); notify secrets file-only, hook env allowlist, redaction of hook output and logs, emit masks the token (W1); fingerprint v1 rewritten with vectors; sink types frozen; heartbeat liveness from marker `ts`; pagination/budget rules; §10 split into "absent at 18" vs "policy"; lock steal via atomic rename; Windows rename note; N-4 wording aligned (three named platform branches).

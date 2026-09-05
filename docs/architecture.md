@@ -1,6 +1,6 @@
 # errmeter architecture (v1)
 
-Status: **frozen candidate v1.1** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
+Status: **frozen candidate v1.2** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
 
 ## 1. The one drawing
 
@@ -73,7 +73,7 @@ emit  ──▶  spool  ──▶  flush ──▶ sink (github-issue | file | w
   - heartbeats: newest per `agent@host` delivered; older ones straight to `sent/` (R-F4).
   - failures: grouped by fingerprint → one board write per group (create, or one occurrence comment), carrying **every delivered id in the marker** so a crash before the move is recovered by reading the board (contract §5.1).
   - counters: one occurrence comment with the count.
-- Then the **dead-man check** (§6 below), then exit. Backoff longer than the lock refresh is *remembered*, not slept: flush exits and the next trigger retries.
+- Then the **dead-man check** (§6 below). An emit-spawned flush that could not deliver **lingers** (keeps the lock, retries with backoff for up to `flush_linger_sec`, default 1 h) so a one-shot agent with no loop still gets automatic retry when the network returns; loop-driven flushes exit and rely on the next tick.
 - The sink interface is the table in contract §5 (**those names are the only names**; this file does not restate them). Three adapters: `github-issue` (REST over `node:https`), `file` (JSONL with a `seq`, same host), `webhook` (POST, not a board).
 - **Exactly one sink per config** (D-3). Human notification is `notify`, owned by watch (and used by flush only for the dead-man, board-first).
 - **Why `node:https`, not global `fetch`**: on Node 18 `fetch` prints an `ExperimentalWarning` on first use, which would land in every agent's log. The brief's "via fetch" meant "plain HTTP, no `gh` binary", which this satisfies.
@@ -91,7 +91,7 @@ One `setTimeout` loop, one tick every `interval_sec`. Two roles, same process, s
 | 5. gap check on all heartbeat records (marker `ts`, per-agent gap) → `upsertAlert` → notify only if winner | yes | — |
 | 6. escalate after `escalate_after` consecutive failures → `needs-human` + one alert | yes | — |
 
-- Dispatch runs **under the claim lease**: renew every `renew_sec` (confirmed 2xx only); on a failed/unconfirmed renew, or at `expires − kill_grace`, the hook is killed. `dispatch.timeout_sec ≤ claim_ttl_sec − kill_grace_sec` is validated at startup, so an orphan hook left by a watcher crash always dies before anyone else can take the claim. The hook is its own process group (POSIX) / killed with `taskkill /T` (Windows).
+- Dispatch runs **under the claim lease**: the watcher spawns a tiny **runner** (`errmeter _run`) that is the hook's parent and holds an absolute deadline `expires − kill_grace`; the runner kills the hook at that deadline (or at `timeout_sec`, whichever is first) **even if the watcher has died**. Renew every `renew_sec` (confirmed 2xx only) pushes the deadline forward; a failed renew kills the hook at once. An orphan therefore always dies before anyone else can take the claim. The runner is a process-group leader (POSIX) / uses `taskkill /T` (Windows).
 - Errors inside the loop are logged, emitted as the loop's own failure events, and never stop the loop.
 - `agent-host` is how a laptop or an agent-only VPS participates in liveness without being a repairer: it gives the dead-man a periodic trigger that is independent of the watchers (§6). `install --role agent-host` registers exactly this.
 
@@ -117,7 +117,9 @@ One `setTimeout` loop, one tick every `interval_sec`. Two roles, same process, s
 | **Whole family dead** (no host runs any loop or emits) | Nothing. Accepted limit X-3; heartbeat Issues have stable titles for an external pinger. | — |
 | **Spool grows (storm / long outage)** | Compact mode above the soft limit, counter mode at the hard limit (contract §3.3). Board writes bounded by grouping + `max_comments_per_issue_per_hour` (shared via marker timestamps). | Disk full (bounded by `hard_limit × 32 KiB`). Eviction of unsent events. Rate-limit lockout (per-pass budget). |
 | **Dispatch hook hangs / dies** | Killed at `timeout_sec` or at the lease fence; outcome `dispatch-failed`. After `escalate_after` consecutive failures → `needs-human` + one owner alert. | Infinite retries. Two hooks on one Issue (fence + `timeout ≤ ttl − grace`). |
-| **Watcher dies mid-dispatch** | Its hook dies at its own timeout (≤ ttl − grace). The claim expires at ttl; another watcher takes over. Worst case: a gap of `claim_ttl_sec`, never an overlap. On restart the watcher kills any pid recorded in `state/dispatch/`. | Overlap. Stuck Issue. |
+| **Watcher dies mid-dispatch** | The runner kills the hook at the absolute deadline `expires − grace`. The claim expires at `expires`; another watcher takes over. Worst case: a gap of `claim_ttl_sec`, never an overlap. On restart the watcher kills any pid recorded in `state/dispatch/`. | Overlap. Stuck Issue. |
+| **Repeated failed repairs** | Consecutive `dispatch-failed` outcomes are counted across occurrences (only a `repaired` outcome resets them); at `escalate_after` the Issue gets `needs-human` and the owner is alerted once. | An Issue that fails forever without paging anyone. |
+| **Very chatty Issue** | At `max_comments_per_issue` flush rolls the Issue over (close + new Issue with `continues=`), so claim reads always stay within the pagination budget. | Permanently incomplete comment reads → dispatch silence. |
 | **Two watchers claim together** | Both post; both re-read (full pagination); lowest comment id wins; the loser deletes exactly its own comment. | Split-brain. Deleting the winner's comment. |
 | **Clock drift between hosts** | Expiry is judged by board time (`Date` header), not local clocks. | Premature takeover. |
 | **Token missing / wrong scope** | `init --check` / `status --check` fail loudly naming the failing probe; over-scope is a warning; least privilege is confirmed by the human checkpoint #2. emit unaffected. | A silent system: `status` shows "last successful flush: never / N pending". |
