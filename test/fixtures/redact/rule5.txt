@@ -1,0 +1,2 @@
+Authorization: Basic abcdef
+Bearer some-value

@@ -1,0 +1,1 @@
+https://alice:private@example.com/a?token=hidden&safe=ok&api_key=abc

@@ -1,0 +1,1 @@
+token=abcdef password: hidden "api_key": "private" cookie=abc; session=x, safe=ok
