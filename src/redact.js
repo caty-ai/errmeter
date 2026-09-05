@@ -53,7 +53,7 @@ function pairValue(text, start) {
       }
     }
     if (end === text.length || text[end] === '\r' || text[end] === '\n') {
-      return { end, quote, closed: false };
+      return { end, quote, closed: end - start > 1 && text[end - 1] === quote };
     }
     // A trailing backslash makes the quoted regex fail, so its unquoted
     // alternative determines the same delimiter boundary as before.

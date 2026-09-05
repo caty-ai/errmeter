@@ -77,6 +77,9 @@ test('value boundaries preserve quotes, query extent and ordinary lines', () => 
 test('sensitive pairs preserve boundary behavior', () => {
   const cases = [
     ['password: "abc \\"def\\" ghi"', 'password: "[REDACTED]"'],
+    ['token="a\\"', 'token="[REDACTED]"'],
+    ["password='\\'", "password='[REDACTED]'"],
+    ['token="a\\"\nnext=1', 'token="[REDACTED]"\nnext=1'],
     ['password=', 'password=[REDACTED]'],
     ['token=one; password=two', 'token=[REDACTED]; password=[REDACTED]'],
     ['token=one&password=two', 'token=[REDACTED]&password=[REDACTED]'],
