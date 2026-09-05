@@ -162,6 +162,7 @@ function failures(rows) {
     const record = records.get(row.ref);
     if (!record) continue;
     if (row.op === 'labels') record.labels = [...new Set(record.labels.concat(row.labels))];
+    if (row.op === 'labels-remove') record.labels = record.labels.filter(label => !row.labels.includes(label));
     if (row.op === 'claim') record.labels = [...new Set(record.labels.concat('errmeter:claimed'))];
     if (row.op === 'release' || row.op === 'outcome') record.labels = record.labels.filter(label => label !== 'errmeter:claimed');
     if (row.op === 'outcome') {
@@ -315,7 +316,7 @@ async function renewClaim(ctx, ref, options) {
   claimOptions(options);
   const rows = scan(ctx); complete(ctx, rows);
   const record = requireFailure(ctx, rows, ref);
-  if (ctx.dryRun) return { ok: false, reason: 'rejected' };
+  if (ctx.dryRun) return { ok: false, reason: 'dry-run' };
   if (record.claim?.watcherId !== options.watcherId || String(record.claim.claimRef) !== String(options.claimRef)) return { ok: false, reason: 'holder-changed' };
   const expiresAt = new Date(Date.parse(time(ctx)) + (options.ttlSec ?? 900) * 1000).toISOString();
   append(ctx, 'claim', { ref: Number(ref), watcherId: options.watcherId, claimRef: options.claimRef, expiresAt }, rows);
@@ -352,8 +353,15 @@ async function addLabels(ctx, ref, labels) {
   append(ctx, 'labels', { ref: Number(ref), labels }, rows);
   return { ok: true };
 }
+async function removeLabels(ctx, ref, labels) {
+  const rows = scan(ctx); complete(ctx, rows); requireFailure(ctx, rows, ref);
+  if (ctx.dryRun) return { pending: true };
+  append(ctx, 'labels-remove', { ref: Number(ref), labels }, rows);
+  return { ok: true };
+}
 const operations = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, listHeartbeats, upsertAlert,
   claim, renewClaim, releaseClaim, writeOutcome };
 module.exports = Object.fromEntries(Object.entries(operations).map(([name, operation]) =>
   [name, (ctx, ...args) => boardOperation(ctx, operation, args)]));
 Object.defineProperty(module.exports, 'addLabels', { value: (ctx, ...args) => boardOperation(ctx, addLabels, args) });
+Object.defineProperty(module.exports, 'removeLabels', { value: (ctx, ...args) => boardOperation(ctx, removeLabels, args) });

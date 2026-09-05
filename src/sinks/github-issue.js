@@ -217,6 +217,9 @@ async function removeLabel(ctx, ref, label) {
   try { await labelApi(ctx, 'DELETE', root(ctx) + '/issues/' + ref + '/labels/' + encodeURIComponent(label)); }
   catch (error) { if (error.status !== 404) throw error; }
 }
+async function removeLabels(ctx, ref, labels) {
+  for (const label of labels) await removeLabel(ctx, ref, label);
+}
 function claimBody(watcherId, expiresAt, claimRef) {
   return '<!-- errmeter:claim watcher=' + watcherId + ' expires=' + expiresAt + ' ref=' + claimRef + ' -->';
 }
@@ -363,3 +366,4 @@ async function upsertAlert(ctx, alert) {
 
 module.exports = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, claim, renewClaim, releaseClaim, writeOutcome, listHeartbeats, upsertAlert };
 Object.defineProperty(module.exports, 'addLabels', { value: addLabels });
+Object.defineProperty(module.exports, 'removeLabels', { value: removeLabels });

@@ -30,11 +30,67 @@ async function upsertNeedsHuman(ctx, issue, summary, failures = ctx.config.watch
     title: 'Needs human: ' + url,
     body: url + ' needs human attention after ' + failures + ' failed repair attempts. ' + (ctx.config.owner.mention || ''),
     mention: ctx.config.owner.mention }, ctx.maskList));
-  if (alert?.pending || alert?.notified === false) summary.pending_remaining++;
+  const pending = Boolean(alert?.pending || alert?.notified === false);
+  if (pending) summary.pending_remaining++;
   if (alert?.lookup_incomplete) { summary.lookup_incomplete = true; ctx.lookup_incomplete = true; }
+  return pending;
 }
 function apiRemaining(ctx) {
   return (ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60) - (ctx.apiCalls || 0);
+}
+function hasLabel(record, name) {
+  return (record?.labels || []).some(label => (typeof label === 'string' ? label : label.name) === name);
+}
+function budgetError(error) {
+  return ['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error?.code);
+}
+const missingRemoveLabelsLogged = new WeakSet();
+async function removeStaleClaimedLabel(ctx, issue) {
+  if (!hasLabel(issue, 'errmeter:claimed') || apiRemaining(ctx) < 1) return;
+  if (typeof ctx.sink.removeLabels !== 'function') {
+    if (!missingRemoveLabelsLogged.has(ctx)) {
+      missingRemoveLabelsLogged.add(ctx);
+      ctx.log?.('watch: sink does not support stale claimed label cleanup');
+    }
+    return;
+  }
+  try {
+    await ctx.sink.removeLabels(ctx, issue.ref, ['errmeter:claimed']);
+  } catch (_) { ctx.log?.('watch: stale claimed label cleanup failed'); }
+}
+function trackDispatchLabels(sink, tracker) {
+  if (typeof sink.writeOutcome !== 'function') return sink;
+  const wrapped = Object.create(sink);
+  Object.defineProperties(wrapped, {
+    writeOutcome: { value: async (ctx, ref, outcome) => {
+      tracker.outcome = outcome;
+      tracker.written = await sink.writeOutcome(ctx, ref, outcome);
+      return tracker.written;
+    } },
+    getFailure: { value: async (ctx, ref) => {
+      const detail = await sink.getFailure(ctx, ref);
+      if (tracker.written) tracker.refreshed = detail;
+      return detail;
+    } },
+    addLabels: { value: async (ctx, ref, labels) => {
+      const result = await sink.addLabels(ctx, ref, labels);
+      if (tracker.written && labels.includes('errmeter:needs-human')) tracker.needsHumanRepaired = true;
+      return result;
+    } },
+    releaseClaim: { value: async (ctx, ref, options) => {
+      const result = await sink.releaseClaim(ctx, ref, options);
+      if (tracker.written) tracker.releaseLabelsFailed = Boolean(result?.labelsFailed);
+      return result;
+    } }
+  });
+  return wrapped;
+}
+function clearRepairedLabelFailure(result, tracker) {
+  if (!result?.labelsFailed || !tracker.written?.labelsFailed || !tracker.needsHumanRepaired || tracker.releaseLabelsFailed || !tracker.refreshed) return;
+  const labels = new Set((tracker.refreshed.labels || []).map(label => typeof label === 'string' ? label : label.name));
+  const status = tracker.outcome?.status;
+  const other = status === 'repaired' ? 'errmeter:dispatch-failed' : 'errmeter:repaired';
+  if (labels.has('errmeter:dispatched') && labels.has('errmeter:' + status) && !labels.has('errmeter:claimed') && !labels.has(other)) delete result.labelsFailed;
 }
 function scanCursor(ctx, value) {
   const file = path.join(ctx.home, 'state', 'scan_cursor.json');
@@ -65,17 +121,19 @@ async function escalate(ctx, issue, summary, escalation, failures, addLabel = fa
   }
   escalation.used = true;
   try {
+    let labelPending = false;
     if (addLabel) {
       try { await ctx.sink.addLabels(ctx, issue.ref, ['errmeter:needs-human']); }
       catch (error) {
-        if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code)) { ctx.lookup_incomplete = true; summary.pending_remaining++; return; }
-        ctx.log?.('watch: escalation label update failed'); summary.pending_remaining++;
+        if (budgetError(error)) { ctx.lookup_incomplete = true; summary.pending_remaining++; return; }
+        ctx.log?.('watch: escalation label update failed'); labelPending = true;
       }
     }
-    await upsertNeedsHuman(ctx, issue, summary, failures);
+    const alertPending = await upsertNeedsHuman(ctx, issue, summary, failures);
+    if (labelPending && !alertPending) summary.pending_remaining++;
   } catch (error) {
     summary.pending_remaining++;
-    if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code)) ctx.lookup_incomplete = true;
+    if (budgetError(error)) ctx.lookup_incomplete = true;
     else reportError(ctx, error, summary.errors);
   }
 }
@@ -134,16 +192,21 @@ async function tick(ctx, options = {}) {
     scanPredecessor = candidates.at(-1)?.ref;
     scanWindow = candidates.slice(0, scanMaxConfirms);
     candidates = scanWindow;
-    // Prioritize inside this round-robin window, never ahead of its boundary.
-    const claimed = record => (record.labels || []).some(label => (typeof label === 'string' ? label : label.name) === 'errmeter:claimed');
-    candidates = candidates.filter(record => !claimed(record)).concat(candidates.filter(claimed));
     const dispatches = [];
     const selected = [];
     const capacity = Math.max(0, ctx.config.watch.max_concurrent - ctx.running.size);
     for (const record of candidates) {
       if (selected.length >= capacity || summary.scanned >= scanMaxConfirms || apiRemaining(ctx) < 2 || ctx.signal.aborted || ctx.lookup_incomplete) break;
       if (ctx.running.has(record.ref)) continue;
-      const detail = record.detailed === true ? record : await sink.getFailure(ctx, record.ref);
+      let detail;
+      try { detail = record.detailed === true ? record : await sink.getFailure(ctx, record.ref); }
+      catch (error) {
+        summary.scanned++;
+        summary.unscanned--;
+        confirmedRefs.add(record.ref);
+        if (budgetError(error) || ctx.lookup_incomplete) { ctx.lookup_incomplete = true; break; }
+        throw error;
+      }
       if (ctx.lookup_incomplete) break;
       summary.scanned++;
       summary.unscanned--;
@@ -155,7 +218,11 @@ async function tick(ctx, options = {}) {
         if (ctx.lookup_incomplete) break;
         continue;
       }
-      if (isEligible(detail, ctx.now(), true)) { selected.push(detail); pendingClaims.add(detail.ref); }
+      if (isEligible(detail, ctx.now(), true)) {
+        await removeStaleClaimedLabel(ctx, detail);
+        selected.push(detail);
+        pendingClaims.add(detail.ref);
+      }
     }
     summary.eligible = selected.length;
     for (const record of selected) {
@@ -167,7 +234,7 @@ async function tick(ctx, options = {}) {
       let claim;
       try { claim = await sink.claim(ctx, detail.ref, { watcherId: ctx.config.watch.watcher_id, ttlSec: ctx.config.watch.claim_ttl_sec }); }
       catch (error) {
-        if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code) || ctx.lookup_incomplete) {
+        if (budgetError(error) || ctx.lookup_incomplete) {
           ctx.lookup_incomplete = true;
           break;
         }
@@ -185,9 +252,12 @@ async function tick(ctx, options = {}) {
       // Dispatch contexts retain their own observation clock and API budget;
       // a future tick must not reset an active lease's response state.
       const dispatchCtx = { ...ctx, apiCalls: 0, lookup_incomplete: false, errors: summary.errors };
+      const labelTracker = {};
+      dispatchCtx.sink = trackDispatchLabels(sink, labelTracker);
       dispatchCtx.now = () => dispatchCtx.boardTime || new Date(ctx.clock()).toISOString();
       const promise = Promise.resolve().then(() => ctx.dispatch(dispatchCtx, detail, claim, { env: ctx.env, signal: ctx.signal }))
         .then(async result => {
+          clearRepairedLabelFailure(result, labelTracker);
           if (result?.status === 'dispatch-failed') summary.dispatch_failed = (summary.dispatch_failed || 0) + 1;
           if (result?.needsHuman) await upsertNeedsHuman(dispatchCtx, detail, summary, result.consecutiveFailures);
         })
@@ -208,15 +278,13 @@ async function tick(ctx, options = {}) {
   } catch (error) { reportError(ctx, error); }
   finally {
     if (confirmedRefs.size) {
-      // Retry a confirmed eligible row before spending another tick on hints.
-      // Once claimed, ordinary ring traversal resumes across deferred rows.
+      // Retry a confirmed eligible row before spending another tick elsewhere.
       const claimIndex = scanWindow.findIndex(record => pendingClaims.has(record.ref));
       const pendingIndex = claimIndex >= 0 ? claimIndex : scanWindow.findIndex(record => !confirmedRefs.has(record.ref));
       const cursor = pendingIndex === -1 ? scanWindow.at(-1).ref : pendingIndex === 0 ? scanPredecessor : scanWindow[pendingIndex - 1].ref;
       try { scanCursor(ctx, cursor); } catch (error) { reportError(ctx, error, summary.errors); }
     }
     summary.lookup_incomplete ||= Boolean(ctx.lookup_incomplete);
-    summary.pending_remaining += summary.unscanned;
   }
   return summary;
 }
@@ -266,7 +334,7 @@ async function watch(argv, env = process.env, io = {}) {
       const summary = await tick(ctx, { ...io, once: flags.once });
       code = summary.flush === 3 ? 3 : summary.flush || summary.pending_remaining || summary.lookup_incomplete || summary.errors.length || summary.dispatch_failed ? 1 : 0;
       if (!flags.quiet) output(stdout, flags.json ? JSON.stringify(cleanValue(summary, masks)) + '\n'
-        : 'watch: role=' + summary.role + ' flush=' + summary.flush + ' eligible=' + summary.eligible + ' claimed=' + summary.claimed + ' dispatched=' + summary.dispatched + ' gaps=' + summary.gaps + '\n');
+        : 'watch: role=' + summary.role + ' flush=' + summary.flush + ' eligible=' + summary.eligible + ' claimed=' + summary.claimed + ' dispatched=' + summary.dispatched + ' gaps=' + summary.gaps + ' scanned=' + summary.scanned + ' unscanned=' + summary.unscanned + '\n');
       if (flags.once || ctx.signal.aborted) break;
       await new Promise(resolve => { wake = resolve; timer = setTimeout(resolve, config.watch.interval_sec * 1000); });
       timer = undefined; wake = undefined;

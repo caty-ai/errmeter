@@ -21,6 +21,13 @@ function group(...events) { return { fingerprint: '0123456789abcdef', fpv: 1, ag
 function failureBody(ids, fp = '0123456789abcdef') { return '<!-- errmeter:failure fp=' + fp + ' fpv=1 ids=' + ids + ' count=1 first=' + stamp + ' last=' + stamp + ' schema=1 -->\n\n```json\n' + JSON.stringify(event(ids)) + '\n```'; }
 function writes(fake) { return fake.requests.filter(r => ['POST', 'PATCH', 'DELETE'].includes(r.method)); }
 
+test('label helpers stay non-enumerable', () => {
+  assert.equal(typeof sink.addLabels, 'function');
+  assert.equal(typeof sink.removeLabels, 'function');
+  assert.equal(Object.prototype.propertyIsEnumerable.call(sink, 'addLabels'), false);
+  assert.equal(Object.prototype.propertyIsEnumerable.call(sink, 'removeLabels'), false);
+});
+
 test('cheap failure summaries cost one list and require confirmation', async t => {
   const { fake, ctx } = await setup(t);
   for (let i = 0; i < 30; i++) fake.seedIssue({ body: failureBody('event-' + i), labels: ['errmeter:failure'] });
