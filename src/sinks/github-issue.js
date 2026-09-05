@@ -7,6 +7,7 @@ const { redact } = require('../redact');
 const version = require('../../package.json').version;
 
 function now(ctx) { return new Date(ctx.boardTime || (ctx.now ? ctx.now() : Date.now())).toISOString(); }
+function text(ctx, value) { return redact(value, [...(ctx.maskList || []), ctx.config.sink.token].filter(Boolean)); }
 function limit(ctx, key, fallback) { return ctx.config[key] ?? ctx.config.sink[key] ?? ctx.config.spool?.[key] ?? fallback; }
 function unknown(ctx) {
   ctx.lookup_incomplete = true;
@@ -24,7 +25,9 @@ async function api(ctx, method, target, body) {
   const response = await (ctx.http || require('../http').request)({ method, url: url.href,
     headers: { Authorization: 'Bearer ' + ctx.config.sink.token, Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'errmeter/' + version },
-    body: body === undefined ? undefined : JSON.parse(redact(JSON.stringify(body), [...(ctx.maskList || []), ctx.config.sink.token].filter(Boolean))) });
+    // Compose redacted text at its source. Redacting this serialized envelope
+    // would consume JSON delimiters and corrupt markers and fenced event JSON.
+    body });
   if (response.status < 200 || response.status >= 300) {
     const error = new Error('GitHub HTTP ' + response.status);
     error.status = response.status; error.headers = response.headers; throw error;
@@ -84,10 +87,10 @@ function bodyFor(ctx, group, events, kind, extra = '') {
   const count = counter ? group.count : events.reduce((n, e) => n + Number(e.meta?._folded_count || 1), 0);
   const prefix = kind === 'failure' ? ' fp=' + group.fingerprint + ' fpv=' + group.fpv : '';
   const marker = '<!-- errmeter:' + kind + prefix + ' ids=' + (counter ? '' : events.map(e => e.id).join(',')) + ' count=' + count + ' first=' + first.ts + ' last=' + last.ts + (kind === 'failure' ? ' schema=1' : '') + (counter ? ' counter_ref=' + counter : '') + (kind === 'occurrence' ? ' ts=' + now(ctx) : '') + extra + ' -->';
-  return marker + '\n\n' + (Number(last.schema) > 1 ? 'Newer event schema; delivered verbatim.\n\n' : '') + (last.message || '') + '\n\n```json\n' + JSON.stringify(last, null, 2) + '\n```';
+  return marker + '\n\n' + (Number(last.schema) > 1 ? 'Newer event schema; delivered verbatim.\n\n' : '') + text(ctx, last.message || '') + '\n\n```json\n' + JSON.stringify(last, null, 2) + '\n```';
 }
 async function createFailure(ctx, group, events, extra) {
-  return (await api(ctx, 'POST', root(ctx) + '/issues', { title: '[errmeter] ' + group.agent + ': ' + (events.at(-1)?.message || group.events.at(-1)?.message || '').slice(0, 80), body: bodyFor(ctx, group, events, 'failure', extra), labels: ['errmeter', 'errmeter:failure'] })).body;
+  return (await api(ctx, 'POST', root(ctx) + '/issues', { title: text(ctx, '[errmeter] ' + group.agent + ': ' + (events.at(-1)?.message || group.events.at(-1)?.message || '').slice(0, 80)), body: bodyFor(ctx, group, events, 'failure', extra), labels: ['errmeter', 'errmeter:failure'] })).body;
 }
 async function duplicate(ctx, canonical, dup, migrate) {
   const mine = await post(ctx, canonical.number, '<!-- errmeter:reconcile from=' + dup.number + ' -->');
@@ -176,10 +179,10 @@ async function deliverHeartbeat(ctx, event) {
   if (!found) found = (await listHeartbeats(ctx)).filter(h => h.agent === event.agent && h.host === event.host).sort((a, b) => a.ref - b.ref)[0];
   if (found && new Date(found.lastSeen) >= new Date(event.ts)) return { ref: found.ref, skipped: true };
   const role = event.meta?.role || '';
-  const body = '<!-- errmeter:heartbeat agent=' + event.agent + ' host=' + event.host + ' role=' + role + ' ts=' + event.ts + ' -->\n\n' + (event.message || '');
+  const body = '<!-- errmeter:heartbeat agent=' + event.agent + ' host=' + event.host + ' role=' + role + ' ts=' + event.ts + ' -->\n\n' + text(ctx, event.message || '');
   let ref;
   if (found) { await patch(ctx, found.ref, { body }); ref = found.ref; }
-  else { const labels = ['errmeter', 'errmeter:heartbeat']; if (role) labels.push('errmeter:role:' + role); ref = (await api(ctx, 'POST', root(ctx) + '/issues', { title: '[errmeter] heartbeat: ' + key, body, labels })).body.number; }
+  else { const labels = ['errmeter', 'errmeter:heartbeat']; if (role) labels.push('errmeter:role:' + role); ref = (await api(ctx, 'POST', root(ctx) + '/issues', { title: text(ctx, '[errmeter] heartbeat: ' + key), body, labels })).body.number; }
   cacheWrite(ctx, 'heartbeats', key, ref); return { ref };
 }
 async function getFailure(ctx, ref) {
@@ -201,7 +204,7 @@ async function upsertAlert(ctx, alert) {
   const matching = async () => (await issues(ctx, 'errmeter:alert')).filter(i => markers(i.body, 'alert').some(m => m.key === alert.key)).sort((a, b) => a.number - b.number);
   let matches = await matching();
   if (!matches.length) {
-    await api(ctx, 'POST', root(ctx) + '/issues', { title: '[errmeter] alert: ' + alert.key, body: '<!-- errmeter:alert key=' + alert.key + ' -->\n\n' + (alert.body || ''), labels: ['errmeter', 'errmeter:alert'] });
+    await api(ctx, 'POST', root(ctx) + '/issues', { title: text(ctx, '[errmeter] alert: ' + alert.key), body: '<!-- errmeter:alert key=' + alert.key + ' -->\n\n' + text(ctx, alert.body || ''), labels: ['errmeter', 'errmeter:alert'] });
     matches = await matching();
     if (!matches.length) throw unknown(ctx);
   }

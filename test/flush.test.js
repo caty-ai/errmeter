@@ -77,6 +77,111 @@ const ack = {
   listOpenFailures: async () => [], upsertAlert: async () => ({ ref: 1 })
 };
 
+test('GitHub flush preserves redacted strings, markers and fenced JSON through create and occurrence writes', async t => {
+  const fake = await createGithubFake(); t.after(() => fake.close());
+  const f = fixture(t, { sink: { type: 'github-issue', repo: 'test/inbox', api_base: fake.url } });
+  f.env.ERRMETER_GITHUB_TOKEN = 'fixture.credential.value';
+  const secrets = ['detail', 'message', 'api', 'password', 'short'].map(part => [part, 'secret'].join('-'));
+  const variants = [
+    { message: 'failure', detail: 'Authorization: Bearer ' + secrets[0] + '\nsecond line' },
+    { message: 'Bearer ' + secrets[1] },
+    { message: 'api_key=' + secrets[2] },
+    { message: 'Authorization: [REDACTED]', detail: 'password="' + secrets[3] + '"\nsecond line', meta: { password: secrets[4] } }
+  ];
+  for (const [index, fields] of variants.entries()) {
+    const original = event('redaction-' + index, fields);
+    write(f.home, 'redaction.json', original);
+    const result = await f.run(['--json']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(state(f).pending_remaining, 0);
+    assert.equal(json(path.join(f.home, 'spool/sent/redaction.json')).id, original.id);
+    const body = index === 0 ? fake.issues[0].body : fake.comments.at(-1).body;
+    assert.match(body, new RegExp('<!-- errmeter:' + (index === 0 ? 'failure fp=0123456789abcdef fpv=1 ' : 'occurrence ') + 'ids=' + original.id + ' count=1 first=[^\\n]+ -->'));
+    const fenced = body.match(/```json\n([\s\S]*?)\n```/);
+    assert.ok(fenced);
+    const parsed = JSON.parse(fenced[1]);
+    const { redact } = require('../src/redact');
+    assert.equal(parsed.message, redact(original.message));
+    if (original.detail) assert.equal(parsed.detail, redact(original.detail));
+    if (original.meta) assert.equal(parsed.meta.password, '[REDACTED]');
+    const payloads = JSON.stringify(fake.requests.filter(r => r.body).map(r => r.body));
+    for (const secret of secrets) assert.equal(payloads.includes(secret), false);
+  }
+  assert.equal((await require('../src/sinks/github-issue').getFailure({ home: f.home, config: { sink: { repo: 'test/inbox', api_base: fake.url, token: f.env.ERRMETER_GITHUB_TOKEN } } }, 1)).occurrences, 4);
+});
+
+test('malformed counter lines report one error and still drain valid groups', async t => {
+  const f = fixture(t);
+  write(f.home, 'counters.bad.log', counter() + 'malformed\n' + counter('fedcba9876543210'));
+  const result = await f.run(['--json']);
+  assert.equal(result.code, 1);
+  assert.equal(state(f).errors.length, 1);
+  assert.equal(state(f).pending_remaining, 0);
+  assert.equal(rows(f.home).length, 2);
+  assert.equal(state(f).backoff_until, undefined);
+  assert.equal((await f.run()).code, 0);
+});
+
+test('file and webhook serialize already-redacted event fields without consuming their JSON structure', async t => {
+  for (const type of ['file', 'webhook']) {
+    const f = fixture(t, { sink: type === 'file' ? { type } : { type, url: 'https://example.invalid/events' } });
+    const secret = ['field', 'credential', 'value'].join('.');
+    const original = event('structured-' + type, { message: 'Bearer ' + secret,
+      detail: 'Authorization: Bearer ' + secret + '\nsecond line', meta: { password: secret, note: 'api_key=' + secret } });
+    write(f.home, 'fields.json', original);
+    let posted;
+    const result = await f.run([], { http: async request => { posted = JSON.parse(JSON.stringify(request.body)); return { status: 200 }; } });
+    assert.equal(result.code, 0, result.stderr);
+    const latest = type === 'file' ? rows(f.home)[0].record.latest : posted.events[0];
+    assert.equal(latest.message, 'Bearer [REDACTED]');
+    assert.equal(latest.detail, 'Authorization: [REDACTED]\nsecond line');
+    assert.equal(latest.meta.password, '[REDACTED]');
+    assert.equal(latest.meta.note, 'api_key=[REDACTED]');
+    assert.equal(JSON.stringify(type === 'file' ? rows(f.home) : posted).includes(secret), false);
+    assert.equal(json(path.join(f.home, 'spool/sent/fields.json')).id, original.id);
+  }
+});
+
+test('an incomplete counter tail remains pending for a later completed write', async t => {
+  const f = fixture(t); const source = counter().slice(0, -1);
+  const file = write(f.home, 'counters.incomplete.log', source);
+  assert.equal((await f.run()).code, 1);
+  assert.equal(fs.readFileSync(file, 'utf8'), source);
+  assert.match(state(f).errors[0], /incomplete counter line/);
+  fs.appendFileSync(file, '\n');
+  assert.equal((await f.run()).code, 0);
+  assert.equal(rows(f.home).length, 1);
+});
+
+test('wholly malformed counter cuts move intact to dead and stop blocking new logs', async t => {
+  const f = fixture(t); const source = 'invalid\nmalformed\n';
+  write(f.home, 'counters.bad.log', source); write(f.home, 'counters.log', counter());
+  assert.equal((await f.run()).code, 1);
+  assert.equal(fs.readFileSync(path.join(f.home, 'spool/dead/counters.bad.log'), 'utf8'), source);
+  assert.equal(fs.existsSync(path.join(f.home, 'state/cuts/bad.json')), false);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(rows(f.home).length, 1);
+});
+
+test('dry-run accepts a checkpoint without posted and explains unchanged pending exit 1', async t => {
+  const f = fixture(t); const source = counter();
+  write(f.home, 'counters.recovery.log', source);
+  fs.mkdirSync(path.join(f.home, 'state/cuts'), { recursive: true });
+  fs.writeFileSync(path.join(f.home, 'state/cuts/recovery.json'), JSON.stringify({ k: 0, offset: 0, end: Buffer.byteLength(source) }));
+  const before = snapshot(f.home);
+  const result = await f.run(['--dry-run']);
+  assert.equal(result.code, 1); assert.match(result.stdout, /recovery\.0/);
+  assert.match(result.stdout, /Dry-run leaves pending work unchanged \(exit 1\)/);
+  assert.deepEqual(snapshot(f.home), before);
+});
+
+test('flush usage errors exit 2 without touching home', async t => {
+  const f = fixture(t); const before = snapshot(f.home);
+  assert.equal((await f.run(['--unknown'])).code, 2);
+  assert.equal((await cli(f, ['--unknown'])).code, 2);
+  assert.deepEqual(snapshot(f.home), before);
+});
+
 test('flush groups oldest first, drains home and fallback, and moves only acknowledged ids', async t => {
   const f = fixture(t); const fallback = path.join(f.base, 'errmeter-spool');
   write(f.home, 'b.json', event('b', { ts: new Date(epoch + 1000).toISOString() }));
@@ -658,7 +763,7 @@ test('heartbeat claim ENOENT leaves that upsert retryable without blocking anoth
   assert.equal(json(path.join(f.home, 'spool/sent', name)).attempts, 1);
 });
 
-test('failed heartbeat passes retain only the newest identity and make one delivery call', async t => {
+test('failed heartbeat passes retain every observation until newest delivery succeeds', async t => {
   const f = fixture(t); const name = 'heartbeat-a@test-host.json'; const called = [];
   const sink = { ...ack, deliverHeartbeat: async (ctx, ev) => { called.push(ev.id); throw Object.assign(new Error('down'), { status: 503 }); } };
   for (let i = 0; i < 4; i++) {
@@ -666,11 +771,14 @@ test('failed heartbeat passes retain only the newest identity and make one deliv
     write(f.home, name, event('heartbeat-' + i, { kind: 'heartbeat', ts: new Date(epoch + i * 1000).toISOString() }));
     assert.equal((await f.run([], { sink })).code, 1);
     const pending = fs.readdirSync(path.join(f.home, 'spool/pending'));
-    assert.equal(pending.length, 1); assert.equal(json(path.join(f.home, 'spool/pending', pending[0])).id, 'heartbeat-' + i);
+    assert.equal(pending.length, i + 1);
+    assert.deepEqual(pending.map(file => json(path.join(f.home, 'spool/pending', file)).id).sort(), Array.from({ length: i + 1 }, (_, n) => 'heartbeat-' + n));
+    assert.equal(fs.existsSync(path.join(f.home, 'spool/sent', name)), false);
     assert.equal(called.length, i + 1);
   }
   f.setNow(epoch + 1000000); assert.equal((await f.run([], { sink: ack })).code, 0);
   assert.equal(json(path.join(f.home, 'spool/sent', name)).id, 'heartbeat-3');
+  assert.deepEqual(fs.readdirSync(path.join(f.home, 'spool/sent')).map(file => json(path.join(f.home, 'spool/sent', file)).id).sort(), ['heartbeat-0', 'heartbeat-1', 'heartbeat-2', 'heartbeat-3']);
   assert.deepEqual(called, ['heartbeat-0', 'heartbeat-1', 'heartbeat-2', 'heartbeat-3']);
 });
 

@@ -3,8 +3,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { redact } = require('../redact');
 
 function time(ctx) { return new Date(ctx.now ? ctx.now() : Date.now()).toISOString(); }
+// This reference board grows without a retention bound; operators must trim it.
 function location(ctx) { return (ctx.config.file || {}).path || path.join(ctx.home, 'board.jsonl'); }
 function atomic(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -49,6 +51,8 @@ function scan(ctx) {
   } finally { fs.closeSync(fd); }
 }
 function complete(ctx, rows) {
+  // A truncated history cannot prove absence or deduplication. Every board
+  // operation fails closed here before allocating a sequence or appending.
   if (rows.incomplete) {
     ctx.lookup_incomplete = true;
     const error = new Error('File board lookup incomplete: scan_max_lines exceeded');
@@ -102,7 +106,7 @@ async function deliverFailureGroup(ctx, group) {
   const ref = existing ? existing.ref : nextSequence(ctx, rows);
   const record = existing ? JSON.parse(JSON.stringify(existing)) : {
     ref, fingerprint: group.fingerprint, fpv: group.fpv, agent: group.agent, host: first.host,
-    title: '[errmeter] ' + group.agent + ': ' + String(latest.message || '').slice(0, 80),
+    title: redact('[errmeter] ' + group.agent + ': ' + String(latest.message || '').slice(0, 80), ctx.maskList || []),
     labels: ['errmeter', 'errmeter:failure'], openedAt: first.ts, lastOccurrenceAt: first.ts,
     occurrences: 0, claim: null, lastOutcome: null, latest: first, claims: [], outcomes: [], occurrenceIds: [], counterRefs: []
   };
@@ -150,7 +154,7 @@ async function upsertAlert(ctx, alert) {
   const rows = scan(ctx); complete(ctx, rows);
   let issue = rows.find(row => row.op === 'alert' && row.key === alert.key);
   if (ctx.dryRun) return { ref: issue ? issue.seq : null, winner: false, pending: true };
-  if (!issue) issue = append(ctx, 'alert', { key: alert.key, title: alert.title || '[errmeter] alert: ' + alert.key, body: alert.body, mention: alert.mention }, rows);
+  if (!issue) issue = append(ctx, 'alert', { key: alert.key, title: redact(alert.title || '[errmeter] alert: ' + alert.key, ctx.maskList || []), body: alert.body, mention: alert.mention }, rows);
   const now = time(ctx);
   const watch = ctx.config.watch || {};
   const recent = rows.filter(row => row.op === 'alert-episode' && row.key === alert.key && Date.parse(row.ts) > Date.parse(now) - (watch.renotify_sec || 21600) * 1000).sort((a, b) => a.seq - b.seq);

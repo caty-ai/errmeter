@@ -108,11 +108,14 @@ test('GitHub counter refs survive crash recovery without reposting or event ids'
   const g = { ...group(event('synthetic')), count: 9, counter: 'nonce.0' };
   await sink.deliverFailureGroup(ctx, g);
   assert.match(fake.issues[0].body, /ids= count=9/); assert.match(fake.issues[0].body, /counter_ref=nonce\.0/);
+  assert.equal(fake.comments.length, 0);
+  assert.equal(writes(fake).length, 1);
   const before = writes(fake).length;
   assert.equal((await sink.deliverFailureGroup(ctx, g)).skipped, true);
   assert.equal(writes(fake).length, before);
   await sink.deliverFailureGroup(ctx, { ...g, counter: 'nonce.1', count: 2 });
   assert.match(fake.comments[0].body, /counter_ref=nonce\.1/);
+  assert.equal((await sink.getFailure(ctx, fake.issues[0].number)).occurrences, 11);
 });
 
 test('GitHub rolls over full issues and preserves crash recovery against predecessor', async t => {

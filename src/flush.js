@@ -135,13 +135,15 @@ function prune(root, type, days, maxBytes, clock) {
 function pendingCount(roots) {
   return roots.reduce((total, home) => total + entries(path.join(home, 'spool', 'pending')).filter(name => !name.endsWith('.tmp')).length, 0);
 }
-function foldedLines(buffer, nonce, k, masks) {
+function foldedLines(buffer, nonce, k, masks, onInvalid = () => {}) {
   const groups = new Map();
   for (const line of buffer.toString('utf8').split('\n')) {
     if (!line) continue;
     const [fingerprint, fpv, agent, host, ts, ...message] = line.split('\t');
-    if (!agent || !host || !Number.isFinite(Date.parse(ts)) || !/^\d+$/.test(fpv || '') || !message.length) {
-      throw new Error('invalid overflow counter line; cut retained');
+    if (!agent || !host || !Number.isFinite(Date.parse(ts)) || !/^\d+$/.test(fpv || '') || !message.length ||
+        !(fingerprint === '-' && fpv === '0' || /^[a-f0-9]{16}$/.test(fingerprint) && Number(fpv) > 0)) {
+      onInvalid();
+      continue;
     }
     const heartbeat = fingerprint === '-' && fpv === '0';
     const key = heartbeat ? '-' + agent + '@' + host : fingerprint;
@@ -182,7 +184,9 @@ async function drainCut(root, ctx, sink, masks, sleep, guard, onError) {
       guard();
       const buffer = fs.readFileSync(file).subarray(cut.offset, cut.end);
       if (buffer.length && buffer[buffer.length - 1] !== 10) throw new Error('incomplete counter line; cut retained');
-      const groups = foldedLines(buffer, nonce, cut.k, masks);
+      let invalid = 0;
+      const groups = foldedLines(buffer, nonce, cut.k, masks, () => { invalid++; });
+      if (invalid) onError(Object.assign(new Error('invalid overflow counter lines skipped: ' + invalid), { code: 'ECOUNTER_INVALID' }));
       atomic(checkpoint, cut);
       let complete = true;
       for (const group of groups) {
@@ -203,7 +207,14 @@ async function drainCut(root, ctx, sink, masks, sleep, guard, onError) {
       await sleep(ctx.config.spool.cut_settle_sec * 1000);
       guard();
       const end = size(file);
-      if (end === cut.end) { fs.unlinkSync(file); fs.unlinkSync(checkpoint); break; }
+      if (end === cut.end) {
+        // Preserve the pass boundary until the cut is gone: losing it first
+        // would reinterpret a recovered tail as part of pass zero.
+        if (invalid && !groups.length && !foldedLines(fs.readFileSync(file), nonce, cut.k, masks).length) move({ file, source: fs.readFileSync(file, 'utf8') }, 'dead');
+        else fs.unlinkSync(file);
+        fs.unlinkSync(checkpoint);
+        break;
+      }
       if (end < cut.end) throw new Error('counter cut shrank; cut retained');
       cut = { k: cut.k + 1, offset: cut.end, end, posted: [] };
       atomic(checkpoint, cut);
@@ -239,7 +250,7 @@ async function dryRun(roots, ctx, sink, masks) {
         const checkpoint = readJSON(path.join(ctx.home, 'state', 'cuts', nonce + '.json'), null);
         const bytes = fs.readFileSync(path.join(pending, name));
         const groups = foldedLines(bytes.subarray(checkpoint?.offset || 0, checkpoint?.end ?? bytes.length), nonce, checkpoint?.k || 0, masks);
-        for (const group of groups) if (!checkpoint?.posted.includes(group.key)) writes.push({ op: group.heartbeat ? 'heartbeat' : 'failure', fingerprint: group.fingerprint, counter: group.counter, count: group.count, target: null });
+        for (const group of groups) if (!checkpoint?.posted?.includes(group.key)) writes.push({ op: group.heartbeat ? 'heartbeat' : 'failure', fingerprint: group.fingerprint, counter: group.counter, count: group.count, target: null });
         continue;
       }
       if (!selected.has(name)) continue;
@@ -270,7 +281,7 @@ async function dryRun(roots, ctx, sink, masks) {
 async function flush(argv, env = process.env, io = {}) {
   const stdout = io.stdout ?? process.stdout; const stderr = io.stderr ?? process.stderr;
   let flags;
-  try { flags = parseFlush(argv); } catch (_) { output(stderr, 'flush: invalid arguments\n'); return 3; }
+  try { flags = parseFlush(argv); } catch (_) { output(stderr, 'flush: invalid arguments\n'); return 2; }
   if (flags.help || flags.version) { if (!flags.quiet) output(stdout, flags.version ? version + '\n' : USAGE); return 0; }
   let resolved;
   try { resolved = resolveConfig(flags, env, { command: 'flush' }); }
@@ -342,7 +353,7 @@ async function flush(argv, env = process.env, io = {}) {
           const message = clean(error.message || error.code || 'flush operation failed');
           state.errors.push(message); log(message);
           if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code)) ctx.lookup_incomplete = true;
-          else if (error.code !== 'EINTERRUPTED') {
+          else if (!['EINTERRUPTED', 'ECOUNTER_INVALID'].includes(error.code)) {
             transport = true;
             const retryUntil = Math.max(until, backoff(error, previousDelay, clock));
             if (retryUntil > until) backoffStartedAt = clock();
@@ -430,12 +441,15 @@ async function flush(argv, env = process.env, io = {}) {
             heartbeatItems.sort((a, b) => String(a.event.ts).localeCompare(String(b.event.ts)));
             const item = heartbeatItems[heartbeatItems.length - 1];
             try {
-              // Older heartbeats have been superseded by the newest observation;
-              // retaining them through outages would grow one claimed file per emit.
-              for (const older of heartbeatItems.slice(0, -1)) move(older, 'sent');
               attempt(item);
               const result = await sink.deliverHeartbeat(ctx, item.event);
-              if (result && !result.pending && !result.lookup_incomplete && (result.ref != null || result.skipped)) move(item, 'sent');
+              if (result && !result.pending && !result.throttled && !result.lookup_incomplete && (result.ref != null || result.skipped)) {
+                // Superseded observations are acknowledged only once the board
+                // has accepted the newest one. Keep each superseded observation
+                // under its private claim name for an intact audit trail.
+                for (const older of heartbeatItems.slice(0, -1)) move({ ...older, basename: path.basename(older.file) }, 'sent');
+                move(item, 'sent');
+              }
             } catch (error) {
               if (item.event.schema > 1 && [400, 422].includes(error.status ?? error.statusCode)) {
                 move(item, 'dead');
@@ -498,7 +512,8 @@ async function flush(argv, env = process.env, io = {}) {
   const failed = Boolean(state.pending_remaining || state.lookup_incomplete || state.errors.length || stopped);
   if (!flags.quiet) output(stdout, flags.json ? JSON.stringify(clean({ ...state, ...(writes ? { writes } : {}) })) + '\n'
     : 'flush: ' + state.pending_remaining + ' pending' + (state.lookup_incomplete ? ', lookup incomplete' : '') +
-      (writes ? ', would write ' + JSON.stringify(clean(writes)) : '') + (state.errors.length ? ', ' + state.errors.length + ' errors' : '') + '\n');
+      (writes ? ', would write ' + JSON.stringify(clean(writes)) : '') + (state.errors.length ? ', ' + state.errors.length + ' errors' : '') +
+      (writes && failed ? '. Dry-run leaves pending work unchanged (exit 1).' : '') + '\n');
   return failed ? 1 : 0;
 }
 function main(argv) {
