@@ -212,8 +212,8 @@ All markers are HTML comments on their own line; `key=value` pairs separated by 
 
 | record | title | body / comment |
 |---|---|---|
-| Failure Issue | `[errmeter] <agent>: <newest message, first 80 chars>` | marker `<!-- errmeter:failure fp=<fingerprint> fpv=1 ids=<id,...> count=<n> first=<ts> last=<ts> schema=1 -->` + human summary + `latest` event as a fenced ```json block (full §2 object, already redacted) |
-| Occurrence comment | — | `<!-- errmeter:occurrence ids=<id,...> count=<n> first=<ts> last=<ts> -->` + summary + fenced ```json `latest` event (if a counter: `ids=` empty, `count` from the counter) |
+| Failure Issue | `[errmeter] <agent>: <newest message, first 80 chars>` | marker `<!-- errmeter:failure fp=<fingerprint> fpv=1 ids=<id,...> count=<n> first=<ts> last=<ts> schema=1 -->` + human summary + `latest` event as a fenced ```json block (full §2 object, already redacted). When a counter group creates the Issue, the marker may also carry `counter_ref=<nonce>.<k>`. |
+| Occurrence comment | — | `<!-- errmeter:occurrence ids=<id,...> count=<n> first=<ts> last=<ts> ts=<board ISO> -->` + summary + fenced ```json `latest` event (if a counter: `ids=` empty, `count` from the counter, and `counter_ref=<nonce>.<k>` is present) |
 | Heartbeat Issue | `[errmeter] heartbeat: <agent>@<host>` | `<!-- errmeter:heartbeat agent= host= role= ts=<ISO of the event> -->` + last message. **Liveness = `ts` in the marker**, never Issue `updated_at`. |
 | Alert Issue | `[errmeter] alert: <key>` | `<!-- errmeter:alert key= -->` + body; each alert episode is a comment `<!-- errmeter:alert-episode key= host= ts= -->` (§5.3) |
 | Claim comment | — | `<!-- errmeter:claim watcher=<id> expires=<ISO> ref=<claimRef-or-new> -->` |
@@ -421,6 +421,8 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- v1.7 note (2026-09-06, #5/#18): clarify `counter_ref=` on counter-created Failure Issue markers and `ts=` on occurrence markers; no version bump or format change.
 
 - v1.7 note (2026-09-05, #4): flush returns 2 for a usage error (was unspecified); §3.3 names malformed overflow lines as a counted, accepted residual; §3 heartbeat upsert note above. No field or format change, no version bump.
 

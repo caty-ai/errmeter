@@ -6,8 +6,8 @@ const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { resolveConfig } = require('./config');
 const { parseFlush, USAGE } = require('./cli');
-const { buildMaskList, sensitiveKey } = require('./redact');
-const { cleanValue } = require('./sinks/clean');
+const { buildMaskList } = require('./redact');
+const { cleanValue, cleanEvent } = require('./sinks/clean');
 const version = require('../package.json').version;
 
 function atomic(file, value) {
@@ -44,11 +44,7 @@ function output(target, text) {
   try { if (typeof target === 'function') target(text); else target.write(text); } catch (_) { /* closed pipe */ }
 }
 function eventForBoard(event, masks) {
-  const clean = cleanValue(event, masks);
-  if (clean.meta && typeof clean.meta === 'object') {
-    for (const key of Object.keys(clean.meta)) if (sensitiveKey.test(key)) clean.meta[key] = '[REDACTED]';
-  }
-  return clean;
+  return cleanEvent(event, masks);
 }
 function acquire(home, limits, clock) {
   const file = path.join(home, 'spool', 'flush.lock');
@@ -293,6 +289,7 @@ async function flush(argv, env = process.env, io = {}) {
   const sink = io.sink || require('./sinks/' + config.sink.type);
   const ctx = { config, home, log, maskList: masks, http: io.http || require('./http').request,
     now: () => ctx.boardTime || new Date(clock()).toISOString(), dryRun: Boolean(flags['dry-run']) };
+  ctx.notify = io.notify || (config.notify.length ? alert => require('./notify').notify(ctx, alert) : undefined);
   const fallback = path.join(io.tmpdir || os.tmpdir(), 'errmeter-spool');
   const roots = [home];
   if (fallback !== home && fs.existsSync(path.join(fallback, 'spool'))) roots.push(fallback);
@@ -319,10 +316,18 @@ async function flush(argv, env = process.env, io = {}) {
       lock = acquire(home, config.spool, clock);
       if (!lock) {
         if (flags.linger) return 0;
+        io.onResult?.({ busy: true, pending_remaining: 1, lookup_incomplete: false, errors: [] });
         if (!flags.quiet) output(stdout, flags.json ? '{"busy":true,"pending_remaining":1}\n' : 'busy\n');
         return 1;
       }
       process.on('SIGINT', signal); process.on('SIGTERM', signal);
+      // A crash after deleting a cut can leave its checkpoint behind. Keep
+      // checkpoints belonging to either spool root, and remove only orphans.
+      const cutsDir = path.join(home, 'state', 'cuts');
+      for (const name of entries(cutsDir).filter(name => name.endsWith('.json'))) {
+        const cutName = 'counters.' + name.slice(0, -5) + '.log';
+        if (!roots.some(root => fs.existsSync(path.join(root, 'spool', 'pending', cutName)))) fs.unlinkSync(path.join(cutsDir, name));
+      }
       const started = clock();
       const saved = readJSON(path.join(home, 'state', 'last_flush.json'), {});
       let until = Date.parse(saved.backoff_until) || 0;
@@ -425,6 +430,7 @@ async function flush(argv, env = process.env, io = {}) {
             guard();
             heartbeatItems.sort((a, b) => String(a.event.ts).localeCompare(String(b.event.ts)));
             const item = heartbeatItems[heartbeatItems.length - 1];
+            let moved = false;
             try {
               attempt(item);
               const result = await sink.deliverHeartbeat(ctx, item.event);
@@ -433,7 +439,7 @@ async function flush(argv, env = process.env, io = {}) {
                 // has accepted the newest one. Keep each superseded observation
                 // under its private claim name for an intact audit trail.
                 for (const older of heartbeatItems.slice(0, -1)) move({ ...older, basename: path.basename(older.file) }, 'sent');
-                move(item, 'sent');
+                moved = move(item, 'sent');
               }
             } catch (error) {
               if (item.event.schema > 1 && [400, 422].includes(error.status ?? error.statusCode)) {
@@ -441,9 +447,10 @@ async function flush(argv, env = process.env, io = {}) {
                 continue;
               }
               onError(error);
-              // These private claims are superseded observations of one
-              // upsert. Retain only the newest claim for the next pass.
-              for (const older of heartbeatItems.slice(0, -1)) {
+            } finally {
+              // Throttling and incomplete lookups also retain the newest
+              // observation. Fold superseded claims on every pending path.
+              if (!moved) for (const older of heartbeatItems.slice(0, -1)) {
                 try { fs.unlinkSync(older.file); }
                 catch (unlinkError) { if (unlinkError.code !== 'ENOENT') throw unlinkError; }
               }
@@ -501,6 +508,7 @@ async function flush(argv, env = process.env, io = {}) {
     process.removeListener('SIGINT', signal); process.removeListener('SIGTERM', signal);
   }
   const failed = Boolean(state.pending_remaining || state.lookup_incomplete || state.errors.length || stopped);
+  io.onResult?.(clean({ ...state, ...(writes ? { writes } : {}) }));
   if (!flags.quiet) output(stdout, flags.json ? JSON.stringify(clean({ ...state, ...(writes ? { writes } : {}) })) + '\n'
     : 'flush: ' + state.pending_remaining + ' pending' + (state.lookup_incomplete ? ', lookup incomplete' : '') +
       (writes ? ', would write ' + JSON.stringify(clean(writes)) : '') + (state.errors.length ? ', ' + state.errors.length + ' errors' : '') +

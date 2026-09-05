@@ -3,7 +3,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { cleanValue } = require('./clean');
+const { cleanValue, cleanEvent } = require('./clean');
+const { deriveClaimState } = require('../claim');
 const version = require('../../package.json').version;
 
 function now(ctx) { return new Date(ctx.boardTime || (ctx.now ? ctx.now() : Date.now())).toISOString(); }
@@ -33,33 +34,34 @@ async function api(ctx, method, target, body) {
     const error = new Error('GitHub HTTP ' + response.status);
     error.status = response.status; error.headers = response.headers; throw error;
   }
-  const date = response.date || response.headers?.date;
+  const date = response.date || response.headers?.date || response.headers?.Date;
   if (date && Number.isFinite(new Date(date).getTime())) ctx.boardTime = new Date(date).toISOString();
   return response;
 }
 function root(ctx) { return '/repos/' + ctx.config.sink.repo; }
-async function list(ctx, target) {
+async function list(ctx, target, requireBoardTime = false) {
   let next = target + (target.includes('?') ? '&' : '?') + 'per_page=100';
-  const rows = [];
+  const rows = []; let boardTime;
   for (let page = 0; next; page++) {
     if (page >= limit(ctx, 'max_pages_per_list', 10)) throw unknown(ctx);
     const res = await api(ctx, 'GET', next);
     if (!Array.isArray(res.body)) throw unknown(ctx);
+    boardTime = res.date || res.headers?.date || res.headers?.Date;
     rows.push(...res.body);
     const links = res.headers?.link || res.headers?.Link || '';
     next = (links.match(/<([^>]+)>;\s*rel="next"/) || [])[1];
   }
+  if (requireBoardTime && !Number.isFinite(new Date(boardTime).getTime())) throw unknown(ctx);
   return rows;
 }
 function markers(body, type) {
-  const result = [];
-  for (const match of (body || '').matchAll(/<!-- errmeter:([a-z-]+)(?: ([^\n]*?))? -->/g)) {
-    if (type && match[1] !== type) continue;
-    const item = { type: match[1] };
-    for (const field of (match[2] || '').split(' ')) { const at = field.indexOf('='); if (at >= 0) item[field.slice(0, at)] = field.slice(at + 1); }
-    result.push(item);
-  }
-  return result;
+  // Human summaries and fenced event data are untrusted; only the exact first
+  // line of a board record can acknowledge delivery or participate in elections.
+  const match = /^<!-- errmeter:([a-z-]+)(?: ([^\r\n]*?))? -->$/.exec((body || '').split(/\r?\n/, 1)[0]);
+  if (!match || (type && match[1] !== type)) return [];
+  const item = { type: match[1] };
+  for (const field of (match[2] || '').split(' ')) { const at = field.indexOf('='); if (at >= 0) item[field.slice(0, at)] = field.slice(at + 1); }
+  return [item];
 }
 function allMarkers(issue, comments) { return [issue, ...comments].flatMap(row => markers(row.body)); }
 function idsIn(issue, comments) { return new Set(allMarkers(issue, comments).flatMap(m => (m.ids || '').split(',').filter(Boolean))); }
@@ -67,7 +69,7 @@ function latest(body) {
   const matches = [...(body || '').matchAll(/```json\n([\s\S]*?)\n```/g)];
   try { return JSON.parse(matches.at(-1)?.[1] || '{}'); } catch (_) { return {}; }
 }
-async function comments(ctx, ref) { return list(ctx, root(ctx) + '/issues/' + ref + '/comments'); }
+async function comments(ctx, ref, requireBoardTime = false) { return list(ctx, root(ctx) + '/issues/' + ref + '/comments', requireBoardTime); }
 async function post(ctx, ref, body) { return (await api(ctx, 'POST', root(ctx) + '/issues/' + ref + '/comments', { body })).body; }
 async function removeComment(ctx, id) { await api(ctx, 'DELETE', root(ctx) + '/issues/comments/' + id); }
 async function issue(ctx, ref) { return (await api(ctx, 'GET', root(ctx) + '/issues/' + ref)).body; }
@@ -84,12 +86,13 @@ function cacheWrite(ctx, name, key, value) {
 function counterRef(group) { const c = group.counter; return typeof c === 'string' ? c : c?.ref || c?.counter_ref || (c?.nonce ? c.nonce + '.' + (c.k || 0) : group.counter_ref); }
 function bodyFor(ctx, group, events, kind, extra = '') {
   const counter = counterRef(group);
-  const first = events[0] || group.events[0] || {}; const last = events.at(-1) || group.events.at(-1) || {};
-  const cleanLast = cleanValue(last, masks(ctx));
+  const cleaned = events.map(event => cleanEvent(event, masks(ctx)));
+  const first = cleaned[0] || cleanEvent(group.events[0] || {}, masks(ctx));
+  const cleanLast = cleaned.at(-1) || cleanEvent(group.events.at(-1) || {}, masks(ctx));
   const count = counter ? group.count : events.reduce((n, e) => n + Number(e.meta?._folded_count || 1), 0);
   const prefix = kind === 'failure' ? ' fp=' + group.fingerprint + ' fpv=' + group.fpv : '';
-  const marker = '<!-- errmeter:' + kind + prefix + ' ids=' + (counter ? '' : events.map(e => e.id).join(',')) + ' count=' + count + ' first=' + first.ts + ' last=' + last.ts + (kind === 'failure' ? ' schema=1' : '') + (counter ? ' counter_ref=' + counter : '') + (kind === 'occurrence' ? ' ts=' + now(ctx) : '') + extra + ' -->';
-  return marker + '\n\n' + (Number(last.schema) > 1 ? 'Newer event schema; delivered verbatim.\n\n' : '') + (cleanLast.message || '') + '\n\n```json\n' + JSON.stringify(cleanLast, null, 2) + '\n```';
+  const marker = '<!-- errmeter:' + kind + prefix + ' ids=' + (counter ? '' : cleaned.map(e => e.id).join(',')) + ' count=' + count + ' first=' + first.ts + ' last=' + cleanLast.ts + (kind === 'failure' ? ' schema=1' : '') + (counter ? ' counter_ref=' + counter : '') + (kind === 'occurrence' ? ' ts=' + now(ctx) : '') + extra + ' -->';
+  return marker + '\n\n' + (Number(cleanLast.schema) > 1 ? 'Newer event schema; delivered verbatim.\n\n' : '') + (cleanLast.message || '') + '\n\n```json\n' + JSON.stringify(cleanLast, null, 2) + '\n```';
 }
 async function createFailure(ctx, group, events, extra) {
   return (await api(ctx, 'POST', root(ctx) + '/issues', { title: text(ctx, '[errmeter] ' + group.agent + ': ' + (events.at(-1)?.message || group.events.at(-1)?.message || '').slice(0, 80)), body: bodyFor(ctx, group, events, 'failure', extra), labels: ['errmeter', 'errmeter:failure'] })).body;
@@ -108,7 +111,7 @@ async function duplicate(ctx, canonical, dup, migrate) {
       const ms = allMarkers(dup, dupRows).filter(m => m.ids);
       const first = ms.map(m => m.first).filter(Boolean).sort()[0] || dup.created_at;
       const last = ms.map(m => m.last).filter(Boolean).sort().at(-1) || dup.created_at;
-      await post(ctx, canonical.number, '<!-- errmeter:occurrence ids=' + missing.join(',') + ' count=' + missing.length + ' first=' + first + ' last=' + last + ' migrated_from=' + dup.number + ' ts=' + now(ctx) + ' -->\n\nMigrated from #' + dup.number + '\n\n```json\n' + JSON.stringify(latest(dupRows.at(-1)?.body || dup.body)) + '\n```');
+      await post(ctx, canonical.number, '<!-- errmeter:occurrence ids=' + missing.join(',') + ' count=' + missing.length + ' first=' + first + ' last=' + last + ' migrated_from=' + dup.number + ' ts=' + now(ctx) + ' -->\n\nMigrated from #' + dup.number + '\n\n```json\n' + JSON.stringify(cleanEvent(latest(dupRows.at(-1)?.body || dup.body), masks(ctx))) + '\n```');
     }
     const knownCounters = new Set(allMarkers(canonical, rows).map(m => m.counter_ref).filter(Boolean));
     for (const m of allMarkers(dup, dupRows)) {
@@ -176,6 +179,7 @@ async function deliverFailureGroup(ctx, group) {
 function heartbeatRecord(row) { const m = markers(row.body, 'heartbeat')[0]; return m ? { ref: row.number, agent: m.agent, host: m.host, role: m.role || null, lastSeen: m.ts, message: (row.body || '').split('-->')[1]?.trim() || '' } : null; }
 async function listHeartbeats(ctx) { return (await issues(ctx, 'errmeter:heartbeat')).map(heartbeatRecord).filter(Boolean); }
 async function deliverHeartbeat(ctx, event) {
+  event = cleanEvent(event, masks(ctx));
   const key = event.agent + '@' + event.host; const cached = cacheRead(ctx, 'heartbeats')[key]; let found;
   if (cached) { try { const row = await issue(ctx, cached.ref || cached); if (row.state === 'open') found = heartbeatRecord(row); } catch (e) { if (e.status !== 404) throw e; } }
   if (!found) found = (await listHeartbeats(ctx)).filter(h => h.agent === event.agent && h.host === event.host).sort((a, b) => a.ref - b.ref)[0];
@@ -188,14 +192,82 @@ async function deliverHeartbeat(ctx, event) {
   cacheWrite(ctx, 'heartbeats', key, ref); return { ref };
 }
 async function getFailure(ctx, ref) {
-  const row = await issue(ctx, ref); const cs = await comments(ctx, ref); const ms = allMarkers(row, cs); const failure = markers(row.body, 'failure')[0] || {};
+  const row = await issue(ctx, ref); const cs = await comments(ctx, ref, true); const ms = allMarkers(row, cs); const failure = markers(row.body, 'failure')[0] || {};
   const events = [row, ...cs].map(c => latest(c.body)).filter(e => e.id); const event = events.at(-1) || {};
-  const outcomes = cs.flatMap(c => markers(c.body, 'outcome').map(m => ({ status: m.status, watcherId: m.watcher, at: m.ts, summary: c.body.split('-->')[1]?.trim() || '' })));
-  const claims = cs.flatMap(c => markers(c.body, 'claim').map(m => ({ claimRef: m.ref === 'new' ? c.id : Number(m.ref), watcherId: m.watcher, createdAt: c.created_at, expiresAt: m.expires,
-    live: new Date(m.expires) > new Date(now(ctx)) && !cs.some(later => later.id > c.id && markers(later.body).some(end => ['release', 'outcome'].includes(end.type) && end.watcher === m.watcher)) })));
+  const state = deriveClaimState({ issue: row, comments: cs, now: ctx.boardTime });
+  const claims = state.claims.map(({ commentId, ...claim }) => claim);
+  const holder = state.claim ? claims[state.claims.indexOf(state.claim)] : null;
+  const outcomes = state.outcomes;
   return { ref: row.number, fingerprint: failure.fp, fpv: Number(failure.fpv), agent: event.agent, host: event.host, title: row.title, labels: (row.labels || []).map(l => typeof l === 'string' ? l : l.name), openedAt: row.created_at,
-    lastOccurrenceAt: ms.map(m => m.last).filter(Boolean).sort().at(-1), occurrences: ms.reduce((n, m) => n + (['failure', 'occurrence'].includes(m.type) ? Number(m.count || 0) : 0), 0), claim: claims.filter(c => c.live).sort((a, b) => a.claimRef - b.claimRef)[0] || null,
-    lastOutcome: outcomes.at(-1) || null, latest: event, claims, outcomes, occurrenceIds: [...idsIn(row, cs)] };
+    firstOccurrenceAt: failure.first || row.created_at,
+    lastOccurrenceAt: ms.map(m => m.last).filter(Boolean).sort().at(-1), occurrences: ms.reduce((n, m) => n + (['failure', 'occurrence'].includes(m.type) ? Number(m.count || 0) : 0), 0), claim: holder,
+    lastOutcome: outcomes.at(-1) || null, occurrenceAfterLastOutcome: state.occurrenceAfterLastOutcome,
+    latest: event, claims, outcomes, occurrenceIds: [...idsIn(row, cs)] };
+}
+async function addLabels(ctx, ref, labels) { await api(ctx, 'POST', root(ctx) + '/issues/' + ref + '/labels', { labels }); }
+async function removeLabel(ctx, ref, label) {
+  try { await api(ctx, 'DELETE', root(ctx) + '/issues/' + ref + '/labels/' + encodeURIComponent(label)); }
+  catch (error) { if (error.status !== 404) throw error; }
+}
+function claimBody(watcherId, expiresAt, claimRef) {
+  return '<!-- errmeter:claim watcher=' + watcherId + ' expires=' + expiresAt + ' ref=' + claimRef + ' -->';
+}
+function releaseBody(watcherId, claimRef) { return '<!-- errmeter:release watcher=' + watcherId + ' ref=' + claimRef + ' -->'; }
+function expiry(ctx, ttlSec) { return new Date(Date.parse(ctx.boardTime) + ttlSec * 1000).toISOString(); }
+async function discardClaim(ctx, ref, watcherId, id) {
+  try { await removeComment(ctx, id); }
+  catch (_) { await post(ctx, ref, releaseBody(watcherId, id)); }
+}
+async function claim(ctx, ref, { watcherId, ttlSec }) {
+  const row = await issue(ctx, ref);
+  const before = await comments(ctx, ref, true);
+  if (!deriveClaimState({ issue: row, comments: before, now: ctx.boardTime }).eligible) return { won: false };
+  const expiresAt = expiry(ctx, ttlSec);
+  const mine = await post(ctx, ref, claimBody(watcherId, expiresAt, 'new'));
+  try {
+    const rows = await comments(ctx, ref, true);
+    const state = deriveClaimState({ issue: row, comments: rows, now: ctx.boardTime });
+    const stillEligible = deriveClaimState({ issue: row, comments: rows.filter(c => !/^<!-- errmeter:claim /.test(c.body)), now: ctx.boardTime }).eligible;
+    if (state.claim?.claimRef === mine.id && state.holder === watcherId && stillEligible) {
+      await addLabels(ctx, ref, ['errmeter:claimed']);
+      return { won: true, claimRef: mine.id, expiresAt };
+    }
+  } catch (error) {
+    // An incomplete re-read must never dispatch. Release our exact candidate
+    // when possible, while preserving the original transport/budget failure.
+    try { await discardClaim(ctx, ref, watcherId, mine.id); } catch (_) {}
+    throw error;
+  }
+  await discardClaim(ctx, ref, watcherId, mine.id);
+  return { won: false };
+}
+async function renewClaim(ctx, ref, { watcherId, claimRef, ttlSec }) {
+  try {
+    const rows = await comments(ctx, ref, true);
+    const state = deriveClaimState({ comments: rows, now: ctx.boardTime });
+    if (state.holder !== watcherId || String(state.claim?.claimRef) !== String(claimRef)) return { ok: false };
+    const expiresAt = expiry(ctx, ttlSec);
+    await post(ctx, ref, claimBody(watcherId, expiresAt, claimRef));
+    return { ok: true, expiresAt };
+  } catch (_) { return { ok: false }; }
+}
+async function releaseClaim(ctx, ref, { watcherId, claimRef }) {
+  await post(ctx, ref, releaseBody(watcherId, claimRef));
+  await removeLabel(ctx, ref, 'errmeter:claimed');
+}
+async function writeOutcome(ctx, ref, outcome) {
+  if (!['repaired', 'dispatch-failed', 'needs-human'].includes(outcome.status)) throw new Error('Invalid outcome status');
+  // Refresh board time before stamping the outcome, even for standalone calls.
+  await issue(ctx, ref);
+  const summary = text(ctx, String(outcome.summary || '')).slice(0, 500);
+  const url = outcome.url ? '\n\n' + text(ctx, String(outcome.url)) : '';
+  const excerpt = text(ctx, String(outcome.excerpt ?? outcome.stderr ?? '')).split(/\r?\n/).slice(-20).join('\n');
+  const body = '<!-- errmeter:outcome status=' + outcome.status + ' watcher=' + outcome.watcherId + ' ts=' + now(ctx) + ' -->\n\n' + summary + url + (excerpt ? '\n\n```text\n' + excerpt + '\n```' : '');
+  await post(ctx, ref, body);
+  await addLabels(ctx, ref, ['errmeter:dispatched', 'errmeter:' + outcome.status, ...(outcome.escalate && outcome.status !== 'needs-human' ? ['errmeter:needs-human'] : [])]);
+  await removeLabel(ctx, ref, 'errmeter:claimed');
+  for (const status of ['repaired', 'dispatch-failed']) if (status !== outcome.status) await removeLabel(ctx, ref, 'errmeter:' + status);
+  return { ref };
 }
 async function listOpenFailures(ctx) {
   const rows = await issues(ctx, 'errmeter:failure'); const result = [];
@@ -214,25 +286,37 @@ async function upsertAlert(ctx, alert) {
   for (const dup of matches.slice(1)) if (!await duplicate(ctx, canonical, dup, false)) return { ref: canonical.number, winner: false };
   const prefix = '<!-- errmeter:alert-episode key=' + alert.key + ' host=' + ctx.config.host + ' ts=';
   const stamp = now(ctx); const mine = await post(ctx, canonical.number, prefix + stamp + ' -->');
-  let rows = await comments(ctx, canonical.number);
+  let rows = await comments(ctx, canonical.number, true);
   const windowMs = (ctx.config.watch?.renotify_sec ?? 21600) * 1000;
+  const confirmMs = (ctx.config.watch?.notify_confirm_sec ?? 120) * 1000;
   const episodes = rows.flatMap(c => markers(c.body, 'alert-episode').filter(m => m.key === alert.key && new Date(now(ctx)) - new Date(m.ts) < windowMs).map(m => ({ ...m, id: c.id, body: c.body }))).sort((a, b) => a.id - b.id);
   const winner = episodes.find(e => e.cover !== '1');
   let chosen = mine; let original;
   if (winner?.id !== mine.id) {
     await removeComment(ctx, mine.id);
-    if (!winner || winner.notified || new Date(now(ctx)) - new Date(winner.ts) < (ctx.config.watch?.notify_confirm_sec ?? 120) * 1000) return { ref: canonical.number, winner: false };
+    if (!winner || winner.notified || new Date(now(ctx)) - new Date(winner.ts) < confirmMs) return { ref: canonical.number, winner: false };
     chosen = await post(ctx, canonical.number, prefix + now(ctx) + ' cover=1 -->');
-    rows = await comments(ctx, canonical.number);
-    const covers = rows.filter(c => markers(c.body, 'alert-episode').some(m => m.key === alert.key && m.cover === '1' && new Date(now(ctx)) - new Date(m.ts) < windowMs)).sort((a, b) => a.id - b.id);
+    rows = await comments(ctx, canonical.number, true);
+    if (rows.some(c => c.id === winner.id && markers(c.body, 'alert-episode').some(m => m.notified))) {
+      await removeComment(ctx, chosen.id);
+      return { ref: canonical.number, winner: false };
+    }
+    const covers = rows.filter(c => c.id > winner.id && markers(c.body, 'alert-episode').some(m => m.key === alert.key && m.cover === '1' && new Date(now(ctx)) - new Date(m.ts) < confirmMs)).sort((a, b) => a.id - b.id);
     if (covers[0]?.id !== chosen.id) { await removeComment(ctx, chosen.id); return { ref: canonical.number, winner: false }; }
     original = winner;
   }
-  // This flush lane has no notification channel; the alert's owner mention is the notification.
-  const notified = ' notified=' + now(ctx) + ' channel=none -->';
+  let channels = ['none'];
+  if (ctx.notify) {
+    try {
+      const result = await ctx.notify(alert);
+      channels = Array.isArray(result?.sent) ? result.sent : [];
+    } catch (_) { channels = []; }
+    if (!channels.length) return { ref: canonical.number, winner: true, notified: false };
+  }
+  const notified = ' notified=' + now(ctx) + ' channel=' + channels.join(',') + ' -->';
   await api(ctx, 'PATCH', root(ctx) + '/issues/comments/' + chosen.id, { body: chosen.body.replace(' -->', notified) });
   if (original) await api(ctx, 'PATCH', root(ctx) + '/issues/comments/' + original.id, { body: original.body.replace(' -->', notified) });
-  return { ref: canonical.number, winner: true };
+  return { ref: canonical.number, winner: true, notified: true };
 }
 
-module.exports = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, listHeartbeats, upsertAlert };
+module.exports = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, claim, renewClaim, releaseClaim, writeOutcome, listHeartbeats, upsertAlert };
