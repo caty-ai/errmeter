@@ -73,3 +73,36 @@ test('value boundaries preserve quotes, query extent and ordinary lines', () => 
   ];
   for (const [input, expected] of cases) assert.equal(redact(input), expected, input);
 });
+
+test('sensitive pairs preserve boundary behavior', () => {
+  const cases = [
+    ['password: "abc \\"def\\" ghi"', 'password: "[REDACTED]"'],
+    ['token="a\\"', 'token="[REDACTED]"'],
+    ["password='\\'", "password='[REDACTED]'"],
+    ['token="a\\"\nnext=1', 'token="[REDACTED]"\nnext=1'],
+    ['password=', 'password=[REDACTED]'],
+    ['token=one; password=two', 'token=[REDACTED]; password=[REDACTED]'],
+    ['token=one&password=two', 'token=[REDACTED]&password=[REDACTED]'],
+    ['status=ok password=secret', 'status=ok password=[REDACTED]'],
+    ['password=sk-' + 'a'.repeat(16), 'password=[REDACTED TOKEN]']
+  ];
+  for (const [input, expected] of cases) assert.equal(redact(input), expected, input);
+});
+
+test('redaction stays fast for 100 KiB single lines', t => {
+  const bytes = 100 * 1024;
+  const pairs = Array.from({ length: 2000 }, (_, index) => `k${index}=v`).join('&');
+  const cases = [
+    ['no sensitive key', 'status:' + 'x'.repeat(bytes - 7)],
+    ['sensitive key and long value', 'password:' + 'x'.repeat(bytes - 9)],
+    ['2000 query pairs', '?' + pairs + '&padding=' + 'x'.repeat(bytes - pairs.length - 10)]
+  ];
+  for (const [name, input] of cases) {
+    assert.equal(Buffer.byteLength(input), bytes, name);
+    const start = process.hrtime.bigint();
+    redact(input);
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    t.diagnostic(`${name}: ${elapsedMs.toFixed(3)} ms`);
+    assert.ok(elapsedMs < 500, `${name} took ${elapsedMs.toFixed(3)} ms`);
+  }
+});
