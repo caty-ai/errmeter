@@ -302,6 +302,7 @@ async function dispatch(ctx, issue, claim, options = {}) {
         if (stopped || failure) return;
         const status = result?.statusCode ?? result?.status;
         if (result?.ok !== true || (status !== undefined && !(status >= 200 && status < 300))) {
+          if (result?.reason) ctx.log?.('dispatch: claim renewal failed: ' + result.reason);
           fence('claim renewal failed'); return;
         }
         remaining = milliseconds(result.expiresAt) - boardNow() - graceSec * 1000;
@@ -362,20 +363,37 @@ async function dispatch(ctx, issue, claim, options = {}) {
     ...(needsHuman ? { escalate: true } : {}) };
   // Preserve recovery state until the outcome is durable. An outcome itself
   // ends this watcher's claim, so release failure must not hide escalation.
-  await sink.writeOutcome(ctx, issue.ref, outcome);
+  let written;
+  try { written = await sink.writeOutcome(ctx, issue.ref, outcome); }
+  catch (error) {
+    ctx.log?.('dispatch: outcome write failed');
+    try { await sink.releaseClaim(ctx, issue.ref, { watcherId, claimRef: claim.claimRef }); }
+    catch (_) { ctx.log?.('dispatch: claim release failed after outcome failure'); }
+    throw error;
+  }
+  let labelsFailed = Boolean(written?.labelsFailed);
+  let refreshed;
   if (status === 'dispatch-failed' && typeof sink.getFailure === 'function') {
     try {
-      const refreshed = await sink.getFailure(ctx, issue.ref);
+      refreshed = await sink.getFailure(ctx, issue.ref);
       if (refreshed && !ctx.lookup_incomplete) consecutiveFailures = Math.max(consecutiveFailures, failureCount(refreshed));
     } catch (_) { ctx.log?.('dispatch: failure refresh failed after outcome'); }
     needsHuman = consecutiveFailures >= (watch.escalate_after ?? 2);
   }
+  const labelled = (refreshed?.labels || []).some(label => (typeof label === 'string' ? label : label.name) === 'errmeter:needs-human');
+  if (needsHuman && !labelled && (!outcome.escalate || labelsFailed)) {
+    try { await sink.addLabels(ctx, issue.ref, ['errmeter:needs-human']); }
+    catch (_) { labelsFailed = true; ctx.log?.('dispatch: escalation label update failed'); }
+  }
   let releaseFailed = false;
-  try { await sink.releaseClaim(ctx, issue.ref, { watcherId, claimRef: claim.claimRef }); }
+  try {
+    const released = await sink.releaseClaim(ctx, issue.ref, { watcherId, claimRef: claim.claimRef });
+    labelsFailed ||= Boolean(released?.labelsFailed);
+  }
   catch (_) { releaseFailed = true; ctx.log?.('dispatch: claim release failed after outcome'); }
   try { fs.unlinkSync(stateFile); } catch (error) { if (error.code !== 'ENOENT') ctx.log?.('dispatch: could not remove completed state'); }
   return { ...outcome, exitCode: completion.code, signal: completion.signal,
-    consecutiveFailures, needsHuman, ...(releaseFailed ? { releaseFailed: true } : {}) };
+    consecutiveFailures, needsHuman, ...(labelsFailed ? { labelsFailed: true } : {}), ...(releaseFailed ? { releaseFailed: true } : {}) };
 }
 
 module.exports = { dispatch, cleanupDispatches, atomicState, recoverStateLock,

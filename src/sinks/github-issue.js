@@ -223,10 +223,11 @@ function claimBody(watcherId, expiresAt, claimRef) {
 function releaseBody(watcherId, claimRef) { return '<!-- errmeter:release watcher=' + watcherId + ' ref=' + claimRef + ' -->'; }
 function expiry(ctx, ttlSec) { return new Date(Date.parse(ctx.boardTime) + ttlSec * 1000).toISOString(); }
 async function discardClaim(ctx, ref, watcherId, id) {
-  let cleanupUsed = false;
+  if (id == null) return;
+  let cleanupUsed = 0;
   const cleanup = async (method, target, body) => {
-    const outsideBudget = !cleanupUsed && (ctx.apiCalls || 0) >= limit(ctx, 'max_api_calls_per_pass', 60);
-    cleanupUsed ||= outsideBudget;
+    const outsideBudget = cleanupUsed < 2 && (ctx.apiCalls || 0) >= limit(ctx, 'max_api_calls_per_pass', 60);
+    if (outsideBudget) cleanupUsed++;
     return api(ctx, method, target, body, outsideBudget);
   };
   try { await cleanup('DELETE', root(ctx) + '/issues/comments/' + id); }
@@ -247,8 +248,10 @@ async function claim(ctx, ref, { watcherId, ttlSec }) {
     const state = deriveClaimState({ issue: row, comments: rows, now: ctx.boardTime });
     const stillEligible = deriveClaimState({ issue: row, comments: rows.filter(c => !/^<!-- errmeter:claim /.test(c.body)), now: ctx.boardTime }).eligible;
     if (state.claim?.claimRef === mine.id && state.holder === watcherId && stillEligible) {
-      await addLabels(ctx, ref, ['errmeter:claimed']);
-      return { won: true, claimRef: mine.id, expiresAt };
+      let labelsFailed = false;
+      try { await addLabels(ctx, ref, ['errmeter:claimed']); }
+      catch (_) { labelsFailed = true; ctx.log?.('claim: label update failed'); }
+      return { won: true, claimRef: mine.id, expiresAt, ...(labelsFailed ? { labelsFailed: true } : {}) };
     }
   } catch (error) {
     // An incomplete re-read must never dispatch. Release our exact candidate
@@ -268,13 +271,17 @@ async function renewClaim(ctx, ref, { watcherId, claimRef, ttlSec }) {
     await post(ctx, ref, claimBody(watcherId, expiresAt, claimRef));
     return { ok: true, expiresAt };
   } catch (error) {
-    if (attempt || error.code === 'EAPI_BUDGET' || error.code === 'ELOOKUP_INCOMPLETE' || (error.status && error.status < 500)) return { ok: false, reason: 'transport' };
+    if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE'].includes(error.code)) return { ok: false, reason: 'budget' };
+    if (error.status >= 400 && error.status < 500) return { ok: false, reason: 'rejected' };
+    if (attempt) return { ok: false, reason: 'transport' };
     await (ctx.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms))))(2000);
   }
 }
 async function releaseClaim(ctx, ref, { watcherId, claimRef }) {
   await post(ctx, ref, releaseBody(watcherId, claimRef));
-  await removeLabel(ctx, ref, 'errmeter:claimed');
+  try { await removeLabel(ctx, ref, 'errmeter:claimed'); }
+  catch (_) { ctx.log?.('release: label update failed'); return { ref, labelsFailed: true }; }
+  return { ref };
 }
 async function writeOutcome(ctx, ref, outcome) {
   if (!['repaired', 'dispatch-failed', 'needs-human'].includes(outcome.status)) throw new Error('Invalid outcome status');
@@ -284,12 +291,17 @@ async function writeOutcome(ctx, ref, outcome) {
   const url = outcome.url ? '\n\n' + text(ctx, String(outcome.url)) : '';
   const excerpt = text(ctx, String(outcome.excerpt ?? outcome.stderr ?? '')).split(/\r?\n/).slice(-20).join('\n');
   const body = '<!-- errmeter:outcome status=' + outcome.status + ' watcher=' + outcome.watcherId + ' ts=' + now(ctx) + ' -->\n\n' + summary + url + (excerpt ? '\n\n```text\n' + excerpt + '\n```' : '');
-  if (outcome.escalate) await addLabels(ctx, ref, ['errmeter:needs-human']);
+  let labelsFailed = false;
+  const labels = async operation => {
+    try { await operation(); }
+    catch (_) { labelsFailed = true; ctx.log?.('outcome: label update failed'); }
+  };
+  if (outcome.escalate) await labels(() => addLabels(ctx, ref, ['errmeter:needs-human']));
   await post(ctx, ref, body);
-  await addLabels(ctx, ref, ['errmeter:dispatched', 'errmeter:' + outcome.status]);
-  await removeLabel(ctx, ref, 'errmeter:claimed');
-  for (const status of ['repaired', 'dispatch-failed']) if (status !== outcome.status) await removeLabel(ctx, ref, 'errmeter:' + status);
-  return { ref };
+  await labels(() => addLabels(ctx, ref, ['errmeter:dispatched', 'errmeter:' + outcome.status]));
+  await labels(() => removeLabel(ctx, ref, 'errmeter:claimed'));
+  for (const status of ['repaired', 'dispatch-failed']) if (status !== outcome.status) await labels(() => removeLabel(ctx, ref, 'errmeter:' + status));
+  return { ref, ...(labelsFailed ? { labelsFailed: true } : {}) };
 }
 async function listOpenFailures(ctx) {
   const rows = await issues(ctx, 'errmeter:failure'); const result = [];

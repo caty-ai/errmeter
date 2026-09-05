@@ -230,12 +230,14 @@ test('a runner-held state lock makes renewal fail closed without changing state 
   assert.equal((await pending).status, 'dispatch-failed');
 });
 
-for (const result of [{ ok: false }, { ok: false, reason: 'holder-changed' }, { ok: false, reason: 'transport' }, { ok: true, statusCode: 503 }, { ok: true, expiresAt: 'invalid' }]) {
+for (const result of [{ ok: false }, { ok: false, reason: 'holder-changed' }, { ok: false, reason: 'transport' }, { ok: false, reason: 'budget' }, { ok: false, reason: 'rejected' }, { ok: true, statusCode: 503 }, { ok: true, expiresAt: 'invalid' }]) {
   test('unconfirmed renewal kills runner and cannot extend state: ' + JSON.stringify(result), async t => {
     const h = harness(t, { async renewClaim() { return result; } });
+    const logs = []; h.ctx.log = message => logs.push(message);
     const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
     const initial = fs.readFileSync(h.file, 'utf8');
     await h.fire(180000);
+    if (result.reason) assert.deepEqual(logs, ['dispatch: claim renewal failed: ' + result.reason]);
     assert.deepEqual(h.kills, [[-h.child.pid, 'SIGTERM']]);
     assert.equal(fs.readFileSync(h.file, 'utf8'), initial);
     h.child.emit('close', 0, null);
@@ -306,7 +308,65 @@ test('spawn errors become failed outcomes and board failures preserve recovery s
   h2.child.emit('close', 1, null);
   await assert.rejects(failed, /board unavailable/);
   assert.equal(fs.existsSync(h2.file), true);
-  assert.equal(h2.calls.length, 0);
+  assert.deepEqual(h2.calls.map(call => call[0]), ['release']);
+});
+
+test('refreshed failures crossing the threshold add one label before release', async t => {
+  const order = [];
+  const h = harness(t, {
+    async writeOutcome(ctx, ref, outcome) { order.push('outcome'); assert.equal(outcome.escalate, undefined); },
+    async getFailure() { order.push('refresh'); return { outcomes: [{ status: 'dispatch-failed' }, { status: 'dispatch-failed' }], labels: [] }; },
+    async addLabels(ctx, ref, labels) { order.push('label'); assert.deepEqual(labels, ['errmeter:needs-human']); },
+    async releaseClaim() { order.push('release'); }
+  });
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  h.child.emit('close', 1, null);
+  const result = await pending;
+  assert.equal(result.needsHuman, true);
+  assert.equal(result.consecutiveFailures, 2);
+  assert.deepEqual(order, ['outcome', 'refresh', 'label', 'release']);
+});
+
+test('refreshed escalation does not repeat an existing needs-human label', async t => {
+  const h = harness(t, {
+    async getFailure() { return { outcomes: [{ status: 'dispatch-failed' }, { status: 'dispatch-failed' }], labels: [{ name: 'errmeter:needs-human' }] }; },
+    async addLabels() { assert.fail('already labelled'); }
+  });
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  h.child.emit('close', 1, null);
+  assert.equal((await pending).needsHuman, true);
+  assert.deepEqual(h.calls.map(call => call[0]), ['outcome', 'release']);
+});
+
+test('outcome and escalation label failures remain visible and never skip release', async t => {
+  const h = harness(t, {
+    async writeOutcome() { return { ref: 42, labelsFailed: true }; },
+    async getFailure() { return { outcomes: [{ status: 'dispatch-failed' }, { status: 'dispatch-failed' }] }; },
+    async addLabels() { throw new Error('label unavailable'); }
+  });
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  h.child.emit('close', 1, null);
+  const result = await pending;
+  assert.equal(result.labelsFailed, true);
+  assert.equal(result.needsHuman, true);
+  assert.deepEqual(h.calls.map(call => call[0]), ['release']);
+  assert.equal(fs.existsSync(h.file), false);
+});
+
+test('failed outcome and failed release both log while preserving the original error and recovery state', async t => {
+  const original = new Error('outcome unavailable');
+  let releases = 0;
+  const h = harness(t, {
+    async writeOutcome() { throw original; },
+    async releaseClaim() { releases++; throw new Error('release unavailable'); }
+  });
+  const logs = []; h.ctx.log = message => logs.push(message);
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  h.child.emit('close', 1, null);
+  await assert.rejects(pending, error => error === original);
+  assert.equal(releases, 1);
+  assert.deepEqual(logs, ['dispatch: outcome write failed', 'dispatch: claim release failed after outcome failure']);
+  assert.equal(fs.existsSync(h.file), true);
 });
 
 test('release transport failure after durable outcome still returns escalation without secret diagnostics', async t => {

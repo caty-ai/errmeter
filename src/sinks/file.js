@@ -315,7 +315,8 @@ async function renewClaim(ctx, ref, options) {
   claimOptions(options);
   const rows = scan(ctx); complete(ctx, rows);
   const record = requireFailure(ctx, rows, ref);
-  if (ctx.dryRun || record.claim?.watcherId !== options.watcherId || String(record.claim.claimRef) !== String(options.claimRef)) return { ok: false };
+  if (ctx.dryRun) return { ok: false, reason: 'rejected' };
+  if (record.claim?.watcherId !== options.watcherId || String(record.claim.claimRef) !== String(options.claimRef)) return { ok: false, reason: 'holder-changed' };
   const expiresAt = new Date(Date.parse(time(ctx)) + (options.ttlSec ?? 900) * 1000).toISOString();
   append(ctx, 'claim', { ref: Number(ref), watcherId: options.watcherId, claimRef: options.claimRef, expiresAt }, rows);
   return { ok: true, expiresAt };

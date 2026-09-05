@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { parseWatch, USAGE } = require('./cli');
 const { resolveConfig } = require('./config');
 const { buildMaskList } = require('./redact');
@@ -32,6 +33,52 @@ async function upsertNeedsHuman(ctx, issue, summary, failures = ctx.config.watch
   if (alert?.pending || alert?.notified === false) summary.pending_remaining++;
   if (alert?.lookup_incomplete) { summary.lookup_incomplete = true; ctx.lookup_incomplete = true; }
 }
+function apiRemaining(ctx) {
+  return (ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60) - (ctx.apiCalls || 0);
+}
+function scanCursor(ctx, value) {
+  const file = path.join(ctx.home, 'state', 'scan_cursor.json');
+  if (value === undefined) {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')).ref; }
+    catch (error) { if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error; return null; }
+  }
+  if (value === null) {
+    try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = file + '.' + crypto.randomUUID() + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ ref: value }) + '\n', { mode: 0o600, flag: 'wx' });
+    try { fs.renameSync(tmp, file); }
+    catch (error) {
+      if (!['EEXIST', 'EPERM', 'EACCES'].includes(error.code)) throw error;
+      try { fs.unlinkSync(file); } catch (unlinkError) { if (unlinkError.code !== 'ENOENT') throw unlinkError; }
+      fs.renameSync(tmp, file);
+    }
+  } finally { try { fs.unlinkSync(tmp); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+}
+async function escalate(ctx, issue, summary, escalation, failures, addLabel = false) {
+  if (escalation.used || ctx.signal.aborted || ctx.lookup_incomplete) {
+    summary.pending_remaining++;
+    return;
+  }
+  escalation.used = true;
+  try {
+    if (addLabel) {
+      try { await ctx.sink.addLabels(ctx, issue.ref, ['errmeter:needs-human']); }
+      catch (error) {
+        if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code)) { ctx.lookup_incomplete = true; summary.pending_remaining++; return; }
+        ctx.log?.('watch: escalation label update failed'); summary.pending_remaining++;
+      }
+    }
+    await upsertNeedsHuman(ctx, issue, summary, failures);
+  } catch (error) {
+    summary.pending_remaining++;
+    if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code)) ctx.lookup_incomplete = true;
+    else reportError(ctx, error, summary.errors);
+  }
+}
 async function reconcileNeedsHuman(ctx, failures, summary) {
   const records = failures.filter(record => (record.labels || [])
     .some(label => (typeof label === 'string' ? label : label.name) === 'errmeter:needs-human'));
@@ -40,8 +87,7 @@ async function reconcileNeedsHuman(ctx, failures, summary) {
   // large historical alert set to consume the claim or heartbeat-gap budget.
   const index = (ctx.needsHumanCursor || 0) % records.length;
   ctx.needsHumanCursor = index + 1;
-  try { await upsertNeedsHuman(ctx, records[index], summary); }
-  catch (error) { reportError(ctx, error); }
+  await escalate(ctx, records[index], summary, { used: false });
 }
 async function tick(ctx, options = {}) {
   ctx.running ||= new Map();
@@ -50,7 +96,11 @@ async function tick(ctx, options = {}) {
   ctx.errors = [];
   delete ctx.boardTime;
   const summary = { ts: new Date(ctx.clock()).toISOString(), role: ctx.config.watch.role,
-    flush: 0, eligible: 0, claimed: 0, pending_remaining: 0, dispatched: 0, gaps: 0, lookup_incomplete: false, errors: ctx.errors };
+    flush: 0, eligible: 0, claimed: 0, pending_remaining: 0, dispatched: 0, gaps: 0,
+    scanned: 0, unscanned: 0, lookup_incomplete: false, errors: ctx.errors };
+  const escalation = { used: false };
+  let scanWindow, scanPredecessor;
+  const confirmedRefs = new Set(), pendingClaims = new Set();
   const sink = ctx.sink;
   try {
     // Publish the current observation before dead-man evaluation in flush.
@@ -72,25 +122,40 @@ async function tick(ctx, options = {}) {
     if (flushed?.backoff_until && Date.parse(flushed.backoff_until) > ctx.clock()) return summary;
     const failures = await sink.listOpenFailures(ctx);
     if (ctx.lookup_incomplete) return summary;
-    const candidates = failures.filter(record => !(record.labels || []).some(label =>
+    let candidates = failures.filter(record => !ctx.running.has(record.ref) && !(record.labels || []).some(label =>
       (typeof label === 'string' ? label : label.name) === 'errmeter:needs-human'))
       .sort((a, b) => /^\d+$/.test(String(a.ref)) && /^\d+$/.test(String(b.ref)) ? Number(a.ref) - Number(b.ref) : String(a.ref).localeCompare(String(b.ref)));
+    const cursor = scanCursor(ctx);
+    const cursorIndex = candidates.findIndex(record => String(record.ref) === String(cursor));
+    if (cursorIndex >= 0) candidates = candidates.slice(cursorIndex + 1).concat(candidates.slice(0, cursorIndex + 1));
+    else if (cursor != null) scanCursor(ctx, null);
+    summary.unscanned = candidates.length;
+    const scanMaxConfirms = Math.max(0, Math.floor(((ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60) - 10) / 2));
+    scanPredecessor = candidates.at(-1)?.ref;
+    scanWindow = candidates.slice(0, scanMaxConfirms);
+    candidates = scanWindow;
+    // Prioritize inside this round-robin window, never ahead of its boundary.
+    const claimed = record => (record.labels || []).some(label => (typeof label === 'string' ? label : label.name) === 'errmeter:claimed');
+    candidates = candidates.filter(record => !claimed(record)).concat(candidates.filter(claimed));
     const dispatches = [];
     const selected = [];
     const capacity = Math.max(0, ctx.config.watch.max_concurrent - ctx.running.size);
     for (const record of candidates) {
-      if (selected.length >= capacity || ctx.signal.aborted || ctx.lookup_incomplete) break;
+      if (selected.length >= capacity || summary.scanned >= scanMaxConfirms || apiRemaining(ctx) < 2 || ctx.signal.aborted || ctx.lookup_incomplete) break;
       if (ctx.running.has(record.ref)) continue;
       const detail = record.detailed === true ? record : await sink.getFailure(ctx, record.ref);
       if (ctx.lookup_incomplete) break;
+      summary.scanned++;
+      summary.unscanned--;
+      confirmedRefs.add(record.ref);
       if (!detail) continue;
       const failures = detail.consecutiveFailures ?? consecutiveFailureCount(detail);
       if (failures >= ctx.config.watch.escalate_after) {
-        await sink.addLabels(ctx, detail.ref, ['errmeter:needs-human']);
-        await upsertNeedsHuman(ctx, detail, summary, failures);
+        await escalate(ctx, detail, summary, escalation, failures, true);
+        if (ctx.lookup_incomplete) break;
         continue;
       }
-      if (isEligible(detail, ctx.now(), true)) selected.push(detail);
+      if (isEligible(detail, ctx.now(), true)) { selected.push(detail); pendingClaims.add(detail.ref); }
     }
     summary.eligible = selected.length;
     for (const record of selected) {
@@ -110,6 +175,7 @@ async function tick(ctx, options = {}) {
       }
       if (claim?.lookup_incomplete || claim?.incomplete) ctx.lookup_incomplete = true;
       if (ctx.lookup_incomplete) break;
+      pendingClaims.delete(detail.ref);
       if (!claim?.won) { summary.pending_remaining++; continue; }
       summary.claimed++;
       if (ctx.signal.aborted) {
@@ -140,7 +206,18 @@ async function tick(ctx, options = {}) {
     // only after current repair and gap work so historical alerts cannot starve it.
     await reconcileNeedsHuman(ctx, failures, summary);
   } catch (error) { reportError(ctx, error); }
-  finally { summary.lookup_incomplete ||= Boolean(ctx.lookup_incomplete); }
+  finally {
+    if (confirmedRefs.size) {
+      // Retry a confirmed eligible row before spending another tick on hints.
+      // Once claimed, ordinary ring traversal resumes across deferred rows.
+      const claimIndex = scanWindow.findIndex(record => pendingClaims.has(record.ref));
+      const pendingIndex = claimIndex >= 0 ? claimIndex : scanWindow.findIndex(record => !confirmedRefs.has(record.ref));
+      const cursor = pendingIndex === -1 ? scanWindow.at(-1).ref : pendingIndex === 0 ? scanPredecessor : scanWindow[pendingIndex - 1].ref;
+      try { scanCursor(ctx, cursor); } catch (error) { reportError(ctx, error, summary.errors); }
+    }
+    summary.lookup_incomplete ||= Boolean(ctx.lookup_incomplete);
+    summary.pending_remaining += summary.unscanned;
+  }
   return summary;
 }
 

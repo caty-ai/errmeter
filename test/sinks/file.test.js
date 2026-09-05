@@ -13,6 +13,13 @@ function context(t) {
 }
 function event(id, ts = '2026-09-05T11:00:00.000Z') { return { schema: 1, id, ts, kind: 'error', agent: 'a', host: 'h', fingerprint: 'abc', fpv: 1, message: 'broken' }; }
 function group(events, counter) { return { fingerprint: 'abc', fpv: 1, agent: 'a', count: events.length, events, ...(counter ? { counter } : {}) }; }
+test('file renew reports an explicit holder change and rejects dry-run renewal', async t => {
+  const ctx = context(t);
+  const failure = await sink.deliverFailureGroup(ctx, group([event('one')]));
+  const lease = await sink.claim(ctx, failure.ref, { watcherId: 'holder', ttlSec: 900 });
+  assert.deepEqual(await sink.renewClaim(ctx, failure.ref, { watcherId: 'other', claimRef: lease.claimRef, ttlSec: 900 }), { ok: false, reason: 'holder-changed' });
+  assert.deepEqual(await sink.renewClaim({ ...ctx, dryRun: true }, failure.ref, { watcherId: 'holder', claimRef: lease.claimRef, ttlSec: 900 }), { ok: false, reason: 'rejected' });
+});
 test('file sequences increase, records rebuild, and existing event IDs are never rewritten', async t => {
   const ctx = context(t);
   const first = await sink.deliverFailureGroup(ctx, group([event('one'), event('two')]));

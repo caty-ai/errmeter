@@ -63,7 +63,7 @@ test('escalation label survives a partial outcome write and label calls retry on
   fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
   await sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed' });
   failing = true;
-  await assert.rejects(sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed', escalate: true }), { status: 503 });
+  assert.deepEqual(await sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed', escalate: true }), { ref: 1, labelsFailed: true });
   assert.ok(fake.issues[0].labels.some(label => label.name === 'errmeter:needs-human'));
   assert.equal(fake.comments.filter(row => /errmeter:outcome /.test(row.body)).length, 2);
   assert.equal(fake.requests.filter(entry => failing && entry.method === 'POST' && /\/labels$/.test(entry.url) && entry.body.labels.includes('errmeter:dispatched')).length, 3);
@@ -87,6 +87,82 @@ test('heartbeat role changes reconcile mutually exclusive labels', async t => {
   const labels = fake.issues[0].labels.map(label => label.name);
   assert.ok(labels.includes('errmeter:role:agent-host'));
   assert.ok(!labels.includes('errmeter:role:watcher'));
+  await sink.deliverHeartbeat(ctx, { ...event('heartbeat', '2026-09-05T12:02:00.000Z'), kind: 'heartbeat', meta: {} });
+  assert.ok(!fake.issues[0].labels.some(label => label.name.startsWith('errmeter:role:')));
+});
+
+for (const failedLabel of ['errmeter:needs-human', 'errmeter:dispatched', 'errmeter:claimed', 'errmeter:repaired']) {
+  test('outcome survives exhausted 5xx retries for label ' + failedLabel, async t => {
+    let failures = 0;
+    const { fake, ctx } = await setup(t, { onRequest(entry, board) {
+      const matches = entry.method === 'POST' && /\/labels$/.test(entry.url) && entry.body.labels.includes(failedLabel) ||
+        entry.method === 'DELETE' && decodeURIComponent(entry.url).endsWith('/labels/' + failedLabel);
+      if (matches) { failures++; board.failNext(503); }
+    } });
+    fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure', 'errmeter:claimed', 'errmeter:repaired'] });
+    const result = await sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed', escalate: true });
+    assert.deepEqual(result, { ref: 1, labelsFailed: true });
+    assert.equal(failures, 2);
+    assert.equal(fake.comments.filter(row => /errmeter:outcome /.test(row.body)).length, 1);
+    await sink.releaseClaim(ctx, 1, { watcherId: 'holder', claimRef: 10 });
+    assert.ok(fake.comments.some(row => /errmeter:release watcher=holder ref=10/.test(row.body)));
+  });
+}
+
+test('a successful label retry is not a permanent label failure; 4xx does not retry', async t => {
+  let labelCalls = 0;
+  const { fake, ctx } = await setup(t, { onRequest(entry, board) {
+    if (entry.method === 'POST' && /\/labels$/.test(entry.url) && entry.body.labels.includes('errmeter:needs-human')) {
+      labelCalls++; if (labelCalls === 1) board.failNext(503); else if (labelCalls > 2) board.failNext(403);
+    }
+  } });
+  fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
+  assert.deepEqual(await sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed', escalate: true }), { ref: 1 });
+  assert.equal(labelCalls, 2);
+  assert.deepEqual(await sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed', escalate: true }), { ref: 1, labelsFailed: true });
+  assert.equal(labelCalls, 3);
+  assert.equal(fake.comments.filter(row => /errmeter:outcome /.test(row.body)).length, 2);
+});
+
+test('exhausted candidate cleanup allows DELETE and fallback release only for its own id', async t => {
+  const { fake, ctx } = await setup(t, { onRequest(entry, board) {
+    if (entry.method === 'DELETE' && /\/issues\/comments\//.test(entry.url)) board.failNext(503);
+  } });
+  fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
+  const unrelated = fake.seedComment(1, { body: 'unrelated' });
+  ctx.http = async options => {
+    const result = await request(options);
+    if (options.method === 'POST' && /errmeter:claim /.test(options.body?.body || '')) ctx.apiCalls = ctx.config.max_api_calls_per_pass;
+    return result;
+  };
+  await assert.rejects(sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 }), { code: 'EAPI_BUDGET' });
+  const mine = fake.comments.find(row => /errmeter:claim /.test(row.body));
+  assert.equal(ctx.apiCalls, ctx.config.max_api_calls_per_pass + 2);
+  assert.ok(fake.comments.some(row => row.id === unrelated.id));
+  assert.equal(fake.requests.find(row => row.method === 'DELETE').url, '/repos/test/inbox/issues/comments/' + mine.id);
+  assert.equal(fake.comments.at(-1).body, '<!-- errmeter:release watcher=holder ref=' + mine.id + ' -->');
+  await assert.rejects(sink.releaseClaim(ctx, 1, { watcherId: 'holder', claimRef: mine.id }), { code: 'EAPI_BUDGET' });
+  assert.equal(ctx.apiCalls, ctx.config.max_api_calls_per_pass + 2);
+});
+
+for (const failure of [
+  { status: 503, reason: 'transport', attempts: 2 },
+  { status: 403, reason: 'rejected', attempts: 1 },
+  { code: 'ECONNRESET', reason: 'transport', attempts: 2 },
+  { code: 'EAPI_BUDGET', reason: 'budget', attempts: 1 },
+  { code: 'ELOOKUP_INCOMPLETE', reason: 'budget', attempts: 1 }
+]) test('renew classifies ' + (failure.status || failure.code), async () => {
+  let attempts = 0, sleeps = 0;
+  const ctx = { config: { sink: { repo: 'test/inbox', token: 'short' } },
+    sleep: async () => { sleeps++; },
+    http: async () => {
+      attempts++;
+      if (failure.code) throw Object.assign(new Error('request failed'), { code: failure.code });
+      return { status: failure.status };
+    } };
+  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: 1, ttlSec: 900 }), { ok: false, reason: failure.reason });
+  assert.equal(attempts, failure.attempts);
+  assert.equal(sleeps, failure.attempts - 1);
 });
 
 test('GitHub creates once, comments once, and recovers every delivered id without writes', async t => {
@@ -336,7 +412,7 @@ test('GitHub rejects claim decisions without a comments response Date header', a
     return response;
   };
   await assert.rejects(sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 }), { code: 'ELOOKUP_INCOMPLETE' });
-  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: 1, ttlSec: 900 }), { ok: false, reason: 'transport' });
+  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: 1, ttlSec: 900 }), { ok: false, reason: 'budget' });
   assert.equal(writes(fake).length, 0);
 });
 
