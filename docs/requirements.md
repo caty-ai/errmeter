@@ -1,6 +1,6 @@
 # errmeter requirements (v1)
 
-Status: **frozen candidate v1.5** for contract-freeze issue #2 (five review rounds folded in). Input: [design-brief-v0.md](design-brief-v0.md).
+Status: **frozen candidate v1.6** for contract-freeze issue #2 (six review rounds folded in). Input: [design-brief-v0.md](design-brief-v0.md).
 Companion documents: [architecture.md](architecture.md) (how the parts fit), [contract.md](contract.md) (the frozen interfaces).
 
 Wording: **MUST / MUST NOT / SHOULD / MAY** are used in the RFC 2119 sense. Each requirement has a stable id (`R-*`, `N-*`, `X-*`) so reviews and Done-when records can point at it.
