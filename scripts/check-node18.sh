@@ -25,13 +25,19 @@ scan() {
 
 # A. One expression per entry makes comparison with the contract straightforward.
 # Array.prototype.with is skipped: .with() cannot identify an array by grep.
-# Regex-v detection is heuristic: constructor flags and literal /v terminators;
-# multiline/computed flags, aliases and computed properties need human review.
+# Regex-v detection is heuristic: constructor flags and literal /v terminators
+# (combined flags, e.g. /x/gv, are now covered); multiline/computed flags and
+# computed properties still need human review.
 # Grep also sees comments/strings, so inspect any reported false positives.
+# Residual classes grep cannot catch (human review): bare-identifier aliasing
+# (`const f = fetch;`, `const u = set.union;`), `describe`/`it` imported but
+# not called, subclassing of Response/Request, and `globalThis["fetch"]`
+# string indexing.
 scan src bin <<'PATTERNS'
 (^|[^[:alnum:]_$])fetch[[:space:]]*\(
 new[[:space:]]+Request[[:space:]]*\(
 new[[:space:]]+Response[[:space:]]*\(
+(^|[^[:alnum:]_$])(Request|Response)[[:space:]]*\.
 (^|[^[:alnum:]_$])parseArgs([^[:alnum:]_$]|$)
 mock[[:space:]]*\.[[:space:]]*timers
 (^|[^[:alnum:]_$])cpSync([^[:alnum:]_$]|$)
@@ -45,9 +51,18 @@ Promise[[:space:]]*\.[[:space:]]*withResolvers
 \.[[:space:]]*isWellFormed[[:space:]]*\(
 \.[[:space:]]*toWellFormed[[:space:]]*\(
 new[[:space:]]+RegExp[[:space:]]*\(.*,[[:space:]]*['"][a-z]*v[a-z]*['"]
-/v([;,)[:space:]]|$)
+/[dgimsuy]*v[dgimsuy]*([;,)[:space:]]|$)
 node:sqlite
 Array[[:space:]]*\.[[:space:]]*fromAsync
+--experimental-
+--env-file
+PATTERNS
+
+# A. package.json scripts values aren't run by the matrix; a banned flag
+# hidden in a "scripts" entry (e.g. a pretest hook) would otherwise be
+# unexercised. Grep can't scope to the "scripts" key, so this scans the
+# whole file as a heuristic.
+scan package.json <<'PATTERNS'
 --experimental-
 --env-file
 PATTERNS
@@ -63,9 +78,10 @@ PATTERNS
 # disguised TypeScript, dynamic addon loading and build steps need review.
 scan src bin <<'PATTERNS'
 import[[:space:]]*\.[[:space:]]*meta
-^[[:space:]]*import[[:space:]]
-^[[:space:]]*export[[:space:]]
-require[[:space:]]*\([[:space:]]*['"]typescript['"]
+^[[:space:]]*import[[:space:]{*'"]
+^[[:space:]]*export[[:space:]{*'"]
+(^|[^[:alnum:]_$.])import[[:space:]]*\(
+require[[:space:]]*\([[:space:]]*['"](typescript|ts-node(/[^'"]*)?|esbuild|tsx|@swc/[^'"]*)['"]
 worker_threads
 (^|[^[:alnum:]_$])structuredClone([^[:alnum:]_$]|$)
 require[[:space:]]*\([[:space:]]*['"][^'"]*\.node['"]
@@ -88,6 +104,8 @@ if ! node -e '
   }
   if (!pkg.engines || pkg.engines.node !== ">=18")
     violation("package.json", line("engines"), "engines.node must equal >=18");
+  if (pkg.type === "module")
+    violation("package.json", line("type"), "type must not be module");
   for (const key of ["dependencies", "devDependencies"])
     if (Object.prototype.hasOwnProperty.call(pkg, key))
       violation("package.json", line(key), `${key} key prohibited`);
@@ -97,12 +115,21 @@ if ! node -e '
       if (entry.isDirectory()) walk(path);
       else if (/\.(?:[cm]?tsx?|node)$/.test(entry.name))
         violation(path, 1, "TypeScript/native addon file prohibited");
+      else if (/\.(?:mjs|cjs)$/.test(entry.name))
+        violation(path, 1, "Explicit ESM/CJS extension file prohibited (src/bin must be plain .js CommonJS)");
     }
   }
   walk("src");
   walk("bin");
   process.exitCode = failed ? 1 : 0;
 '; then
+  failed=1
+fi
+
+# NIT: contract section 10's last sentence requires this guard; grep for it
+# directly since the deny-list scan above only looks for banned patterns.
+if ! grep -q 'versions\.node' bin/errmeter.js 2>/dev/null || ! grep -q 'exit(2)' bin/errmeter.js 2>/dev/null; then
+  printf 'bin/errmeter.js: version guard missing\n'
   failed=1
 fi
 

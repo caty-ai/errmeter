@@ -68,7 +68,8 @@ resolve_node() {
 }
 install_hint() {
   case "$manager" in
-    nvm|scan) echo "Install separately: nvm install $1" >&2 ;;
+    nvm) echo "Install separately: nvm install $1" >&2 ;;
+    scan) echo "Install separately: install Node $1 via nvm/fnm/volta (no manager detected)" >&2 ;;
     fnm) echo "Install separately: fnm install $1" >&2 ;;
     volta) echo "Install separately: volta install node@$1" >&2 ;;
   esac
@@ -82,9 +83,14 @@ missing=0
 runtime=$(command -v node || true)
 # Hard-code shell-expanded files: package.json belongs to another lane, and
 # `node --test test/` breaks on Node >=22. Node itself need not expand globs.
-shopt -s nullglob
-tests=(test/*.test.js)
-if [[ -d test/sinks ]]; then tests+=(test/sinks/*.test.js); fi
+# `find` (not a `test/**/*.test.js` glob) is used so any *.test.js file is
+# picked up regardless of nesting depth -- a file under e.g. test/emit/ was
+# previously silently skipped and the matrix stayed green -- and so this
+# stays portable to bash 3.2 (macOS's default /bin/bash), which lacks
+# globstar.
+tests=()
+while IFS= read -r -d '' file; do tests+=("$file"); done \
+  < <(find test -name '*.test.js' -print0 | sort -z)
 if [[ ${#tests[@]} -eq 0 || ! -f scripts/check-node18.sh ]]; then
   echo 'Setup error: test files and scripts/check-node18.sh are required.' >&2; exit 2
 fi
@@ -108,6 +114,9 @@ for major in "${majors[@]}"; do
     code=0
     PATH="$(dirname "$executable"):$PATH" NODE_DISABLE_COLORS=1 "$executable" --test "${tests[@]}" > "$tmp/test.log" 2>&1 || code=$?
     # Piped output is TAP on Node 18 and may be spec on newer releases.
+    # File-level blind spot: a *.test.js file that exits (e.g. process.exit)
+    # before defining any test() still counts as one passing file in
+    # node:test's summary; only the aggregate counts below are checked.
     passed=$(sed -nE 's/^(#|ℹ)[[:space:]]+pass ([0-9]+).*/\2/p' "$tmp/test.log" | tail -n 1)
     failed=$(sed -nE 's/^(#|ℹ)[[:space:]]+fail ([0-9]+).*/\2/p' "$tmp/test.log" | tail -n 1)
     total=$(sed -nE 's/^(#|ℹ)[[:space:]]+tests ([0-9]+).*/\2/p' "$tmp/test.log" | tail -n 1)
@@ -119,19 +128,53 @@ for major in "${majors[@]}"; do
   [[ $result == PASS ]] || status=1
   printf '%s\t%s\t%s passed, %s failed\t%ss\n' "$major ($actual)" "$result" "${passed:-?}" "${failed:-?}" "$((SECONDS - start))" >> "$rows"
 done
-if [[ -z $runtime ]]; then echo 'Setup error: an installed Node is required for the static check and JSON output.' >&2; exit 2; fi
-start=$SECONDS
-result=PASS
-check_code=0
-PATH="$(dirname "$runtime"):$PATH" bash scripts/check-node18.sh > "$tmp/static.log" 2>&1 || check_code=$?
-if [[ $check_code != 0 ]]; then result=FAIL; status=1; fi
-if [[ $check_code == 2 || $check_code == 126 || $check_code == 127 ]]; then status=2; fi
-cat "$tmp/static.log" >&2
-printf 'check-node18\t%s\t-\t%ss\n' "$result" "$((SECONDS - start))" >> "$rows"
-summary="Matrix: $([[ $status == 0 ]] && echo PASS || echo FAIL); ${#majors[@]} majors requested; $missing missing; check-node18 $result."
+if [[ -n $runtime ]]; then
+  start=$SECONDS
+  result=PASS
+  check_code=0
+  PATH="$(dirname "$runtime"):$PATH" bash scripts/check-node18.sh > "$tmp/static.log" 2>&1 || check_code=$?
+  if [[ $check_code != 0 ]]; then result=FAIL; status=1; fi
+  if [[ $check_code == 2 || $check_code == 126 || $check_code == 127 ]]; then status=2; fi
+  cat "$tmp/static.log" >&2
+  printf 'check-node18\t%s\t-\t%ss\n' "$result" "$((SECONDS - start))" >> "$rows"
+else
+  # No installed Node was found anywhere (not on PATH, nor any requested
+  # major) -- this can only happen when every requested major is MISSING.
+  # That is a missing-versions condition, not a usage/setup error: print
+  # the accumulated evidence and fail with exit 1, not 2.
+  echo 'No installed Node is available to run the static check.' >&2
+  result=SKIPPED
+  printf 'check-node18\tSKIPPED\t-\t-\n' >> "$rows"
+  status=1
+fi
+majors_ran=$(( ${#majors[@]} - missing ))
+if [[ $status == 0 ]]; then
+  if [[ $majors_ran -eq 0 && ${#majors[@]} -gt 0 ]]; then
+    matrix_label=INCOMPLETE
+  else
+    matrix_label=PASS
+  fi
+else
+  matrix_label=FAIL
+fi
+summary="Matrix: $matrix_label; ${#majors[@]} majors requested; $missing missing; check-node18 $result."
 if [[ $allow_missing == 1 ]]; then summary="$summary --allow-missing: NOT merge evidence."; fi
 if [[ $json == 1 ]]; then
-  "$runtime" -e 'const fs=require("fs"); console.log(JSON.stringify(fs.readFileSync(process.argv[1],"utf8").trim().split("\n").map(line=>{const [Node,result,tests,duration]=line.split("\t");return {Node,result,tests,duration};}),null,2))' "$rows"
+  if [[ -n $runtime ]]; then
+    "$runtime" -e 'const fs=require("fs"); console.log(JSON.stringify(fs.readFileSync(process.argv[1],"utf8").trim().split("\n").map(line=>{const [Node,result,tests,duration]=line.split("\t");return {Node,result,tests,duration};}),null,2))' "$rows"
+  else
+    # Bash-only fallback: no Node executable is available to run the usual
+    # JSON serializer.
+    first=1
+    printf '['
+    while IFS=$'\t' read -r label res counts duration; do
+      [[ $first == 1 ]] || printf ','
+      first=0
+      printf '\n  {\n    "Node": "%s",\n    "result": "%s",\n    "tests": "%s",\n    "duration": "%s"\n  }' \
+        "$label" "$res" "$counts" "$duration"
+    done < "$rows"
+    printf '\n]\n'
+  fi
   echo "$summary" >&2
 else
   printf '| Node | result | tests | duration |\n| --- | --- | --- | --- |\n'

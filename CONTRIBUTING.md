@@ -21,8 +21,12 @@ download Node. Missing versions print an installation hint and fail the matrix.
 Use `MATRIX_VERSIONS="18 22"` in Bash, or `$env:MATRIX_VERSIONS = "18 22"`
 in PowerShell, for a focused check. `--json` emits the table as a JSON array.
 `--allow-missing` allows absent versions for local exploration; its output
-**is not merge evidence**. Exit codes are 0 for success, 1 for failed tests,
-static violations or missing versions, and 2 for usage/setup errors.
+**is not merge evidence**. When every requested major is absent, an
+`--allow-missing` run reports `Matrix: INCOMPLETE` (exit 0) instead of PASS,
+since nothing was actually run. Exit codes are 0 for success, 1 for failed
+tests, static violations or missing versions, and 2 for usage/setup errors
+(bad flags, an empty `MATRIX_VERSIONS`, or no test files found) -- missing
+majors alone never raise exit 2.
 
 The `CI:` line of a PR completion record must include the pasted Markdown
 matrix table from `scripts/test-matrix.sh` (or `.ps1`), with **all four majors
@@ -37,7 +41,18 @@ The deny list in `scripts/check-node18.sh` mirrors the two lists in
 A covers APIs absent or experimental at Node 18.0; B covers project policy.
 Run it separately with `bash scripts/check-node18.sh`. Its comments name the
 grep limitations that still require review, including array `.with()` and
-heuristic regex flag detection. See section 12 for isolated test hooks.
+heuristic regex flag detection. See docs/contract.md §12 for isolated test
+hooks.
 
-Tests use explicit globs (`node --test test/*.test.js`, plus
-`test/sinks/*.test.js` when present); the directory form fails on Node 22+.
+Tests are discovered recursively under `test/` (explicit file list, not the
+directory form, which fails on Node 22+), so any `*.test.js` file counts
+regardless of nesting. A `*.test.js` file that exits (e.g. `process.exit`)
+before defining any `test()` still counts as one passing file in node:test's
+summary; the matrix checks aggregate pass/fail counts, not individual files.
+Reviewers should also compare the `tests` column against the previous
+record -- a drop (e.g. 41 to 1) with an otherwise-green row is a red flag
+the matrix cannot catch on its own.
+
+The `.ps1` path is unverified on Windows from this macOS worktree; treat its
+table as evidence only once someone has actually run it on a real Windows
+host.
