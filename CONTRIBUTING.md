@@ -21,12 +21,14 @@ download Node. Missing versions print an installation hint and fail the matrix.
 Use `MATRIX_VERSIONS="18 22"` in Bash, or `$env:MATRIX_VERSIONS = "18 22"`
 in PowerShell, for a focused check. `--json` emits the table as a JSON array.
 `--allow-missing` allows absent versions for local exploration; its output
-**is not merge evidence**. When every requested major is absent, an
+**is not merge evidence**. When every requested major is absent and a Node
+runtime is available for the static check and that check passes, an
 `--allow-missing` run reports `Matrix: INCOMPLETE` (exit 0) instead of PASS,
-since nothing was actually run. Exit codes are 0 for success, 1 for failed
+since no requested major was actually run. Exit codes are 0 for success, 1 for failed
 tests, static violations or missing versions, and 2 for usage/setup errors
-(bad flags, an empty `MATRIX_VERSIONS`, or no test files found) -- missing
-majors alone never raise exit 2.
+(bad flags, an empty `MATRIX_VERSIONS`, no test files found, or, in PowerShell,
+a resolved `bash` that is not Git Bash (WSL/Cygwin)) -- missing majors alone
+never raise exit 2.
 
 The `CI:` line of a PR completion record must include the pasted Markdown
 matrix table from `scripts/test-matrix.sh` (or `.ps1`), with **all four majors

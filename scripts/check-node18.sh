@@ -76,6 +76,7 @@ PATTERNS
 # B. structuredClone is conservatively banned: grep cannot prove plain data.
 # TypeScript file extensions and native .node files are checked below as well;
 # disguised TypeScript, dynamic addon loading and build steps need review.
+# Dynamic import() is deliberately stricter than contract section 10 list B.
 scan src bin <<'PATTERNS'
 import[[:space:]]*\.[[:space:]]*meta
 ^[[:space:]]*import[[:space:]{*'"]
@@ -99,8 +100,40 @@ if ! node -e '
   const text = fs.readFileSync("package.json", "utf8");
   const pkg = JSON.parse(text);
   function line(key) {
-    const index = text.indexOf(JSON.stringify(key));
-    return index < 0 ? 1 : text.slice(0, index).split("\n").length;
+    let depth = 0;
+    let lineNumber = 1;
+    for (let index = 0; index < text.length; index++) {
+      const character = text[index];
+      if (character === "\n") {
+        lineNumber++;
+      } else if (character === "{") {
+        depth++;
+      } else if (character === "}") {
+        depth--;
+      } else if (character === "\"") {
+        const start = index;
+        const keyLine = lineNumber;
+        let escaped = false;
+        for (index++; index < text.length; index++) {
+          const stringCharacter = text[index];
+          if (stringCharacter === "\n") lineNumber++;
+          if (escaped) {
+            escaped = false;
+          } else if (stringCharacter === "\\") {
+            escaped = true;
+          } else if (stringCharacter === "\"") {
+            break;
+          }
+        }
+        let separator = index + 1;
+        while (/\s/.test(text[separator])) separator++;
+        if (depth === 1 && text[separator] === ":" &&
+            text.slice(start, index + 1) === JSON.stringify(key)) {
+          return keyLine;
+        }
+      }
+    }
+    return 1;
   }
   if (!pkg.engines || pkg.engines.node !== ">=18")
     violation("package.json", line("engines"), "engines.node must equal >=18");
