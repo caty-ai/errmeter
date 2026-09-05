@@ -103,14 +103,23 @@ function acquire(home, limits, clock) {
   } };
 }
 function move(item, destination) {
-  // Heartbeat upserts can be replaced while a request is in flight. Never move
-  // the replacement as though the older event had acknowledged it.
   if (item.source !== fs.readFileSync(item.file, 'utf8')) return false;
-  const target = path.join(path.dirname(path.dirname(item.file)), destination, path.basename(item.file));
+  const target = path.join(path.dirname(path.dirname(item.file)), destination, item.basename || path.basename(item.file));
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   try { fs.unlinkSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   fs.renameSync(item.file, target);
   return true;
+}
+function attempt(item) {
+  const event = JSON.parse(item.source);
+  event.attempts = (Number.isSafeInteger(event.attempts) && event.attempts >= 0 ? event.attempts : 0) + 1;
+  atomic(item.file, event);
+  item.source = JSON.stringify(event) + '\n';
+  item.event.attempts = event.attempts;
+}
+function failurePayload(group) {
+  const { fingerprint, fpv, agent, count, events, counter } = group;
+  return { fingerprint, fpv, agent, count, events, ...(counter === undefined ? {} : { counter }) };
 }
 function prune(root, type, days, maxBytes, clock) {
   const dir = path.join(root, 'spool', type);
@@ -184,7 +193,7 @@ async function drainCut(root, ctx, sink, masks, sleep, guard, onError) {
           atomic(checkpoint, cut);
           const result = group.heartbeat
             ? await sink.deliverHeartbeat(ctx, group.events[group.events.length - 1])
-            : await sink.deliverFailureGroup(ctx, group);
+            : await sink.deliverFailureGroup(ctx, failurePayload(group));
           if (result && !result.pending && !result.throttled && !result.lookup_incomplete && (result.ref != null || result.skipped)) {
             cut.posted.push(group.key); atomic(checkpoint, cut);
           } else complete = false;
@@ -194,7 +203,7 @@ async function drainCut(root, ctx, sink, masks, sleep, guard, onError) {
       await sleep(ctx.config.spool.cut_settle_sec * 1000);
       guard();
       const end = size(file);
-      if (end === cut.end) { fs.unlinkSync(file); break; }
+      if (end === cut.end) { fs.unlinkSync(file); fs.unlinkSync(checkpoint); break; }
       if (end < cut.end) throw new Error('counter cut shrank; cut retained');
       cut = { k: cut.k + 1, offset: cut.end, end, posted: [] };
       atomic(checkpoint, cut);
@@ -213,10 +222,16 @@ function backoff(error, previous, clock) {
   return clock() + (previous ? Math.min(previous * 2, 3600000) : 5000);
 }
 async function dryRun(roots, ctx, sink, masks) {
-  const writes = []; const grouped = new Map();
+  const writes = []; const grouped = new Map(); const heartbeats = new Map();
+  let remaining = ctx.config.spool.max_events_per_pass;
   for (const root of roots) {
     const pending = path.join(root, 'spool', 'pending');
-    for (const name of entries(pending)) {
+    const names = entries(pending);
+    const json = names.filter(name => name.endsWith('.json') && name !== 'overflow-exceeded.json');
+    const ordered = [...json.filter(name => !name.startsWith('heartbeat-')), ...json.filter(name => name.startsWith('heartbeat-'))];
+    const selected = new Set(ordered.slice(0, remaining));
+    remaining -= selected.size;
+    for (const name of names) {
       if (name.endsWith('.tmp')) continue;
       if (name === 'overflow-exceeded.json') { writes.push({ op: 'alert', key: 'spool-overflow:' + ctx.config.host, count: 1, target: null }); continue; }
       if (/^counters(?:\..+)?\.log$/.test(name)) {
@@ -227,17 +242,19 @@ async function dryRun(roots, ctx, sink, masks) {
         for (const group of groups) if (!checkpoint?.posted.includes(group.key)) writes.push({ op: group.heartbeat ? 'heartbeat' : 'failure', fingerprint: group.fingerprint, counter: group.counter, count: group.count, target: null });
         continue;
       }
+      if (!selected.has(name)) continue;
       try {
         const event = eventForBoard(readJSON(path.join(pending, name)), masks);
-        if (event.kind === 'heartbeat') writes.push({ op: 'heartbeat', agent: event.agent, host: event.host, count: 1, target: null });
+        if (event.kind === 'heartbeat') heartbeats.set(JSON.stringify([event.agent, event.host]), { op: 'heartbeat', agent: event.agent, host: event.host, count: 1, target: null });
         else if (event.kind === 'error') {
-          if (!grouped.has(event.fingerprint)) grouped.set(event.fingerprint, { op: 'failure', fingerprint: event.fingerprint, count: 0, target: null });
-          grouped.get(event.fingerprint).count++;
+          const key = event.schema > 1 ? event : event.fingerprint;
+          if (!grouped.has(key)) grouped.set(key, { op: 'failure', fingerprint: event.fingerprint, count: 0, target: null });
+          grouped.get(key).count++;
         } else writes.push({ op: 'dead', count: 1, target: name });
       } catch (_) { writes.push({ op: 'dead', count: 1, target: name }); }
     }
   }
-  writes.push(...grouped.values());
+  writes.push(...grouped.values(), ...heartbeats.values());
   if (ctx.config.sink.type !== 'webhook') {
     const failures = await sink.listOpenFailures(ctx);
     const heartbeats = await sink.listHeartbeats(ctx);
@@ -278,13 +295,13 @@ async function flush(argv, env = process.env, io = {}) {
   };
   if (resolved.warning) log(resolved.warning);
   const sink = io.sink || require('./sinks/' + config.sink.type);
-  const ctx = { config, home, log, http: io.http || require('./http').request,
+  const ctx = { config, home, log, maskList: masks, http: io.http || require('./http').request,
     now: () => ctx.boardTime || new Date(clock()).toISOString(), dryRun: Boolean(flags['dry-run']) };
   const fallback = path.join(io.tmpdir || os.tmpdir(), 'errmeter-spool');
   const roots = [home];
   if (fallback !== home && fs.existsSync(path.join(fallback, 'spool'))) roots.push(fallback);
   let lock; let stopped = false; let wake;
-  const signal = () => { stopped = true; if (lock) lock.release(); if (wake) wake(); };
+  const signal = () => { stopped = true; if (wake) wake(); };
   const sleep = io.sleep || (ms => new Promise(resolve => {
     const timer = setTimeout(() => { wake = null; resolve(); }, ms);
     wake = () => { clearTimeout(timer); wake = null; resolve(); };
@@ -310,24 +327,33 @@ async function flush(argv, env = process.env, io = {}) {
         return 1;
       }
       process.on('SIGINT', signal); process.on('SIGTERM', signal);
-      const started = clock(); let delay = 0;
+      const started = clock();
       const saved = readJSON(path.join(home, 'state', 'last_flush.json'), {});
       let until = Date.parse(saved.backoff_until) || 0;
+      let backoffStartedAt = Date.parse(saved.ts);
+      if (!Number.isFinite(backoffStartedAt)) backoffStartedAt = clock();
+      let delay = Math.max(0, until - backoffStartedAt);
+      if (!flags.linger && delay <= config.spool.lock_refresh_sec * 1000) until = 0;
       for (;;) {
         let transport = false;
+        const previousDelay = delay;
         ctx.apiCalls = 0; ctx.lookup_incomplete = false;
         const onError = error => {
           const message = clean(error.message || error.code || 'flush operation failed');
           state.errors.push(message); log(message);
-          if (error.code === 'EAPI_BUDGET' || error.code === 'ELOOKUP_INCOMPLETE') ctx.lookup_incomplete = true;
+          if (['EAPI_BUDGET', 'ELOOKUP_INCOMPLETE', 'LOOKUP_INCOMPLETE'].includes(error.code)) ctx.lookup_incomplete = true;
           else if (error.code !== 'EINTERRUPTED') {
             transport = true;
-            until = Math.max(until, backoff(error, delay, clock()));
+            const retryUntil = Math.max(until, backoff(error, previousDelay, clock));
+            if (retryUntil > until) backoffStartedAt = clock();
+            until = retryUntil;
             delay = until - clock();
           }
         };
         if (until <= clock()) {
           until = 0;
+          // last_flush describes the current pass; prior failures remain in the log.
+          state.errors = [];
           const items = []; let remaining = config.spool.max_events_per_pass;
           for (const root of roots) {
             const pending = path.join(root, 'spool', 'pending');
@@ -340,37 +366,83 @@ async function flush(argv, env = process.env, io = {}) {
             const ordered = [...json.filter(name => !name.startsWith('heartbeat-')), ...json.filter(name => name.startsWith('heartbeat-'))];
             for (const name of ordered.slice(0, remaining)) {
               guard(); remaining--;
-              const file = path.join(pending, name); const source = fs.readFileSync(file, 'utf8');
-              let event;
-              try { event = JSON.parse(source); } catch (_) { move({ file, source }, 'dead'); continue; }
-              if (!event || !['error', 'heartbeat'].includes(event.kind)) { move({ file, source }, 'dead'); continue; }
+              let file = path.join(pending, name);
+              let basename = name;
               if (name.startsWith('heartbeat-')) {
-                // Decode for enumeration only; the body owns agent and host.
-                try { name.slice(10, -5).split('@').map(decodeURIComponent); } catch (_) { /* body is authoritative */ }
+                const claimed = /^heartbeat-claimed-[0-9a-f-]{36}\.json$/;
+                if (!claimed.test(name)) {
+                  // Claim the inode before reading or modifying it. Emits can
+                  // replace the canonical upsert while this private file waits.
+                  const staged = path.join(pending, 'heartbeat-claimed-' + randomUUID() + '.json');
+                  try { fs.renameSync(file, staged); }
+                  catch (error) {
+                    if (error.code === 'ENOENT') continue; // Emitter's replacement window; retry next pass.
+                    throw error;
+                  }
+                  file = staged;
+                  basename = path.basename(staged);
+                }
               }
-              items.push({ file, source, event: eventForBoard(event, masks) });
+              const source = fs.readFileSync(file, 'utf8');
+              let event;
+              try { event = JSON.parse(source); } catch (_) { move({ file, source, basename }, 'dead'); continue; }
+              if (!event || !['error', 'heartbeat'].includes(event.kind)) { move({ file, source, basename }, 'dead'); continue; }
+              if (name.startsWith('heartbeat-') && event.kind === 'heartbeat') {
+                basename = 'heartbeat-' + encodeURIComponent(event.agent) + '@' + encodeURIComponent(event.host) + '.json';
+              }
+              items.push({ file, source, basename, event: eventForBoard(event, masks) });
             }
           }
           const groups = new Map();
           for (const item of items.filter(item => item.event.kind === 'error').sort((a, b) => String(a.event.ts).localeCompare(String(b.event.ts)))) {
             const event = item.event;
-            if (!groups.has(event.fingerprint)) groups.set(event.fingerprint, { fingerprint: event.fingerprint, fpv: event.fpv, agent: event.agent, events: [], count: 0, items: [] });
-            const group = groups.get(event.fingerprint); group.events.push(event); group.items.push(item); group.count++;
+            // A future payload must remain the latest (verbatim) event of its
+            // own board write, even if schema 1 occurrences share its fingerprint.
+            const key = event.schema > 1 ? item : event.fingerprint;
+            if (!groups.has(key)) groups.set(key, { fingerprint: event.fingerprint, fpv: event.fpv, agent: event.agent, events: [], count: 0, items: [] });
+            const group = groups.get(key); group.events.push(event); group.items.push(item); group.count++;
           }
           for (const group of groups.values()) {
             guard();
             try {
-              const result = await sink.deliverFailureGroup(ctx, group);
+              for (const item of group.items) attempt(item);
+              const result = await sink.deliverFailureGroup(ctx, failurePayload(group));
               const delivered = new Set(result?.delivered || []);
               for (const item of group.items) if (delivered.has(item.event.id)) move(item, 'sent');
-            } catch (error) { onError(error); }
+            } catch (error) {
+              // A newer payload rejected as unprocessable has had its verbatim
+              // attempt. Authentication, rate limits and transport remain retryable.
+              if ([400, 422].includes(error.status ?? error.statusCode)) {
+                for (const item of group.items) if (item.event.schema > 1) move(item, 'dead');
+                if (group.items.every(item => item.event.schema > 1)) continue;
+              }
+              onError(error);
+            }
           }
+          const heartbeatGroups = new Map();
           for (const item of items.filter(item => item.event.kind === 'heartbeat')) {
+            const key = JSON.stringify([item.event.agent, item.event.host]);
+            if (!heartbeatGroups.has(key)) heartbeatGroups.set(key, []);
+            heartbeatGroups.get(key).push(item);
+          }
+          for (const heartbeatItems of heartbeatGroups.values()) {
             guard();
+            heartbeatItems.sort((a, b) => String(a.event.ts).localeCompare(String(b.event.ts)));
+            const item = heartbeatItems[heartbeatItems.length - 1];
             try {
+              // Older heartbeats have been superseded by the newest observation;
+              // retaining them through outages would grow one claimed file per emit.
+              for (const older of heartbeatItems.slice(0, -1)) move(older, 'sent');
+              attempt(item);
               const result = await sink.deliverHeartbeat(ctx, item.event);
               if (result && !result.pending && !result.lookup_incomplete && (result.ref != null || result.skipped)) move(item, 'sent');
-            } catch (error) { onError(error); }
+            } catch (error) {
+              if (item.event.schema > 1 && [400, 422].includes(error.status ?? error.statusCode)) {
+                move(item, 'dead');
+                continue;
+              }
+              onError(error);
+            }
           }
           for (const root of roots) {
             guard();
@@ -383,7 +455,7 @@ async function flush(argv, env = process.env, io = {}) {
                 const alert = clean({ key: 'spool-overflow:' + (config.host || os.hostname().split('.')[0]), title: 'Spool overflow exceeded', body: 'Spool overflow since ' + value.since + ' ' + (config.owner.mention || '') });
                 const result = await sink.upsertAlert(ctx, alert);
                 const overflowBytes = entries(pending).filter(name => /^counters(?:\..+)?\.log$/.test(name)).reduce((sum, name) => sum + size(path.join(pending, name)), 0);
-                if (result && !result.pending && !result.lookup_incomplete && (result.ref != null || result.skipped) && overflowBytes < config.spool.overflow_max_bytes / 2) fs.unlinkSync(marker);
+                if (result && !result.pending && !result.lookup_incomplete && (result.ref != null || result.skipped || result.winner !== undefined) && overflowBytes < config.spool.overflow_max_bytes / 2) fs.unlinkSync(marker);
               } catch (error) { onError(error); }
             }
             prune(root, 'sent', config.spool.sent_retention_days, config.spool.sent_max_bytes, clock);
@@ -400,7 +472,9 @@ async function flush(argv, env = process.env, io = {}) {
             } catch (error) { onError(error); }
           }
         } else transport = true;
-        state.ts = new Date(clock()).toISOString(); state.pending_remaining = pendingCount(roots);
+        // Deferred ticks keep the current failure's timestamp, including after
+        // an early-woken linger sleep, so restart recovers the same delay.
+        state.ts = new Date(until > clock() ? backoffStartedAt : clock()).toISOString(); state.pending_remaining = pendingCount(roots);
         state.lookup_incomplete = Boolean(ctx.lookup_incomplete);
         delete state.backoff_until;
         if (until > clock()) state.backoff_until = new Date(until).toISOString();
