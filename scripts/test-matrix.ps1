@@ -56,7 +56,11 @@ $originalColors = $env:NODE_DISABLE_COLORS
 # node:test's spec-reporter output, corrupting the pass/fail counts below.
 $originalOutputEncoding = $null
 try { $originalOutputEncoding = [Console]::OutputEncoding } catch {}
-try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+try {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+} catch {
+    [Console]::Error.WriteLine('Console output encoding could not be set; non-ASCII reporter counts may not parse.')
+}
 $exitCode = 2
 $locationPushed = $false
 try {
@@ -86,6 +90,11 @@ try {
         $bashCommand = Get-Command bash -CommandType Application -ErrorAction SilentlyContinue
     }
     if ($null -eq $bashCommand) { throw 'Git Bash is required for check-node18.sh; add bash.exe to PATH.' }
+    $bashPlatform = Invoke-Captured $bashCommand.Source @('-lc', 'uname -s')
+    $bashSystem = ($bashPlatform.Output -join "`n").Trim()
+    if ($bashPlatform.Code -ne 0 -or $bashSystem -notmatch '^(MINGW|MSYS)') {
+        throw "Resolved bash is not Git Bash (uname -s: $bashSystem); WSL bash is the likely cause."
+    }
     # Hard-code the contract glob invocation, not package.json scripts (another
     # lane owns them). Expand explicitly: PowerShell passes wildcards literally,
     # and `node --test test/` breaks on Node >=22. Recurse (not just test/ and
@@ -146,7 +155,9 @@ try {
     $missing = 0
     $passed = 0
     $setupFailed = $false
+    $pathNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue
     $staticNode = $null
+    if ($null -ne $pathNode) { $staticNode = $pathNode.Source }
     $env:NODE_DISABLE_COLORS = '1'
     foreach ($major in $majors) {
         $selected = @($installed | Where-Object { $_ -match ('^' + $major + '\.') } | Select-Object -First 1)
@@ -199,15 +210,19 @@ try {
     $env:PATH = $originalPath
     if ($null -ne $staticNode) {
         $env:PATH = (Split-Path -Parent $staticNode) + [IO.Path]::PathSeparator + $originalPath
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $check = Invoke-Captured $bashCommand.Source @('scripts/check-node18.sh')
+        $watch.Stop()
+        $checkResult = 'FAIL'
+        if ($check.Code -eq 0) { $checkResult = 'PASS' }
+        if ($check.Code -eq 2 -or $check.Code -eq 126 -or $check.Code -eq 127) { $setupFailed = $true }
+        if ($check.Output.Count -gt 0) { [Console]::Error.WriteLine($check.Output -join "`n") }
+        $rows += New-Row 'check-node18' $checkResult '-' ($watch.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture) + 's')
+    } else {
+        [Console]::Error.WriteLine('No installed Node is available to run the static check.')
+        $checkResult = 'SKIPPED'
+        $rows += New-Row 'check-node18' $checkResult '-' '-'
     }
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    $check = Invoke-Captured $bashCommand.Source @('scripts/check-node18.sh')
-    $watch.Stop()
-    $checkResult = 'FAIL'
-    if ($check.Code -eq 0) { $checkResult = 'PASS' }
-    if ($check.Code -eq 2 -or $check.Code -eq 126 -or $check.Code -eq 127) { $setupFailed = $true }
-    if ($check.Output.Count -gt 0) { [Console]::Error.WriteLine($check.Output -join "`n") }
-    $rows += New-Row 'check-node18' $checkResult '-' ($watch.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture) + 's')
     $exitCode = 0
     if ($failed -gt 0 -or $checkResult -ne 'PASS' -or ($missing -gt 0 -and -not $allowMissing)) { $exitCode = 1 }
     if ($setupFailed) { $exitCode = 2 }
@@ -219,7 +234,11 @@ try {
         foreach ($row in $rows) { Write-Output "| $($row.Node) | $($row.result) | $($row.tests) | $($row.duration) |" }
     }
     $matrixResult = 'PASS'
-    if ($exitCode -ne 0) { $matrixResult = 'FAIL' }
+    if ($exitCode -ne 0) {
+        $matrixResult = 'FAIL'
+    } elseif ($missing -eq $majors.Count -and $majors.Count -gt 0) {
+        $matrixResult = 'INCOMPLETE'
+    }
     $summary = "Matrix: $matrixResult; $($majors.Count) majors requested; $missing missing; check-node18 $checkResult."
     if ($allowMissing) { $summary += ' --allow-missing: NOT merge evidence.' }
     if ($jsonOutput) { [Console]::Error.WriteLine($summary) } else { Write-Output $summary }
