@@ -1,0 +1,10 @@
+{
+  "name": "errmeter",
+  "version": "0.0.0",
+  "description": "Error meter reading for AI agent families: emit, spool, sink, watch. Zero deps, Node 18+.",
+  "license": "MIT",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "bin": { "errmeter": "bin/errmeter.js" },
+  "repository": { "type": "git", "url": "https://github.com/caty-ai/errmeter.git" }
+}
