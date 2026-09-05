@@ -3,11 +3,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { redact } = require('../redact');
+const { cleanValue } = require('./clean');
 const version = require('../../package.json').version;
 
 function now(ctx) { return new Date(ctx.boardTime || (ctx.now ? ctx.now() : Date.now())).toISOString(); }
-function text(ctx, value) { return redact(value, [...(ctx.maskList || []), ctx.config.sink.token].filter(Boolean)); }
+function masks(ctx) { return [...(ctx.maskList || []), ctx.config.sink.token].filter(Boolean); }
+function text(ctx, value) { return cleanValue(value, masks(ctx)); }
 function limit(ctx, key, fallback) { return ctx.config[key] ?? ctx.config.sink[key] ?? ctx.config.spool?.[key] ?? fallback; }
 function unknown(ctx) {
   ctx.lookup_incomplete = true;
@@ -84,10 +85,11 @@ function counterRef(group) { const c = group.counter; return typeof c === 'strin
 function bodyFor(ctx, group, events, kind, extra = '') {
   const counter = counterRef(group);
   const first = events[0] || group.events[0] || {}; const last = events.at(-1) || group.events.at(-1) || {};
+  const cleanLast = cleanValue(last, masks(ctx));
   const count = counter ? group.count : events.reduce((n, e) => n + Number(e.meta?._folded_count || 1), 0);
   const prefix = kind === 'failure' ? ' fp=' + group.fingerprint + ' fpv=' + group.fpv : '';
   const marker = '<!-- errmeter:' + kind + prefix + ' ids=' + (counter ? '' : events.map(e => e.id).join(',')) + ' count=' + count + ' first=' + first.ts + ' last=' + last.ts + (kind === 'failure' ? ' schema=1' : '') + (counter ? ' counter_ref=' + counter : '') + (kind === 'occurrence' ? ' ts=' + now(ctx) : '') + extra + ' -->';
-  return marker + '\n\n' + (Number(last.schema) > 1 ? 'Newer event schema; delivered verbatim.\n\n' : '') + text(ctx, last.message || '') + '\n\n```json\n' + JSON.stringify(last, null, 2) + '\n```';
+  return marker + '\n\n' + (Number(last.schema) > 1 ? 'Newer event schema; delivered verbatim.\n\n' : '') + (cleanLast.message || '') + '\n\n```json\n' + JSON.stringify(cleanLast, null, 2) + '\n```';
 }
 async function createFailure(ctx, group, events, extra) {
   return (await api(ctx, 'POST', root(ctx) + '/issues', { title: text(ctx, '[errmeter] ' + group.agent + ': ' + (events.at(-1)?.message || group.events.at(-1)?.message || '').slice(0, 80)), body: bodyFor(ctx, group, events, 'failure', extra), labels: ['errmeter', 'errmeter:failure'] })).body;

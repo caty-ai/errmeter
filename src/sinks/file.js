@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { redact } = require('../redact');
+const { cleanValue } = require('./clean');
 
 function time(ctx) { return new Date(ctx.now ? ctx.now() : Date.now()).toISOString(); }
 // This reference board grows without a retention bound; operators must trim it.
@@ -92,7 +93,7 @@ async function deliverFailureGroup(ctx, group) {
   const rows = scan(ctx); complete(ctx, rows);
   const existing = Array.from(failures(rows).values()).find(record => record.fingerprint === group.fingerprint);
   const counter = typeof group.counter === 'string' ? group.counter : group.counter && (group.counter.ref || group.counter.counter_ref);
-  const events = group.events || [];
+  const events = (group.events || []).map(event => cleanValue(event, ctx.maskList || []));
   const ids = new Set(existing ? existing.occurrenceIds : []);
   const fresh = events.filter(event => event.id && !ids.has(event.id));
   if ((counter && existing && existing.counterRefs.includes(counter)) || (!counter && fresh.length === 0)) {
@@ -139,6 +140,7 @@ async function listHeartbeats(ctx) {
   return Array.from(heartbeats(rows).values());
 }
 async function deliverHeartbeat(ctx, event) {
+  event = cleanValue(event, ctx.maskList || []);
   const rows = scan(ctx); complete(ctx, rows);
   const existing = heartbeats(rows).get(event.agent + '@' + event.host);
   const prior = event.id && rows.find(row => row.op === 'heartbeat' && row.id === event.id);

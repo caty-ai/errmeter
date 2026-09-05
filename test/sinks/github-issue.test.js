@@ -36,6 +36,27 @@ test('GitHub creates once, comments once, and recovers every delivered id withou
   for (const r of fake.requests) { assert.equal(r.headers.authorization, 'Bearer ' + ctx.config.sink.token); assert.ok(!r.url.includes(ctx.config.sink.token)); assert.ok(!JSON.stringify(r.body || '').includes(ctx.config.sink.token)); }
 });
 
+test('GitHub direct delivery redacts every event string before composing issue text', async t => {
+  const { fake, ctx } = await setup(t);
+  const secret = ['ghp_', 's'.repeat(24)].join('');
+  const bearer = ['bearer', 'fixture', 'credential'].join('-');
+  const unclean = { ...event('unclean'), message: 'failure ' + secret, detail: 'detail ' + secret + '\nBearer ' + bearer };
+  await sink.deliverFailureGroup(ctx, group(unclean));
+
+  const { title, body } = fake.issues[0];
+  assert.equal(title.includes(secret), false);
+  assert.equal(body.includes(secret), false);
+  assert.equal(body.includes(bearer), false);
+  assert.match(body, /^<!-- errmeter:([a-z-]+)(?: ([^\n]*?))? -->$/m);
+  const human = body.split('\n\n')[1];
+  assert.equal(human.includes(secret), false);
+  const fenced = body.match(/```json\n([\s\S]*?)\n```/);
+  assert.ok(fenced);
+  const parsed = JSON.parse(fenced[1]);
+  assert.equal(JSON.stringify(parsed).includes(secret), false);
+  assert.equal(JSON.stringify(parsed).includes(bearer), false);
+});
+
 test('GitHub incomplete list or exhausted API budget never creates', async t => {
   const { fake, ctx } = await setup(t, { pageSize: 1 });
   fake.seedIssue({ body: failureBody('other', '1111111111111111'), labels: ['errmeter:failure'] });

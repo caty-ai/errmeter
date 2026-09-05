@@ -6,7 +6,8 @@ const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { resolveConfig } = require('./config');
 const { parseFlush, USAGE } = require('./cli');
-const { redact, buildMaskList, sensitiveKey } = require('./redact');
+const { buildMaskList, sensitiveKey } = require('./redact');
+const { cleanValue } = require('./sinks/clean');
 const version = require('../package.json').version;
 
 function atomic(file, value) {
@@ -41,22 +42,6 @@ function size(file) {
 }
 function output(target, text) {
   try { if (typeof target === 'function') target(text); else target.write(text); } catch (_) { /* closed pipe */ }
-}
-function cleanValue(value, masks) {
-  if (typeof value === 'string') {
-    // The explicit credential boundary also covers short configured credentials.
-    for (const secret of masks.filter(item => typeof item === 'string' && item.length > 0).sort((a, b) => b.length - a.length)) {
-      value = value.split(secret).join('[REDACTED]');
-    }
-    return redact(value, masks);
-  }
-  if (Array.isArray(value)) return value.map(item => cleanValue(item, masks));
-  if (value && typeof value === 'object') {
-    const result = Object.create(null);
-    for (const [key, item] of Object.entries(value)) result[key] = cleanValue(item, masks);
-    return result;
-  }
-  return value;
 }
 function eventForBoard(event, masks) {
   const clean = cleanValue(event, masks);
@@ -456,6 +441,12 @@ async function flush(argv, env = process.env, io = {}) {
                 continue;
               }
               onError(error);
+              // These private claims are superseded observations of one
+              // upsert. Retain only the newest claim for the next pass.
+              for (const older of heartbeatItems.slice(0, -1)) {
+                try { fs.unlinkSync(older.file); }
+                catch (unlinkError) { if (unlinkError.code !== 'ENOENT') throw unlinkError; }
+              }
             }
           }
           for (const root of roots) {

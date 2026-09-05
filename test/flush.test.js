@@ -763,23 +763,24 @@ test('heartbeat claim ENOENT leaves that upsert retryable without blocking anoth
   assert.equal(json(path.join(f.home, 'spool/sent', name)).attempts, 1);
 });
 
-test('failed heartbeat passes retain every observation until newest delivery succeeds', async t => {
+test('failed heartbeat passes retain only the newest claim until delivery succeeds', async t => {
   const f = fixture(t); const name = 'heartbeat-a@test-host.json'; const called = [];
   const sink = { ...ack, deliverHeartbeat: async (ctx, ev) => { called.push(ev.id); throw Object.assign(new Error('down'), { status: 503 }); } };
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 3; i++) {
     f.setNow(epoch + i * 100000);
     write(f.home, name, event('heartbeat-' + i, { kind: 'heartbeat', ts: new Date(epoch + i * 1000).toISOString() }));
     assert.equal((await f.run([], { sink })).code, 1);
     const pending = fs.readdirSync(path.join(f.home, 'spool/pending'));
-    assert.equal(pending.length, i + 1);
-    assert.deepEqual(pending.map(file => json(path.join(f.home, 'spool/pending', file)).id).sort(), Array.from({ length: i + 1 }, (_, n) => 'heartbeat-' + n));
+    assert.equal(pending.length, 1);
+    assert.match(pending[0], /^heartbeat-claimed-[a-f0-9-]+\.json$/);
+    assert.equal(json(path.join(f.home, 'spool/pending', pending[0])).id, 'heartbeat-' + i);
     assert.equal(fs.existsSync(path.join(f.home, 'spool/sent', name)), false);
     assert.equal(called.length, i + 1);
   }
   f.setNow(epoch + 1000000); assert.equal((await f.run([], { sink: ack })).code, 0);
-  assert.equal(json(path.join(f.home, 'spool/sent', name)).id, 'heartbeat-3');
-  assert.deepEqual(fs.readdirSync(path.join(f.home, 'spool/sent')).map(file => json(path.join(f.home, 'spool/sent', file)).id).sort(), ['heartbeat-0', 'heartbeat-1', 'heartbeat-2', 'heartbeat-3']);
-  assert.deepEqual(called, ['heartbeat-0', 'heartbeat-1', 'heartbeat-2', 'heartbeat-3']);
+  assert.equal(json(path.join(f.home, 'spool/sent', name)).id, 'heartbeat-2');
+  assert.deepEqual(fs.readdirSync(path.join(f.home, 'spool/sent')), [name]);
+  assert.deepEqual(called, ['heartbeat-0', 'heartbeat-1', 'heartbeat-2']);
 });
 
 test('short saved dead-man backoff does not defer newly pending events on a manual flush', async t => {
