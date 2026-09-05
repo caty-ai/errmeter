@@ -1,0 +1,11 @@
+[
+  { "message": "HTTP 404 fetching invoice 1234", "normalized": "http 404 fetching invoice #" },
+  { "message": "HTTP 500 fetching invoice 9876", "normalized": "http 500 fetching invoice #" },
+  { "message": "ECONNREFUSED 10.0.0.1:5432", "normalized": "econnrefused #ip#:#" },
+  { "message": "ECONNREFUSED db.internal:6379", "normalized": "econnrefused db.internal:#" },
+  { "message": "TypeError: Cannot read properties of undefined (reading 'userId')", "normalized": "typeerror: cannot read properties of undefined (reading 'userid')" },
+  { "message": "TypeError: Cannot read properties of undefined (reading 'orgId')", "normalized": "typeerror: cannot read properties of undefined (reading 'orgid')" },
+  { "message": "ENOENT: no such file, open '/tmp/run-abc/a.txt'", "normalized": "enoent: no such file, open '#path#'" },
+  { "message": "ENOENT: no such file, open '/tmp/run-xyz/a.txt'", "normalized": "enoent: no such file, open '#path#'" },
+  { "message": "Error at /opt/app/src/x.js:123:45", "normalized": "error at #path#:#" }
+]
