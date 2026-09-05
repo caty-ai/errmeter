@@ -12,6 +12,10 @@ if (command === 'emit') {
     if (!process.argv.includes('--quiet')) process.stderr.write('flush: unexpected failure\n');
     process.exitCode = 1;
   });
+} else if (command === 'watch') {
+  require('../src/watch').main(process.argv.slice(3));
+} else if (command === '_run') {
+  require('../src/run').main(process.argv.slice(3));
 } else if (command === '--version') {
   process.stdout.write(require('../package.json').version + '\n');
 } else if (command === '--help' || command === undefined) {

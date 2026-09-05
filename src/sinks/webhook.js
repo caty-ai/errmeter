@@ -24,4 +24,15 @@ async function upsertAlert(ctx, alert) { await post(ctx, { alert }); return { wi
 async function listOpenFailures() { throw new NotABoard(); }
 async function getFailure() { throw new NotABoard(); }
 async function listHeartbeats() { throw new NotABoard(); }
-module.exports = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, listHeartbeats, upsertAlert, NotABoard };
+async function claim() { throw new NotABoard(); }
+async function renewClaim() { throw new NotABoard(); }
+async function releaseClaim() { throw new NotABoard(); }
+async function writeOutcome() { throw new NotABoard(); }
+const adapter = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, listHeartbeats, upsertAlert, NotABoard };
+// Preserve the original enumerable adapter surface for callers that inspect it,
+// while still exposing every frozen board operation as a rejecting function.
+Object.defineProperties(adapter, {
+  claim: { value: claim }, renewClaim: { value: renewClaim },
+  releaseClaim: { value: releaseClaim }, writeOutcome: { value: writeOutcome }
+});
+module.exports = adapter;

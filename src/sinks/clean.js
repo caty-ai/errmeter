@@ -1,6 +1,6 @@
 'use strict';
 
-const { redact } = require('../redact');
+const { redact, sensitiveKey } = require('../redact');
 
 function cleanValue(value, masks) {
   if (typeof value === 'string') {
@@ -19,4 +19,12 @@ function cleanValue(value, masks) {
   return value;
 }
 
-module.exports = { cleanValue };
+function cleanEvent(event, masks = []) {
+  const result = cleanValue(event, masks);
+  if (result && result.meta && typeof result.meta === 'object') {
+    for (const key of Object.keys(result.meta)) if (sensitiveKey.test(key)) result.meta[key] = '[REDACTED]';
+  }
+  return result;
+}
+
+module.exports = { cleanValue, cleanEvent };

@@ -1,7 +1,8 @@
 'use strict';
 
-const USAGE = 'Usage: errmeter <emit|flush> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
+const USAGE = 'Usage: errmeter <emit|flush|watch> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
   'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n' +
+  'watch: [--role watcher|agent-host] [--once] [--interval SEC]\n' +
   'Values starting with -- must be passed as --flag=value.\n';
 class UsageError extends Error {}
 function parse(argv) {
@@ -63,4 +64,48 @@ function parseFlush(argv) {
   }
   return result;
 }
-module.exports = { parse, parseFlush, UsageError, USAGE };
+function parseWatch(argv) {
+  const result = {};
+  const boolean = new Set(['json', 'quiet', 'once', 'help', 'version']);
+  const values = new Set(['home', 'config', 'role', 'interval']);
+  for (let i = 0; i < argv.length; i++) {
+    const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
+    if (!match) throw new UsageError('watch: expected a flag');
+    const key = match[1];
+    if (boolean.has(key)) {
+      if (match[2] !== undefined) throw new UsageError('watch: boolean flags take no value');
+      result[key] = true;
+    } else {
+      if (!values.has(key)) throw new UsageError('watch: unknown flag');
+      const value = match[2] === undefined ? argv[++i] : match[2];
+      if (!value || (match[2] === undefined && value.startsWith('--'))) throw new UsageError('watch: missing flag value');
+      result[key] = value;
+    }
+  }
+  if (result.role !== undefined && !['watcher', 'agent-host'].includes(result.role)) throw new UsageError('watch: invalid role');
+  if (result.interval !== undefined) {
+    if (!/^\d+$/.test(result.interval) || !Number.isSafeInteger(Number(result.interval)) || Number(result.interval) <= 0) throw new UsageError('watch: invalid interval');
+    result.interval = Number(result.interval);
+  }
+  return result;
+}
+function parseRun(argv) {
+  const result = {};
+  const values = new Set(['deadline-ms', 'deadline-mono-ms', 'timeout', 'state']);
+  let i = 0;
+  for (; i < argv.length && argv[i] !== '--'; i++) {
+    const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
+    if (!match || !values.has(match[1])) throw new UsageError('_run: invalid flag');
+    const value = match[2] === undefined ? argv[++i] : match[2];
+    if (!value || (match[2] === undefined && value.startsWith('--'))) throw new UsageError('_run: missing flag value');
+    result[match[1]] = value;
+  }
+  result.command = argv.slice(i + 1);
+  if (!result.state || !result.command.length || !result.command[0]) throw new UsageError('_run: state and command required');
+  for (const key of ['deadline-ms', 'deadline-mono-ms', 'timeout']) {
+    if (!/^\d+(?:\.\d+)?$/.test(result[key] || '') || !Number.isFinite(Number(result[key]))) throw new UsageError('_run: invalid deadline or timeout');
+    result[key] = Number(result[key]);
+  }
+  return result;
+}
+module.exports = { parse, parseFlush, parseWatch, parseRun, UsageError, USAGE };

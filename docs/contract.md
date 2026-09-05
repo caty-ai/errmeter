@@ -202,18 +202,20 @@ HeartbeatRecord = { ref, agent, host, role: "watcher"|"agent-host"|null, lastSee
 Event           = the §2 object
 ```
 
+Summaries from paginated boards may carry `claim`/`lastOutcome` as `null` with `detailed: false` and MUST be confirmed with `getFailure` before any claim.
+
 Idempotency keys the sink MUST honour: event `id` (never two board writes for one id), counter `<nonce>.<k>` (§3.3, `counter_ref=`), `fingerprint` (never two *open* failure records for one fingerprint — with the reconciliation in §5.2), alert `key` (one open alert record per key).
 
-`deliverHeartbeat` lookup order: `state/heartbeats.json` cache (`agent@host → ref`) → list open Issues labelled `errmeter:heartbeat` (full pagination) and match `agent=`/`host=` in the marker → create. Delivery = `PATCH` of the Issue body (marker `ts` = the event's `ts`; an older event never overwrites a newer marker).
+`deliverHeartbeat` lookup order: `state/heartbeats.json` cache (`agent@host → ref`) → list open Issues labelled `errmeter:heartbeat` (full pagination) and match `agent=`/`host=` in the marker → create. Delivery = `PATCH` of the Issue body (marker `ts` = the event's `ts`; an older event never overwrites a newer marker). Empty heartbeat roles remove both built-in role labels.
 
 ### 5.1 `github-issue` board layout [frozen]
 
-All markers are HTML comments on their own line; `key=value` pairs separated by single spaces; values never contain spaces (ids are comma-joined). Every marker starts with `errmeter:`.
+All markers are HTML comments on the **first** line of the body or comment (later lines, including fenced content, are never parsed as markers); `key=value` pairs separated by single spaces; values never contain spaces (ids are comma-joined). Every marker starts with `errmeter:`.
 
 | record | title | body / comment |
 |---|---|---|
-| Failure Issue | `[errmeter] <agent>: <newest message, first 80 chars>` | marker `<!-- errmeter:failure fp=<fingerprint> fpv=1 ids=<id,...> count=<n> first=<ts> last=<ts> schema=1 -->` + human summary + `latest` event as a fenced ```json block (full §2 object, already redacted) |
-| Occurrence comment | — | `<!-- errmeter:occurrence ids=<id,...> count=<n> first=<ts> last=<ts> -->` + summary + fenced ```json `latest` event (if a counter: `ids=` empty, `count` from the counter) |
+| Failure Issue | `[errmeter] <agent>: <newest message, first 80 chars>` | marker `<!-- errmeter:failure fp=<fingerprint> fpv=1 ids=<id,...> count=<n> first=<ts> last=<ts> schema=1 -->` + human summary + `latest` event as a fenced ```json block (full §2 object, already redacted). When a counter group creates the Issue, the marker may also carry `counter_ref=<nonce>.<k>`. |
+| Occurrence comment | — | `<!-- errmeter:occurrence ids=<id,...> count=<n> first=<ts> last=<ts> ts=<board ISO> -->` + summary + fenced ```json `latest` event (if a counter: `ids=` empty, `count` from the counter, and `counter_ref=<nonce>.<k>` is present) |
 | Heartbeat Issue | `[errmeter] heartbeat: <agent>@<host>` | `<!-- errmeter:heartbeat agent= host= role= ts=<ISO of the event> -->` + last message. **Liveness = `ts` in the marker**, never Issue `updated_at`. |
 | Alert Issue | `[errmeter] alert: <key>` | `<!-- errmeter:alert key= -->` + body; each alert episode is a comment `<!-- errmeter:alert-episode key= host= ts= -->` (§5.3) |
 | Claim comment | — | `<!-- errmeter:claim watcher=<id> expires=<ISO> ref=<claimRef-or-new> -->` |
@@ -256,6 +258,11 @@ Order: `state/fingerprints.json` cache (`fp → { ref, state }`) → list open I
 - Every list call uses `per_page=100` and follows `Link: rel="next"` until exhausted or `max_pages_per_list` (10) is hit. An exhausted page budget is **incomplete** and MUST be treated as unknown (no create, no dispatch, no alert).
 - `max_api_calls_per_pass` (60) per flush pass and per watch tick. Backoff on 403/429 honours `Retry-After` / `X-RateLimit-Reset`; on 5xx exponential from 5 s. Backoff longer than `lock_refresh_sec` is stored in `state/last_flush.json` and the process exits/skips the tick.
 - Comment reads for a claim decision (§6) MUST be complete (all pages); if not, the watcher does not dispatch.
+- Watch confirms at most `scan_max_confirms = max(0, floor((max_api_calls_per_pass - 10) / 2))` candidates per tick (25 at the default budget). This is an internal bound, not a new config key. It selects a round-robin window in ascending reference order, wrapping at the end. The advisory `errmeter:claimed` label does not affect scan order; an eligible detail carrying a stale label has that label removed best effort. `<home>/state/scan_cursor.json` stores the reference after which the next tick's scan starts as `{ "ref": <reference> }`, via temporary file and rename. A missing reference is ignored and its stale cursor removed. JSON summaries include numeric `scanned` and `unscanned`; `unscanned` is reported in the summary and does not affect the exit code.
+- The in-scan needs-human label/alert reconciliation runs at most once per tick; additional threshold failures remain pending. An API/page-budget error during that branch sets `lookup_incomplete` and stops the scan. Actual incomplete detail reads still fail closed. Independent post-dispatch and existing-label alert recovery retain their existing behavior.
+- A fully confirmed window advances to its last reference. A partial window normally advances only through its contiguous confirmed prefix; a detail read that throws is counted as scanned for this cursor purpose, remains fail-closed, and advances the next tick past that row. Pending eligible claims take precedence: if a confirmed eligible row cannot claim because its remaining tick budget cannot admit a complete election, the scan stops and the cursor stays at that row's logical predecessor so the next tick retries it first with a fresh budget. After success, ordinary ring traversal resumes and revisits deferred rows. That first tick intentionally reports `lookup_incomplete`; it never allocates a fresh claim budget inside the same tick.
+- Cleanup of a just-posted losing or unconfirmed claim may use at most two calls beyond an exhausted budget: DELETE its own returned comment id, then a release POST for that same id if deletion fails. No unrelated claim, ordinary release, outcome, or alert has this exemption.
+- `renewClaim` returns `reason: "holder-changed"` for lost ownership, `"transport"` after one retry of a 5xx/network failure, `"budget"` for `EAPI_BUDGET`/`ELOOKUP_INCOMPLETE`, `"rejected"` for 4xx, or `"dry-run"` when the file board is not allowed to renew. Every non-ok result still fences the runner.
 
 ### 5.5 `file` sink
 
@@ -376,6 +383,7 @@ Invocation by `watch --role watcher` after `claim` returned `won: true`:
 
 - **Exit code** `0` = repair attempted; the **last non-empty stdout line** (redacted, ≤ 500 chars) is the outcome summary (a PR URL by convention). Any other exit, a timeout (`timeout_sec`; kill = `SIGTERM` to the group, `SIGKILL` after 10 s; Windows `taskkill /T /F`), a fence kill (§6.2), or a spawn error = `dispatch-failed`; the last 20 lines of stderr are recorded **after redaction**.
 - After `escalate_after` consecutive failures: label `errmeter:needs-human`, owner notified once via `upsertAlert` key `needs-human:<issue>`.
+- Outcome label writes before and after the outcome comment are best effort: retry 5xx once, then continue. An unrepaired label failure at return sets `{ ref, labelsFailed: true }` and never suppresses the outcome POST or claim release; a successful in-dispatch retry clears that failure state. A refreshed failure count crossing the threshold adds a missing needs-human label during that same dispatch. The dispatcher attempts release even if the outcome POST throws, logs both failures if release also fails, and preserves its recovery state until an outcome is durable.
 - **Boundary (D-6)**: the hook MAY open pull requests and comment in target repos with its own credentials. It MUST NOT merge, push to protected branches, or close the inbox Issue; `repaired` means "a fix was proposed". errmeter cannot police the hook's credentials; this rule is restated in `docs/integrations/` for hook authors. errmeter's own token structurally cannot do any of these (§8). **Process boundary, stated honestly**: the hook runs as the watcher's OS user and can read whatever that user can, including `<home>/github-token`. errmeter does not hand the token over, but it cannot hide it from a same-user process; families that need that isolation run `watch --role watcher` under a dedicated OS user with its own home (documented in `docs/integrations/`).
 
 ---
@@ -410,6 +418,8 @@ Allowed and expected: `node:fs` (incl. `promises`, `rmSync`, `mkdirSync({recursi
 
 Output: without `--json`, one summary line on stdout, diagnostics on stderr. With `--json`, one JSON object on stdout.
 
+`watch --once` returns 0 when nothing actionable remains. An unexamined quiescent backlog is not pending; `scanned` and `unscanned` report the bounded scan coverage.
+
 ---
 
 ## 12. Test hooks (non-normative, for #3–#7)
@@ -421,6 +431,12 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- v1.7 note (2026-09-06, #5 round-2): §5.4 describes the watcher's bounded per-tick candidate scan (internal bound, round-robin cursor file, two-call cleanup exemption, `renewClaim` reasons) and §9 the best-effort label writes around the outcome comment. No frozen field or format changed; the watch JSON summary gains advisory `scanned` / `unscanned` (additive), dispatch results gain `labelsFailed`. No config key, marker or exit-code change; no version bump.
+
+- v1.7 note (2026-09-06, #5 round-1): paginated-board summaries require detail confirmation when marked `detailed: false`; protocol markers are parsed only on the first line. Text clarification only, no field-list change or version bump.
+
+- v1.7 note (2026-09-06, #5/#18): clarify `counter_ref=` on counter-created Failure Issue markers and `ts=` on occurrence markers; no version bump or format change.
 
 - v1.7 note (2026-09-05, #4): flush returns 2 for a usage error (was unspecified); §3.3 names malformed overflow lines as a counted, accepted residual; §3 heartbeat upsert note above. No field or format change, no version bump.
 
