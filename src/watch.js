@@ -147,6 +147,26 @@ async function reconcileNeedsHuman(ctx, failures, summary) {
   ctx.needsHumanCursor = index + 1;
   await escalate(ctx, records[index], summary, { used: false });
 }
+function saveLastWatch(ctx, summary) {
+  const file = path.join(ctx.home, 'state', 'last_watch.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = file + '.' + crypto.randomUUID() + '.tmp';
+  let fd;
+  try {
+    fd = fs.openSync(tmp, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(cleanValue({ ...summary, pid: process.pid }, ctx.maskList)) + '\n');
+    try { fs.fsyncSync(fd); } catch (_) { /* best effort */ }
+    fs.closeSync(fd); fd = undefined;
+    try { fs.renameSync(tmp, file); } catch (error) {
+      if (!['EEXIST', 'EPERM', 'EACCES'].includes(error.code)) throw error;
+      try { fs.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      fs.renameSync(tmp, file);
+    }
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.unlinkSync(tmp); } catch (_) { /* renamed or failed */ }
+  }
+}
 async function tick(ctx, options = {}) {
   ctx.running ||= new Map();
   ctx.apiCalls = 0;
@@ -285,6 +305,7 @@ async function tick(ctx, options = {}) {
       try { scanCursor(ctx, cursor); } catch (error) { reportError(ctx, error, summary.errors); }
     }
     summary.lookup_incomplete ||= Boolean(ctx.lookup_incomplete);
+    try { saveLastWatch(ctx, summary); } catch (error) { reportError(ctx, error, summary.errors); }
   }
   return summary;
 }

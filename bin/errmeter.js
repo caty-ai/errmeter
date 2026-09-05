@@ -14,6 +14,12 @@ if (command === 'emit') {
   });
 } else if (command === 'watch') {
   require('../src/watch').main(process.argv.slice(3));
+} else if (command === 'init') {
+  require('../src/init').main(process.argv.slice(3));
+} else if (command === 'status') {
+  require('../src/status').main(process.argv.slice(3));
+} else if (command === 'install' || command === 'uninstall') {
+  require('../src/install').main(process.argv.slice(3), command);
 } else if (command === '_run') {
   require('../src/run').main(process.argv.slice(3));
 } else if (command === '--version') {
