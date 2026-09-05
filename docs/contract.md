@@ -422,7 +422,7 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 
 ## Changelog
 
-- v1.7 note (2026-09-05, #4): flush returns 2 for a usage error (was unspecified); no other change.
+- v1.7 note (2026-09-05, #4): flush returns 2 for a usage error (was unspecified); §3.3 names malformed overflow lines as a counted, accepted residual; §3 heartbeat upsert note above. No field or format change, no version bump.
 
 - v1.7 note (2026-09-05, #12): clarify heartbeat file-name encoding, overflow heartbeat sentinels, and reserved metadata outside the 16-entry cap; no field or format change.
 
