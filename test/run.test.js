@@ -58,6 +58,16 @@ function fake(t, extra = {}) {
     state(value) { fs.writeFileSync(f.file, JSON.stringify(value)); } };
 }
 
+test('runner creates PID-only state when absent at startup', async t => {
+  const f = fake(t);
+  fs.unlinkSync(f.file);
+  const pending = f.start();
+  f.child.emit('spawn');
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file, 'utf8')), { pid: 43210, runner_pid: 12345 });
+  f.child.emit('close', 0, null);
+  assert.equal(await pending, 0);
+});
+
 test('runner parser requires deadlines, timeout, state, and a literal argv separator', () => {
   for (const input of [[], ['--bad', '1'], args('x').filter(x => x !== '--'), args('x', { timeout: -1 }),
     args('x', { mono: NaN }), ['--state', 'x', '--', 'node']]) assert.throws(() => parse(input));

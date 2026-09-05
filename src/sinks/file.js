@@ -161,6 +161,7 @@ function failures(rows) {
     if (row.op === 'failure' || row.op === 'occurrence') records.set(row.ref, JSON.parse(JSON.stringify(row.record)));
     const record = records.get(row.ref);
     if (!record) continue;
+    if (row.op === 'labels') record.labels = [...new Set(record.labels.concat(row.labels))];
     if (row.op === 'claim') record.labels = [...new Set(record.labels.concat('errmeter:claimed'))];
     if (row.op === 'release' || row.op === 'outcome') record.labels = record.labels.filter(label => label !== 'errmeter:claimed');
     if (row.op === 'outcome') {
@@ -177,7 +178,7 @@ function detail(ctx, rows, ref) {
   if (!record) return null;
   const state = deriveClaimState({ issue: record, comments: rows.filter(row => row.ref === Number(ref)), now: time(ctx) });
   return { ...record, claim: state.claim, claims: state.claims, outcomes: state.outcomes,
-    lastOutcome: state.lastOutcome, occurrenceAfterLastOutcome: state.occurrenceAfterLastOutcome };
+    lastOutcome: state.lastOutcome, consecutiveFailures: state.consecutiveFailures, detailed: true, occurrenceAfterLastOutcome: state.occurrenceAfterLastOutcome };
 }
 function summary(record) {
   const { latest, claims, outcomes, occurrenceIds, counterRefs, ...result } = record;
@@ -344,7 +345,14 @@ async function writeOutcome(ctx, ref, outcome) {
     ...(outcome.claimRef != null ? { claimRef: outcome.claimRef } : {}), ...(outcome.escalate ? { escalate: true } : {}) }, rows);
   return { ok: true };
 }
+async function addLabels(ctx, ref, labels) {
+  const rows = scan(ctx); complete(ctx, rows); requireFailure(ctx, rows, ref);
+  if (ctx.dryRun) return { pending: true };
+  append(ctx, 'labels', { ref: Number(ref), labels }, rows);
+  return { ok: true };
+}
 const operations = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, listHeartbeats, upsertAlert,
   claim, renewClaim, releaseClaim, writeOutcome };
 module.exports = Object.fromEntries(Object.entries(operations).map(([name, operation]) =>
   [name, (ctx, ...args) => boardOperation(ctx, operation, args)]));
+Object.defineProperty(module.exports, 'addLabels', { value: (ctx, ...args) => boardOperation(ctx, addLabels, args) });

@@ -5,9 +5,10 @@ const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { parseRun } = require('./cli');
 const { atomicState } = require('./dispatch');
+const RUNNER_KILL_DELAY_MS = 10000;
 
 function recordPids(file, pid, runnerPid) {
-  atomicState(file, state => ({ ...state, pid, runner_pid: runnerPid }));
+  atomicState(file, state => ({ ...state, pid, runner_pid: runnerPid }), { create: true });
 }
 
 function run(argv, io = {}) {
@@ -83,7 +84,7 @@ function run(argv, io = {}) {
       } else {
         if (!groupSignal('SIGTERM')) { finish(stopCode); return; }
         // Keep the runner alive even if the direct child exits: descendants can ignore TERM.
-        killTimer = schedule(() => { groupSignal('SIGKILL'); finish(stopCode); }, 10000);
+        killTimer = schedule(() => { groupSignal('SIGKILL'); finish(stopCode); }, RUNNER_KILL_DELAY_MS);
       }
     }
     function checkDeadline() {

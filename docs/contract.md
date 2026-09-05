@@ -202,13 +202,15 @@ HeartbeatRecord = { ref, agent, host, role: "watcher"|"agent-host"|null, lastSee
 Event           = the §2 object
 ```
 
+Summaries from paginated boards may carry `claim`/`lastOutcome` as `null` with `detailed: false` and MUST be confirmed with `getFailure` before any claim.
+
 Idempotency keys the sink MUST honour: event `id` (never two board writes for one id), counter `<nonce>.<k>` (§3.3, `counter_ref=`), `fingerprint` (never two *open* failure records for one fingerprint — with the reconciliation in §5.2), alert `key` (one open alert record per key).
 
 `deliverHeartbeat` lookup order: `state/heartbeats.json` cache (`agent@host → ref`) → list open Issues labelled `errmeter:heartbeat` (full pagination) and match `agent=`/`host=` in the marker → create. Delivery = `PATCH` of the Issue body (marker `ts` = the event's `ts`; an older event never overwrites a newer marker).
 
 ### 5.1 `github-issue` board layout [frozen]
 
-All markers are HTML comments on their own line; `key=value` pairs separated by single spaces; values never contain spaces (ids are comma-joined). Every marker starts with `errmeter:`.
+All markers are HTML comments on the **first** line of the body or comment (later lines, including fenced content, are never parsed as markers); `key=value` pairs separated by single spaces; values never contain spaces (ids are comma-joined). Every marker starts with `errmeter:`.
 
 | record | title | body / comment |
 |---|---|---|
@@ -421,6 +423,8 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- v1.7 note (2026-09-06, #5 round-1): paginated-board summaries require detail confirmation when marked `detailed: false`; protocol markers are parsed only on the first line. Text clarification only, no field-list change or version bump.
 
 - v1.7 note (2026-09-06, #5/#18): clarify `counter_ref=` on counter-created Failure Issue markers and `ts=` on occurrence markers; no version bump or format change.
 

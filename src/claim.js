@@ -22,7 +22,7 @@ function consecutiveFailureCount(detailOrOutcomes) {
 }
 
 function isEligible(issue, now, complete = true) {
-  if (!complete || !issue || issue.incomplete || issue.lookup_incomplete || issue.state === 'closed' || issue.closed === true) return false;
+  if (!complete || !issue || issue.detailed === false || issue.incomplete || issue.lookup_incomplete || issue.state === 'closed' || issue.closed === true) return false;
   const labels = (issue.labels || []).map(label => typeof label === 'string' ? label : label.name);
   if (labels.includes('errmeter:needs-human') || liveClaims(issue, now).length) return false;
   if (!issue.lastOutcome) return true;

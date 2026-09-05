@@ -13,12 +13,81 @@ async function setup(t, options) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-gh-'));
   t.after(async () => { await fake.close(); fs.rmSync(home, { recursive: true, force: true }); });
   const ctx = { home, http: request, now: () => stamp, log() {}, config: { host: 'host', sink: { repo: 'test/inbox', token: 'test.token.' + 'value.1', api_base: fake.url }, watch: { notify_confirm_sec: 120 }, max_api_calls_per_pass: 500 } };
+  ctx.sleep = async milliseconds => { assert.equal(milliseconds, 2000); };
   return { fake, ctx };
 }
 function event(id, ts = stamp) { return { schema: 1, id, ts, kind: 'error', agent: 'a', host: 'host', fingerprint: '0123456789abcdef', fpv: 1, message: 'failure', meta: {} }; }
 function group(...events) { return { fingerprint: '0123456789abcdef', fpv: 1, agent: 'a', count: events.length, events }; }
 function failureBody(ids, fp = '0123456789abcdef') { return '<!-- errmeter:failure fp=' + fp + ' fpv=1 ids=' + ids + ' count=1 first=' + stamp + ' last=' + stamp + ' schema=1 -->\n\n```json\n' + JSON.stringify(event(ids)) + '\n```'; }
 function writes(fake) { return fake.requests.filter(r => ['POST', 'PATCH', 'DELETE'].includes(r.method)); }
+
+test('cheap failure summaries cost one list and require confirmation', async t => {
+  const { fake, ctx } = await setup(t);
+  for (let i = 0; i < 30; i++) fake.seedIssue({ body: failureBody('event-' + i), labels: ['errmeter:failure'] });
+  const summaries = await sink.listOpenFailures(ctx);
+  assert.equal(ctx.apiCalls, 1);
+  assert.equal(summaries.length, 30);
+  assert.equal(summaries[0].detailed, false);
+  assert.equal(summaries[0].claim, null);
+  assert.equal(summaries[0].lastOutcome, null);
+  assert.equal(require('../../src/claim').isEligible(summaries[0]), false);
+});
+
+test('claim reserves reread and cleanup calls before candidate POST', async t => {
+  const { fake, ctx } = await setup(t);
+  fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
+  ctx.config.max_api_calls_per_pass = 3;
+  assert.deepEqual(await sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 }), { won: false, lookup_incomplete: true });
+  assert.equal(fake.comments.length, 0);
+  assert.equal(writes(fake).length, 0);
+});
+
+test('claim deletes its exact candidate when reread exhausts the budget', async t => {
+  const { fake, ctx } = await setup(t);
+  fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
+  ctx.http = async options => {
+    const result = await request(options);
+    if (options.method === 'POST' && /errmeter:claim /.test(options.body?.body || '')) ctx.apiCalls = ctx.config.max_api_calls_per_pass;
+    return result;
+  };
+  await assert.rejects(sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 }), { code: 'EAPI_BUDGET' });
+  assert.equal(fake.comments.length, 0);
+  assert.equal(fake.requests.filter(entry => entry.method === 'DELETE').length, 1);
+});
+
+test('escalation label survives a partial outcome write and label calls retry once', async t => {
+  let failing = false;
+  const { fake, ctx } = await setup(t, { onRequest(entry, board) {
+    if (failing && entry.method === 'POST' && /\/labels$/.test(entry.url) && entry.body.labels.includes('errmeter:dispatched')) board.failNext(503);
+  } });
+  fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
+  await sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed' });
+  failing = true;
+  await assert.rejects(sink.writeOutcome(ctx, 1, { watcherId: 'holder', status: 'dispatch-failed', escalate: true }), { status: 503 });
+  assert.ok(fake.issues[0].labels.some(label => label.name === 'errmeter:needs-human'));
+  assert.equal(fake.comments.filter(row => /errmeter:outcome /.test(row.body)).length, 2);
+  assert.equal(fake.requests.filter(entry => failing && entry.method === 'POST' && /\/labels$/.test(entry.url) && entry.body.labels.includes('errmeter:dispatched')).length, 3);
+});
+
+test('renew retries a transient POST failure without losing the holder', async t => {
+  let failures = 0;
+  const { fake, ctx } = await setup(t, { onRequest(entry, board) {
+    if (entry.method === 'POST' && /errmeter:claim /.test(entry.body?.body || '') && !/ref=new/.test(entry.body.body) && failures++ === 0) board.failNext(502);
+  } });
+  fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
+  const lease = await sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 });
+  assert.equal((await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: lease.claimRef, ttlSec: 900 })).ok, true);
+  assert.equal(failures, 2);
+});
+
+test('heartbeat role changes reconcile mutually exclusive labels', async t => {
+  const { fake, ctx } = await setup(t);
+  await sink.deliverHeartbeat(ctx, { ...event('heartbeat'), kind: 'heartbeat', meta: { role: 'watcher' } });
+  await sink.deliverHeartbeat(ctx, { ...event('heartbeat', '2026-09-05T12:01:00.000Z'), kind: 'heartbeat', meta: { role: 'agent-host' } });
+  const labels = fake.issues[0].labels.map(label => label.name);
+  assert.ok(labels.includes('errmeter:role:agent-host'));
+  assert.ok(!labels.includes('errmeter:role:watcher'));
+});
 
 test('GitHub creates once, comments once, and recovers every delivered id without writes', async t => {
   const { fake, ctx } = await setup(t);
@@ -252,9 +321,9 @@ test('GitHub cannot renew another watcher or accept a non-2xx renewal', async t 
   } });
   fake.seedIssue({ body: failureBody('one'), labels: ['errmeter:failure'] });
   const lease = await sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 });
-  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'intruder', claimRef: lease.claimRef, ttlSec: 900 }), { ok: false });
+  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'intruder', claimRef: lease.claimRef, ttlSec: 900 }), { ok: false, reason: 'holder-changed' });
   failRenew = true;
-  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: lease.claimRef, ttlSec: 900 }), { ok: false });
+  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: lease.claimRef, ttlSec: 900 }), { ok: false, reason: 'transport' });
   assert.equal(fake.comments.filter(c => /errmeter:claim /.test(c.body)).length, 1);
 });
 
@@ -267,7 +336,7 @@ test('GitHub rejects claim decisions without a comments response Date header', a
     return response;
   };
   await assert.rejects(sink.claim(ctx, 1, { watcherId: 'holder', ttlSec: 900 }), { code: 'ELOOKUP_INCOMPLETE' });
-  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: 1, ttlSec: 900 }), { ok: false });
+  assert.deepEqual(await sink.renewClaim(ctx, 1, { watcherId: 'holder', claimRef: 1, ttlSec: 900 }), { ok: false, reason: 'transport' });
   assert.equal(writes(fake).length, 0);
 });
 

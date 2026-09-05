@@ -6,7 +6,7 @@ const { parseWatch, USAGE } = require('./cli');
 const { resolveConfig } = require('./config');
 const { buildMaskList } = require('./redact');
 const { cleanValue } = require('./sinks/clean');
-const { isEligible } = require('./claim');
+const { isEligible, consecutiveFailureCount } = require('./claim');
 const version = require('../package.json').version;
 
 function output(target, text) {
@@ -45,9 +45,7 @@ async function reconcileNeedsHuman(ctx, failures, summary) {
 }
 async function tick(ctx, options = {}) {
   ctx.running ||= new Map();
-  const budget = { calls: 0 };
-  Object.defineProperty(ctx, 'apiCalls', { configurable: true, enumerable: true,
-    get: () => budget.calls, set: value => { budget.calls = value; } });
+  ctx.apiCalls = 0;
   ctx.lookup_incomplete = false;
   ctx.errors = [];
   delete ctx.boardTime;
@@ -74,18 +72,32 @@ async function tick(ctx, options = {}) {
     if (flushed?.backoff_until && Date.parse(flushed.backoff_until) > ctx.clock()) return summary;
     const failures = await sink.listOpenFailures(ctx);
     if (ctx.lookup_incomplete) return summary;
-    const eligible = failures.filter(record => isEligible(record, ctx.now(), true))
+    const candidates = failures.filter(record => !(record.labels || []).some(label =>
+      (typeof label === 'string' ? label : label.name) === 'errmeter:needs-human'))
       .sort((a, b) => /^\d+$/.test(String(a.ref)) && /^\d+$/.test(String(b.ref)) ? Number(a.ref) - Number(b.ref) : String(a.ref).localeCompare(String(b.ref)));
-    summary.eligible = eligible.length;
     const dispatches = [];
-    const selected = eligible.filter(record => !ctx.running.has(record.ref))
-      .slice(0, Math.max(0, ctx.config.watch.max_concurrent - ctx.running.size));
-    summary.pending_remaining += Math.max(0, eligible.length - selected.length);
+    const selected = [];
+    const capacity = Math.max(0, ctx.config.watch.max_concurrent - ctx.running.size);
+    for (const record of candidates) {
+      if (selected.length >= capacity || ctx.signal.aborted || ctx.lookup_incomplete) break;
+      if (ctx.running.has(record.ref)) continue;
+      const detail = record.detailed === true ? record : await sink.getFailure(ctx, record.ref);
+      if (ctx.lookup_incomplete) break;
+      if (!detail) continue;
+      const failures = detail.consecutiveFailures ?? consecutiveFailureCount(detail);
+      if (failures >= ctx.config.watch.escalate_after) {
+        await sink.addLabels(ctx, detail.ref, ['errmeter:needs-human']);
+        await upsertNeedsHuman(ctx, detail, summary, failures);
+        continue;
+      }
+      if (isEligible(detail, ctx.now(), true)) selected.push(detail);
+    }
+    summary.eligible = selected.length;
     for (const record of selected) {
       if (ctx.signal.aborted || ctx.lookup_incomplete) break;
       if (ctx.running.size >= ctx.config.watch.max_concurrent) break;
       if (ctx.running.has(record.ref)) continue;
-      const detail = await sink.getFailure(ctx, record.ref);
+      const detail = record.detailed === true && !record.latest ? await sink.getFailure(ctx, record.ref) : record;
       if (ctx.lookup_incomplete || !detail || !isEligible(detail, ctx.now(), !ctx.lookup_incomplete)) continue;
       let claim;
       try { claim = await sink.claim(ctx, detail.ref, { watcherId: ctx.config.watch.watcher_id, ttlSec: ctx.config.watch.claim_ttl_sec }); }
@@ -106,8 +118,7 @@ async function tick(ctx, options = {}) {
       }
       // Dispatch contexts retain their own observation clock and API budget;
       // a future tick must not reset an active lease's response state.
-      const dispatchCtx = { ...ctx, errors: summary.errors };
-      Object.defineProperty(dispatchCtx, 'apiCalls', Object.getOwnPropertyDescriptor(ctx, 'apiCalls'));
+      const dispatchCtx = { ...ctx, apiCalls: 0, lookup_incomplete: false, errors: summary.errors };
       dispatchCtx.now = () => dispatchCtx.boardTime || new Date(ctx.clock()).toISOString();
       const promise = Promise.resolve().then(() => ctx.dispatch(dispatchCtx, detail, claim, { env: ctx.env, signal: ctx.signal }))
         .then(async result => {

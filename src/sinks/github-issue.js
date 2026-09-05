@@ -17,8 +17,8 @@ function unknown(ctx) {
   error.code = 'ELOOKUP_INCOMPLETE';
   return error;
 }
-async function api(ctx, method, target, body) {
-  if ((ctx.apiCalls || 0) >= limit(ctx, 'max_api_calls_per_pass', 60)) { const error = unknown(ctx); error.code = 'EAPI_BUDGET'; throw error; }
+async function api(ctx, method, target, body, cleanupCall = false) {
+  if (!cleanupCall && (ctx.apiCalls || 0) >= limit(ctx, 'max_api_calls_per_pass', 60)) { const error = unknown(ctx); error.code = 'EAPI_BUDGET'; throw error; }
   const base = ctx.config.sink.api_base || 'https://api.github.com';
   const url = new URL(target, base);
   // Never forward credentials to an origin supplied by an untrusted Link header.
@@ -187,7 +187,11 @@ async function deliverHeartbeat(ctx, event) {
   const role = event.meta?.role || '';
   const body = '<!-- errmeter:heartbeat agent=' + event.agent + ' host=' + event.host + ' role=' + role + ' ts=' + event.ts + ' -->\n\n' + text(ctx, event.message || '');
   let ref;
-  if (found) { await patch(ctx, found.ref, { body }); ref = found.ref; }
+  if (found) {
+    await patch(ctx, found.ref, { body }); ref = found.ref;
+    if (role) await addLabels(ctx, ref, ['errmeter:role:' + role]);
+    for (const other of ['watcher', 'agent-host']) if (other !== role) await removeLabel(ctx, ref, 'errmeter:role:' + other);
+  }
   else { const labels = ['errmeter', 'errmeter:heartbeat']; if (role) labels.push('errmeter:role:' + role); ref = (await api(ctx, 'POST', root(ctx) + '/issues', { title: text(ctx, '[errmeter] heartbeat: ' + key), body, labels })).body.number; }
   cacheWrite(ctx, 'heartbeats', key, ref); return { ref };
 }
@@ -202,11 +206,15 @@ async function getFailure(ctx, ref) {
     firstOccurrenceAt: failure.first || row.created_at,
     lastOccurrenceAt: ms.map(m => m.last).filter(Boolean).sort().at(-1), occurrences: ms.reduce((n, m) => n + (['failure', 'occurrence'].includes(m.type) ? Number(m.count || 0) : 0), 0), claim: holder,
     lastOutcome: outcomes.at(-1) || null, occurrenceAfterLastOutcome: state.occurrenceAfterLastOutcome,
-    latest: event, claims, outcomes, occurrenceIds: [...idsIn(row, cs)] };
+    latest: event, claims, outcomes, consecutiveFailures: state.consecutiveFailures, detailed: true, occurrenceIds: [...idsIn(row, cs)] };
 }
-async function addLabels(ctx, ref, labels) { await api(ctx, 'POST', root(ctx) + '/issues/' + ref + '/labels', { labels }); }
+async function labelApi(ctx, method, target, body) {
+  try { return await api(ctx, method, target, body); }
+  catch (error) { if (!(error.status >= 500 && error.status < 600)) throw error; return api(ctx, method, target, body); }
+}
+async function addLabels(ctx, ref, labels) { await labelApi(ctx, 'POST', root(ctx) + '/issues/' + ref + '/labels', { labels }); }
 async function removeLabel(ctx, ref, label) {
-  try { await api(ctx, 'DELETE', root(ctx) + '/issues/' + ref + '/labels/' + encodeURIComponent(label)); }
+  try { await labelApi(ctx, 'DELETE', root(ctx) + '/issues/' + ref + '/labels/' + encodeURIComponent(label)); }
   catch (error) { if (error.status !== 404) throw error; }
 }
 function claimBody(watcherId, expiresAt, claimRef) {
@@ -215,13 +223,23 @@ function claimBody(watcherId, expiresAt, claimRef) {
 function releaseBody(watcherId, claimRef) { return '<!-- errmeter:release watcher=' + watcherId + ' ref=' + claimRef + ' -->'; }
 function expiry(ctx, ttlSec) { return new Date(Date.parse(ctx.boardTime) + ttlSec * 1000).toISOString(); }
 async function discardClaim(ctx, ref, watcherId, id) {
-  try { await removeComment(ctx, id); }
-  catch (_) { await post(ctx, ref, releaseBody(watcherId, id)); }
+  let cleanupUsed = false;
+  const cleanup = async (method, target, body) => {
+    const outsideBudget = !cleanupUsed && (ctx.apiCalls || 0) >= limit(ctx, 'max_api_calls_per_pass', 60);
+    cleanupUsed ||= outsideBudget;
+    return api(ctx, method, target, body, outsideBudget);
+  };
+  try { await cleanup('DELETE', root(ctx) + '/issues/comments/' + id); }
+  catch (_) { await cleanup('POST', root(ctx) + '/issues/' + ref + '/comments', { body: releaseBody(watcherId, id) }); }
 }
 async function claim(ctx, ref, { watcherId, ttlSec }) {
   const row = await issue(ctx, ref);
   const before = await comments(ctx, ref, true);
   if (!deriveClaimState({ issue: row, comments: before, now: ctx.boardTime }).eligible) return { won: false };
+  if (limit(ctx, 'max_api_calls_per_pass', 60) - (ctx.apiCalls || 0) < 2 + limit(ctx, 'max_pages_per_list', 10)) {
+    ctx.lookup_incomplete = true;
+    return { won: false, lookup_incomplete: true };
+  }
   const expiresAt = expiry(ctx, ttlSec);
   const mine = await post(ctx, ref, claimBody(watcherId, expiresAt, 'new'));
   try {
@@ -242,14 +260,17 @@ async function claim(ctx, ref, { watcherId, ttlSec }) {
   return { won: false };
 }
 async function renewClaim(ctx, ref, { watcherId, claimRef, ttlSec }) {
-  try {
+  for (let attempt = 0; attempt < 2; attempt++) try {
     const rows = await comments(ctx, ref, true);
     const state = deriveClaimState({ comments: rows, now: ctx.boardTime });
-    if (state.holder !== watcherId || String(state.claim?.claimRef) !== String(claimRef)) return { ok: false };
+    if (state.holder !== watcherId || String(state.claim?.claimRef) !== String(claimRef)) return { ok: false, reason: 'holder-changed' };
     const expiresAt = expiry(ctx, ttlSec);
     await post(ctx, ref, claimBody(watcherId, expiresAt, claimRef));
     return { ok: true, expiresAt };
-  } catch (_) { return { ok: false }; }
+  } catch (error) {
+    if (attempt || error.code === 'EAPI_BUDGET' || error.code === 'ELOOKUP_INCOMPLETE' || (error.status && error.status < 500)) return { ok: false, reason: 'transport' };
+    await (ctx.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms))))(2000);
+  }
 }
 async function releaseClaim(ctx, ref, { watcherId, claimRef }) {
   await post(ctx, ref, releaseBody(watcherId, claimRef));
@@ -263,15 +284,24 @@ async function writeOutcome(ctx, ref, outcome) {
   const url = outcome.url ? '\n\n' + text(ctx, String(outcome.url)) : '';
   const excerpt = text(ctx, String(outcome.excerpt ?? outcome.stderr ?? '')).split(/\r?\n/).slice(-20).join('\n');
   const body = '<!-- errmeter:outcome status=' + outcome.status + ' watcher=' + outcome.watcherId + ' ts=' + now(ctx) + ' -->\n\n' + summary + url + (excerpt ? '\n\n```text\n' + excerpt + '\n```' : '');
+  if (outcome.escalate) await addLabels(ctx, ref, ['errmeter:needs-human']);
   await post(ctx, ref, body);
-  await addLabels(ctx, ref, ['errmeter:dispatched', 'errmeter:' + outcome.status, ...(outcome.escalate && outcome.status !== 'needs-human' ? ['errmeter:needs-human'] : [])]);
+  await addLabels(ctx, ref, ['errmeter:dispatched', 'errmeter:' + outcome.status]);
   await removeLabel(ctx, ref, 'errmeter:claimed');
   for (const status of ['repaired', 'dispatch-failed']) if (status !== outcome.status) await removeLabel(ctx, ref, 'errmeter:' + status);
   return { ref };
 }
 async function listOpenFailures(ctx) {
   const rows = await issues(ctx, 'errmeter:failure'); const result = [];
-  for (const row of rows) { if (!markers(row.body, 'failure').length) continue; const detail = await getFailure(ctx, row.number); const { latest: event, claims, outcomes, occurrenceIds, ...summary } = detail; result.push(summary); }
+  for (const row of rows) {
+    const marker = markers(row.body, 'failure')[0];
+    if (!marker) continue;
+    const event = latest(row.body);
+    result.push({ ref: row.number, fingerprint: marker.fp, fpv: Number(marker.fpv), agent: marker.agent || event.agent || '', host: marker.host || event.host || '',
+      title: row.title, labels: (row.labels || []).map(label => typeof label === 'string' ? label : label.name),
+      openedAt: marker.first || row.created_at, lastOccurrenceAt: marker.last, occurrences: Number(marker.count || 0),
+      claim: null, lastOutcome: null, detailed: false });
+  }
   return result;
 }
 async function upsertAlert(ctx, alert) {
@@ -320,3 +350,4 @@ async function upsertAlert(ctx, alert) {
 }
 
 module.exports = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, claim, renewClaim, releaseClaim, writeOutcome, listHeartbeats, upsertAlert };
+Object.defineProperty(module.exports, 'addLabels', { value: addLabels });

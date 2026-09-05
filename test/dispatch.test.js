@@ -52,6 +52,23 @@ function harness(t, overrides = {}) {
     async fire(ms) { const [id, timer] = [...timers].find(([, timer]) => timer.ms === ms); timers.delete(id); await timer.fn(); } };
 }
 
+test('post-outcome refresh failure still releases and returns escalation', async t => {
+  const order = [];
+  const h = harness(t, {
+    async writeOutcome() { order.push('outcome'); },
+    async getFailure(ctx) { order.push('refresh'); ctx.lookup_incomplete = true; throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); },
+    async releaseClaim() { order.push('release'); }
+  });
+  h.issue.outcomes = [{ status: 'dispatch-failed' }];
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  h.child.emit('close', 1, null);
+  const result = await pending;
+  assert.deepEqual(order, ['outcome', 'refresh', 'release']);
+  assert.equal(result.needsHuman, true);
+  assert.equal(result.consecutiveFailures, 2);
+  assert.equal(fs.existsSync(h.file), false);
+});
+
 test('dispatch uses exact runner arguments, isolated env and payload, then writes outcome before release', async t => {
   const h = harness(t);
   const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
@@ -213,7 +230,7 @@ test('a runner-held state lock makes renewal fail closed without changing state 
   assert.equal((await pending).status, 'dispatch-failed');
 });
 
-for (const result of [{ ok: false }, { ok: true, statusCode: 503 }, { ok: true, expiresAt: 'invalid' }]) {
+for (const result of [{ ok: false }, { ok: false, reason: 'holder-changed' }, { ok: false, reason: 'transport' }, { ok: true, statusCode: 503 }, { ok: true, expiresAt: 'invalid' }]) {
   test('unconfirmed renewal kills runner and cannot extend state: ' + JSON.stringify(result), async t => {
     const h = harness(t, { async renewClaim() { return result; } });
     const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
@@ -227,6 +244,26 @@ for (const result of [{ ok: false }, { ok: true, statusCode: 503 }, { ok: true, 
     assert.equal(h.kills.length, 1);
   });
 }
+
+test('GitHub renewal retries transient transport while the hook keeps running', async t => {
+  const h = harness(t, { renewClaim: require('../src/sinks/github-issue').renewClaim });
+  h.ctx.config.sink.token = 'test.token.' + 'value';
+  let posts = 0; let sleeps = 0;
+  const date = new Date(h.now).toUTCString();
+  h.ctx.http = async options => {
+    if (options.method === 'POST') return { status: ++posts === 1 ? 502 : 201, date, headers: {}, body: {} };
+    return { status: 200, date, headers: {}, body: [{ id: 12, created_at: new Date(h.now).toISOString(),
+      body: '<!-- errmeter:claim watcher=watcher-1 expires=' + h.claim.expiresAt + ' ref=new -->' }] };
+  };
+  h.ctx.sleep = async delay => { sleeps++; assert.equal(delay, 2000); assert.deepEqual(h.kills, []); };
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  await h.fire(180000);
+  assert.equal(posts, 2);
+  assert.equal(sleeps, 1);
+  assert.deepEqual(h.kills, []);
+  h.child.emit('close', 0, null);
+  assert.equal((await pending).status, 'repaired');
+});
 
 test('hanging renew is fenced at expires minus renew interval, and late success cannot mutate state', async t => {
   let answer;

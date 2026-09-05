@@ -35,13 +35,88 @@ function context(extra = {}) {
   return { ctx, controller };
 }
 
+test('thirty open failures leave budget for the last candidate and its complete dispatch', async t => {
+  const f = fixture(t);
+  const stamp = '2026-09-06T00:00:00.000Z';
+  const fake = await createGithubFake({ now: new Date(stamp) });
+  t.after(() => fake.close());
+  for (let ref = 1; ref <= 30; ref++) fake.seedIssue({
+    body: '<!-- errmeter:failure fp=0123456789abcdef fpv=1 ids=event count=1 first=' + stamp + ' last=' + stamp + ' -->',
+    labels: ['errmeter:failure', ...(ref < 30 ? ['errmeter:needs-human'] : [])]
+  });
+  const { ctx } = context({ home: f.home, http: request, sink: githubSink });
+  ctx.config.sink = { repo: 'test/inbox', token: 'test.token.' + 'value', api_base: fake.url };
+  ctx.config.max_api_calls_per_pass = 60;
+  ctx.config.watch.escalate_after = 2;
+  ctx.dispatch = async (leaseCtx, detail, claim) => {
+    assert.equal(detail.ref, 30);
+    assert.equal(leaseCtx.apiCalls, 0);
+    await githubSink.writeOutcome(leaseCtx, detail.ref, { watcherId: 'test', status: 'repaired' });
+    await githubSink.releaseClaim(leaseCtx, detail.ref, { watcherId: 'test', claimRef: claim.claimRef });
+    return { status: 'repaired' };
+  };
+  const result = await tick(ctx, { once: true });
+  assert.equal(result.dispatched, 1);
+  assert.ok(ctx.apiCalls <= 60);
+  assert.ok(fake.comments.some(row => row.issue_number === 30 && /errmeter:outcome /.test(row.body)));
+  assert.ok(fake.comments.some(row => row.issue_number === 30 && /errmeter:release /.test(row.body)));
+  assert.equal(fake.requests.filter(row => row.method === 'GET' && /\/issues\/(?:[1-9]|[12][0-9])(?:\?|$)/.test(row.url)).length, 0);
+});
+
+test('a budget exhausted while scanning candidates reports incomplete without any POST', async t => {
+  const fake = await createGithubFake({ now: new Date('2026-09-06T00:00:00.000Z') });
+  t.after(() => fake.close());
+  for (let ref = 1; ref <= 30; ref++) {
+    fake.seedIssue({ body: '<!-- errmeter:failure fp=0123456789abcdef fpv=1 count=1 -->', labels: ['errmeter:failure'] });
+    fake.seedComment(ref, { body: '<!-- errmeter:claim watcher=other expires=2026-09-06T01:00:00.000Z ref=new -->' });
+  }
+  const { ctx } = context({ http: request, sink: githubSink });
+  ctx.config.sink = { repo: 'test/inbox', token: 'test.token.' + 'value', api_base: fake.url };
+  ctx.config.max_api_calls_per_pass = 60;
+  const result = await tick(ctx, { once: true });
+  assert.equal(result.lookup_incomplete, true);
+  assert.equal(result.dispatched, 0);
+  assert.equal(ctx.apiCalls, 60);
+  assert.equal(fake.requests.filter(row => row.method === 'POST').length, 0);
+});
+
+test('confirmed consecutive failures reconcile label and one alert without dispatch', async () => {
+  const { ctx } = context(); const calls = [];
+  ctx.config.watch.escalate_after = 2;
+  ctx.sink = { listOpenFailures: async () => [{ ref: 9, labels: [], detailed: false }],
+    getFailure: async () => ({ ref: 9, labels: [], consecutiveFailures: 2 }),
+    addLabels: async (ctx, ref, labels) => { calls.push(['labels', ref, labels]); },
+    upsertAlert: async (ctx, alert) => { calls.push(['alert', alert.key]); return {}; },
+    claim: () => assert.fail('reconciliation must not claim') };
+  assert.equal((await tick(ctx, { once: true })).dispatched, 0);
+  assert.deepEqual(calls, [['labels', 9, ['errmeter:needs-human']], ['alert', 'needs-human:9']]);
+});
+
+test('corrupt heartbeat timestamps fail closed as gaps', async () => {
+  const { ctx } = context(); let alerts = 0;
+  ctx.sink = { listHeartbeats: async () => [{ agent: 'broken', host: 'test', lastSeen: 'invalid' }],
+    upsertAlert: async () => { alerts++; return {}; } };
+  assert.equal((await checkGaps(ctx)).gaps, 1);
+  assert.equal(alerts, 1);
+});
+
 test('watch and internal runner parsers validate flags without changing emit/flush parsing', () => {
+  assert.match(require('../src/cli').USAGE.split('\n')[0], /<emit\|flush\|watch>/);
   assert.deepEqual(parseWatch(['--once', '--interval=2', '--role', 'agent-host']), { once: true, interval: 2, role: 'agent-host' });
   for (const args of [['--interval', '0'], ['--role', 'bad'], ['--once=true'], ['--no-flush']]) assert.throws(() => parseWatch(args));
   const run = parseRun(['--deadline-ms', '100', '--deadline-mono-ms=50', '--timeout', '1', '--state', '/tmp/state', '--', 'node', '-e', '']);
   assert.equal(run['deadline-ms'], 100);
   assert.deepEqual(run.command, ['node', '-e', '']);
   assert.throws(() => parseRun(['--timeout', '1']));
+});
+
+test('flush and watch configuration default host to the short OS hostname', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify({ schema: 1, sink: { type: 'file' }, watch: { role: 'agent-host' } }));
+  for (const command of ['flush', 'watch']) {
+    const result = require('../src/config').resolveConfig({}, f.env, { command });
+    assert.equal(result.config.host, os.hostname().split('.')[0]);
+  }
 });
 
 test('agent-host emits heartbeat before flushing and never reads failures or gaps', async t => {
@@ -91,7 +166,7 @@ test('gap checks use per-agent gap and board time and let upsertAlert own notifi
 });
 
 test('normal ticks retain running dispatches and refresh API budget without dispatch overlap', async () => {
-  let finish; let dispatches = 0; const budgets = [];
+  let finish; let dispatches = 0; let dispatchContext; const budgets = [];
   const { ctx } = context();
   const detail = { ref: 1, labels: [], claim: null, lastOutcome: null };
   ctx.sink = {
@@ -99,12 +174,14 @@ test('normal ticks retain running dispatches and refresh API budget without disp
     getFailure: async () => detail,
     claim: async () => ({ won: true, claimRef: 1, expiresAt: '2026-09-06T00:15:00Z' })
   };
-  ctx.dispatch = async () => { dispatches++; return new Promise(resolve => { finish = resolve; }); };
+  ctx.dispatch = async leaseCtx => { dispatchContext = leaseCtx; assert.equal(leaseCtx.apiCalls, 0); leaseCtx.apiCalls = 12; dispatches++; return new Promise(resolve => { finish = resolve; }); };
   assert.equal((await tick(ctx)).dispatched, 1);
   assert.equal(ctx.running.size, 1);
   assert.equal((await tick(ctx)).dispatched, 0);
   assert.equal(dispatches, 1);
   assert.deepEqual(budgets, [0, 0]);
+  assert.equal(dispatchContext.apiCalls, 12);
+  assert.equal(ctx.apiCalls, 5);
   finish({ status: 'repaired' });
   await Promise.all(ctx.running.values());
   assert.equal(ctx.running.size, 0);
@@ -186,14 +263,14 @@ test('pre-labelled needs-human failures reconcile alerts again after transport o
   assert.deepEqual(alerts[0], alerts[1]);
 });
 
-test('tick counts all eligible summaries and claims only ascending refs within capacity', async () => {
+test('tick confirms only ascending candidates up to capacity', async () => {
   const calls = []; const { ctx } = context();
   const records = [10, 2, 5].map(ref => ({ ref, labels: [], lastOutcome: null }));
   ctx.sink = { listOpenFailures: async () => records,
     getFailure: async (ctx, ref) => { calls.push(ref); return records.find(record => record.ref === ref); },
     claim: async () => ({ won: false }) };
   const summary = await tick(ctx, { once: true });
-  assert.equal(summary.eligible, 3);
+  assert.equal(summary.eligible, 1);
   assert.equal(summary.claimed, 0);
   assert.deepEqual(calls, [2]);
 });

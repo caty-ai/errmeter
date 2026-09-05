@@ -12,7 +12,7 @@ async function checkGaps(ctx, sink = ctx.sink) {
     const identity = record.agent + '@' + record.host;
     const limit = ctx.config.watch.gaps?.[identity] ?? ctx.config.watch.heartbeat_gap_sec;
     const seen = Date.parse(record.lastSeen);
-    if (!Number.isFinite(seen) || now - seen <= limit * 1000) continue;
+    if (Number.isFinite(seen) && now - seen <= limit * 1000) continue;
     if (ctx.signal?.aborted || ctx.lookup_incomplete) break;
     const alert = cleanValue({ key: 'heartbeat-gap:' + identity, title: 'Heartbeat gap: ' + identity,
       body: identity + ' has been silent since ' + record.lastSeen + ' (allowed gap ' + limit + ' seconds). ' + (ctx.config.owner.mention || ''),

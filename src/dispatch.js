@@ -11,6 +11,8 @@ const { consecutiveFailureCount } = require('./claim');
 
 const DEFAULT_PASS_ENV = ['PATH', 'HOME', 'LANG', 'TMPDIR', 'TEMP', 'SYSTEMROOT', 'USERPROFILE'];
 const MAX_LINE = 65536;
+// Wait one extra second so the runner owns the kill of its hook.
+const DISPATCH_KILL_DELAY_MS = 11000;
 const PROCESS_STARTED_MS = Math.floor(Date.now() - process.uptime() * 1000);
 const LOCK_STALE_MS = 10000;
 const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
@@ -71,7 +73,7 @@ function withStateLock(file, operation, options = {}) {
   }
 }
 
-function atomicState(file, update) {
+function atomicState(file, update, options = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   return withStateLock(file, () => {
     // The runner uses the same lock for PID insertion. Hold it across the read
@@ -81,7 +83,9 @@ function atomicState(file, update) {
     try {
       let value = update;
       if (typeof update === 'function') {
-        const current = JSON.parse(fs.readFileSync(file, 'utf8'));
+        let current;
+        try { current = JSON.parse(fs.readFileSync(file, 'utf8')); }
+        catch (error) { if (error.code !== 'ENOENT' || !options.create) throw error; current = {}; }
         if (!current || typeof current !== 'object' || Array.isArray(current)) throw new Error('Invalid dispatch state');
         value = update(current);
       }
@@ -199,8 +203,8 @@ function processAlive(pid, options = {}) {
     try {
       const status = childProcess.execFileSync('ps', ['-o', 'stat=', '-p', String(pid)],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-      if (!status || status.startsWith('Z')) return false;
-    } catch (_) { return false; }
+      if (status.startsWith('Z')) return false;
+    } catch (_) { return true; }
   }
   return true;
 }
@@ -209,7 +213,7 @@ async function waitForExit(pids, options, milliseconds) {
   const deadline = Date.now() + milliseconds;
   let live = pids.filter(pid => processAlive(pid, options));
   while (live.length && Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))));
+    await new Promise(resolve => setTimeout(resolve, Math.min(200, Math.max(1, deadline - Date.now()))));
     live = live.filter(pid => processAlive(pid, options));
   }
   return live;
@@ -284,7 +288,7 @@ async function dispatch(ctx, issue, claim, options = {}) {
     if (platform !== 'win32') {
       // The runner first force-kills its hook at 10 seconds; leave it time to
       // finish that job before force-killing the runner itself.
-      killTimer = schedule(() => signalTree('SIGKILL'), 11000);
+      killTimer = schedule(() => signalTree('SIGKILL'), DISPATCH_KILL_DELAY_MS);
       killTimer.unref?.();
     }
   }
@@ -352,19 +356,20 @@ async function dispatch(ctx, issue, claim, options = {}) {
   const summary = stdout.summary() || failure || (status === 'repaired' ? 'Repair proposed' : 'Dispatch failed');
   let url;
   try { const parsed = new URL(summary); if (['http:', 'https:'].includes(parsed.protocol) && !/\s/.test(summary)) url = summary; } catch (_) { /* Summaries need not be URLs. */ }
-  let failureBasis = issue;
-  if (status === 'dispatch-failed' && typeof sink.getFailure === 'function') {
-    const refreshed = await sink.getFailure(ctx, issue.ref);
-    if (ctx.lookup_incomplete) throw new Error('Failure lookup incomplete after dispatch');
-    if (refreshed) failureBasis = refreshed;
-  }
-  const consecutiveFailures = status === 'dispatch-failed' ? failureCount(failureBasis) + 1 : 0;
-  const needsHuman = consecutiveFailures >= (watch.escalate_after ?? 2);
+  let consecutiveFailures = status === 'dispatch-failed' ? failureCount(issue) + 1 : 0;
+  let needsHuman = consecutiveFailures >= (watch.escalate_after ?? 2);
   const outcome = { status, summary, ...(url ? { url } : {}), excerpt: stderr.excerpt(), watcherId, claimRef: claim.claimRef,
     ...(needsHuman ? { escalate: true } : {}) };
   // Preserve recovery state until the outcome is durable. An outcome itself
   // ends this watcher's claim, so release failure must not hide escalation.
   await sink.writeOutcome(ctx, issue.ref, outcome);
+  if (status === 'dispatch-failed' && typeof sink.getFailure === 'function') {
+    try {
+      const refreshed = await sink.getFailure(ctx, issue.ref);
+      if (refreshed && !ctx.lookup_incomplete) consecutiveFailures = Math.max(consecutiveFailures, failureCount(refreshed));
+    } catch (_) { ctx.log?.('dispatch: failure refresh failed after outcome'); }
+    needsHuman = consecutiveFailures >= (watch.escalate_after ?? 2);
+  }
   let releaseFailed = false;
   try { await sink.releaseClaim(ctx, issue.ref, { watcherId, claimRef: claim.claimRef }); }
   catch (_) { releaseFailed = true; ctx.log?.('dispatch: claim release failed after outcome'); }

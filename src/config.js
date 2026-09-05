@@ -78,6 +78,7 @@ function resolveConfig(flags = {}, env = process.env, options = {}) {
 function flushConfig(result, env, options, flags) {
   const { home } = result;
   const config = result.config;
+  config.host ??= os.hostname().split('.')[0];
   const command = options.command || 'flush';
   const invalid = message => new ConfigError(command + ': ' + message);
   const readSecret = file => secretFile(file, { ...options, onWarning: warning => { result.warning = warning; } });

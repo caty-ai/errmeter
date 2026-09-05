@@ -1,6 +1,6 @@
 'use strict';
 
-const USAGE = 'Usage: errmeter <emit|flush> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
+const USAGE = 'Usage: errmeter <emit|flush|watch> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
   'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n' +
   'watch: [--role watcher|agent-host] [--once] [--interval SEC]\n' +
   'Values starting with -- must be passed as --flag=value.\n';
