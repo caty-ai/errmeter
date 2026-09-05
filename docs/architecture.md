@@ -1,6 +1,6 @@
 # errmeter architecture (v1)
 
-Status: **frozen candidate v1.2** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
+Status: **frozen candidate v1.3** for contract-freeze issue #2. Companion: [requirements.md](requirements.md) (what and why), [contract.md](contract.md) (exact formats — where this file and contract.md differ, contract.md wins). Requirement ids (`R-*`, `N-*`) refer to requirements.md.
 
 ## 1. The one drawing
 
@@ -58,7 +58,7 @@ emit  ──▶  spool  ──▶  flush ──▶ sink (github-issue | file | w
 - Work: build one event (contract §2), run the **redactor** over `task`, `message`, `detail`, `meta` values, compute the **fingerprint** (§2.1), hand it to spool.
 - Mask list: emit reads the secret files it can read (board token, notify secrets) **only to add them to the mask list**; it never sends them and never opens a socket. If the files are unreadable, the mask list simply lacks them. Result: the spool on disk is already safe (N-9) whenever emit runs as the same user that owns the token.
 - Then, unless `--no-flush`: spawn `errmeter flush` detached (`stdio: 'ignore'`, `unref()`), exit 0 immediately. The child takes the flush lock or exits silently.
-- Capacity (contract §3.3): below the soft limit normal; between soft and hard limit *compact* events (no detail); at the hard limit *counters* per fingerprint. emit never refuses and never evicts.
+- Capacity (contract §3.3): below the soft limit normal; between soft and hard limit *compact* events (no detail); at the hard limit one **appended line per occurrence** in a single overflow log (atomic small append, no lock, no new files). emit never refuses and never evicts.
 
 ### 2.2 spool (`src/spool`)
 
@@ -72,7 +72,7 @@ emit  ──▶  spool  ──▶  flush ──▶ sink (github-issue | file | w
 - flush is short-lived: take the lock, list `pending/` oldest-first (≤ `max_events_per_pass`), group, call the sink:
   - heartbeats: newest per `agent@host` delivered; older ones straight to `sent/` (R-F4).
   - failures: grouped by fingerprint → one board write per group (create, or one occurrence comment), carrying **every delivered id in the marker** so a crash before the move is recovered by reading the board (contract §5.1).
-  - counters: one occurrence comment with the count.
+  - overflow log: cut by rename, folded per fingerprint into one occurrence comment with the count, idempotent by the cut file's nonce.
 - Then the **dead-man check** (§6 below). An emit-spawned flush that could not deliver **lingers** (keeps the lock, retries with backoff for up to `flush_linger_sec`, default 1 h) so a one-shot agent with no loop still gets automatic retry when the network returns; loop-driven flushes exit and rely on the next tick.
 - The sink interface is the table in contract §5 (**those names are the only names**; this file does not restate them). Three adapters: `github-issue` (REST over `node:https`), `file` (JSONL with a `seq`, same host), `webhook` (POST, not a board).
 - **Exactly one sink per config** (D-3). Human notification is `notify`, owned by watch (and used by flush only for the dead-man, board-first).
@@ -135,7 +135,7 @@ One `setTimeout` loop, one tick every `interval_sec`. Two roles, same process, s
   github-token           board token, 0600 — or ERRMETER_GITHUB_TOKEN
   telegram-token …       notify secrets, 0600, file-only
   spool/
-    pending/             not yet delivered (one JSON per event; <fp>.count.json in counter mode)
+    pending/             not yet delivered (one JSON per event; counters.log + heartbeat-*.json in counter mode)
     sent/                delivered, kept sent_retention_days
     dead/                unprocessable only, kept dead_retention_days
     flush.lock           holder pid/nonce/ts; stolen only via atomic rename
