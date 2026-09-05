@@ -1,18 +1,18 @@
 # errmeter contract (v1) — FROZEN INTERFACES
 
-Status: **freeze candidate** for issue #2. Once the owner approves, every section marked **[frozen]** may change only through a new contract issue that bumps the relevant version field. Sections marked **[default]** are tunable defaults that implementations MUST honour but families MAY override in config.
+Status: **freeze candidate v1.1** for issue #2 (v1.0 → v1.1: round-1 five-seat review, all findings folded in; see the changelog at the end). Once the owner approves, every section marked **[frozen]** may change only through a new contract issue that bumps the relevant version field. Sections marked **[default]** are tunable defaults that implementations MUST honour but families MAY override in config.
 
 Companions: [requirements.md](requirements.md), [architecture.md](architecture.md). Requirement ids (`R-*`, `N-*`) and decision ids (`D-*`) refer to those files.
 
-Wording: MUST / MUST NOT / SHOULD / MAY as in RFC 2119. "Reader" = any code that consumes a format; "writer" = code that produces it.
+Wording: MUST / MUST NOT / SHOULD / MAY as in RFC 2119. "Reader" = any code that consumes a format; "writer" = code that produces it. "Board time" = the `Date` header of the last successful board response (see §6.0).
 
 ---
 
 ## 1. Versioning and freeze rules [frozen]
 
-- `schema` (event), `config.schema` (config file), and the board marker prefix `errmeter:` are the three versioned surfaces. All are integers or fixed strings; there are no semver ranges inside the contract.
-- Readers MUST ignore unknown fields. Readers MUST NOT drop data whose version is *higher* than they understand; they deliver it verbatim and annotate (event → board with note; config → refuse to start with a clear message, since acting on a config you cannot read is unsafe).
-- Adding an optional field is not a version bump. Renaming, removing, changing a type, or changing a default that affects the board layout is a bump.
+- Versioned surfaces: `schema` (event), `config.schema` (config file), `fpv` (fingerprint algorithm, §2.1), and the board marker prefix `errmeter:`. All are integers or fixed strings.
+- Readers MUST ignore unknown fields. Readers MUST NOT drop data whose version is *higher* than they understand; they deliver it verbatim and annotate (event → board with note; config → refuse to start with a clear message).
+- Adding an optional field is not a version bump. Renaming, removing, changing a type, changing the fingerprint algorithm, or changing a default that affects the board layout is a bump.
 - Anything not described here is undefined behaviour and MUST NOT be relied on by another module.
 
 ---
@@ -34,6 +34,7 @@ One event = one JSON object, UTF-8, no BOM, newline-terminated when written to a
   "message": "TypeError: Cannot read properties of undefined (reading 'id')",
   "detail": "... last 40 lines, redacted ...",
   "fingerprint": "a3f9c2e17b04d8e6",
+  "fpv": 1,
   "meta": { "pr": "https://github.com/x/y/pull/12", "run_id": "sitter-20260905-1307" },
   "emitter": "errmeter/1.0.0",
   "attempts": 0
@@ -44,41 +45,60 @@ One event = one JSON object, UTF-8, no BOM, newline-terminated when written to a
 |---|---|---|---|---|
 | `schema` | integer | yes | emit | `1` for this contract. |
 | `id` | string | yes | emit | UUID v4 (`crypto.randomUUID()`). Globally unique; the idempotency key for the sink. |
-| `ts` | string | yes | emit | ISO 8601 UTC with milliseconds, `Z` suffix. Time of emit, not of the underlying failure. |
+| `ts` | string | yes | emit | ISO 8601 UTC with milliseconds, `Z` suffix. Time of emit. |
 | `kind` | `"error"` \| `"heartbeat"` | yes | emit | Closed enum. Anything else is a usage error at emit and a `dead/` event at flush. |
-| `agent` | string | yes | emit | `[A-Za-z0-9._/-]{1,64}`. Logical name. Source: `--agent` > `ERRMETER_AGENT` > config `agent` > `"unknown"`. Watchers use `watcher/<watcher_id>`. |
-| `host` | string | yes | emit | `[A-Za-z0-9._-]{1,64}`. Source: config `host` > `os.hostname()` (lower-cased, domain stripped). |
-| `family` | string | no | emit | From config. Free text ≤ 64. Informational only (X-5). |
-| `task` | string | no | emit | ≤ 200 chars after redaction. What the agent was doing. |
-| `message` | string | yes for `error`; MAY be empty for `heartbeat` | emit | First line of the failure. ≤ 500 chars after redaction; single line (CR/LF replaced by space). |
-| `detail` | string | no | emit | Redacted tail. ≤ `detail_max_bytes` (8192) after redaction; newlines preserved. Truncation marks with a leading line `[errmeter: truncated to last N lines]`. |
-| `fingerprint` | string | yes for `error`; absent for `heartbeat` | emit | 16 lowercase hex chars, see §2.1. |
-| `meta` | object | no | emit | String keys `[A-Za-z0-9_.-]{1,32}`, string values ≤ 256 chars, ≤ 16 entries. Values pass the redactor. Keys starting with `_` are reserved for errmeter (`_spool_fallback`, `_folded`). |
+| `agent` | string | yes | emit | `[a-z0-9._/-]{1,64}` **after lower-casing** (emit lower-cases; `Nora` and `nora` are one agent). Source: `--agent` > `ERRMETER_AGENT` > config `agent` > `"unknown"`. Watchers use `watcher/<watcher_id>`. |
+| `host` | string | yes | emit | `[a-z0-9._-]{1,64}` after lower-casing. Source: config `host` > `os.hostname()` (domain stripped). |
+| `family` | string | no | emit | From config. ≤ 64 chars. Informational only (X-5). |
+| `task` | string | no | emit | ≤ 200 chars after redaction. |
+| `message` | string | yes for `error`; MAY be empty for `heartbeat` | emit | First line of the failure. ≤ 500 chars after redaction; single line (CR/LF → space). |
+| `detail` | string | no | emit | Redacted tail. ≤ `detail_max_bytes` after redaction; newlines preserved. Truncation marks with a leading line `[errmeter: truncated to last N lines]`. Empty in compact mode (§3.3). |
+| `fingerprint` | string | yes for `error`; absent for `heartbeat` | emit | 16 lowercase hex chars, §2.1. |
+| `fpv` | integer | yes for `error` | emit | Fingerprint algorithm version, `1`. |
+| `meta` | object | no | emit | Keys `[A-Za-z0-9_.-]{1,32}`, string values ≤ 256 chars, ≤ 16 entries. Values pass the redactor. Keys starting with `_` are reserved (`_spool_fallback`, `_compact`, `_folded_count`). |
 | `emitter` | string | yes | emit | `errmeter/<package version>`. |
-| `attempts` | integer | yes | emit (0), flush (increments) | Delivery attempts so far. The only field flush may rewrite in a pending file. |
+| `attempts` | integer | yes | emit (0), flush (increments) | Delivery attempts. The only field flush may rewrite in a pending file. |
 
-Size cap for the whole serialized event: **32 KiB**. emit MUST shrink `detail` first, then `meta` values, to fit.
+Size cap for the whole serialized event: **32 KiB**. emit shrinks `detail` first, then `meta` values, to fit.
 
-### 2.1 Fingerprint [frozen]
+### 2.1 Fingerprint, `fpv = 1` [frozen]
 
 ```
-normalized = message
+n = message
   .toLowerCase()
-  .replace(/0x[0-9a-f]+/g, "#")             // hex literals
-  .replace(/[0-9a-f]{8,}/g, "#")            // long hex ids / hashes
-  .replace(/\d+/g, "#")                     // any number
-  .replace(/(["'`]).*?\1/g, "$1#$1")        // quoted strings
+  .replace(/(?:[a-z]:)?(?:[\\/][^\s"'`:;,)]+){2,}/g, "#path#")    // absolute or multi-segment paths (posix + windows)
+  .replace(/https?:\/\/[^\s"'`)]+/g, "#url#")                       // urls
+  .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, "#uuid#")
+  .replace(/\b0x[0-9a-f]+\b/g, "#hex#")
+  .replace(/\b[0-9a-f]{12,}\b/g, "#hex#")                          // long hex ids / hashes
+  .replace(/\b\d{1,3}(\.\d{1,3}){3}\b/g, "#ip#")
+  .replace(/:\d+(?::\d+)?\b/g, ":#")                                // :port, :line:col
+  .replace(/\b\d{4,}\b/g, "#")                                      // 4+ digit numbers (ids, timestamps, pids)
   .replace(/\s+/g, " ")
   .trim()
   .slice(0, 200)
-fingerprint = sha256(agent + "\n" + normalized).hex.slice(0, 16)
+fingerprint = sha256(agent + "\n" + n).hex.slice(0, 16)
 ```
 
-`host` is deliberately **not** part of the fingerprint: the same error on two hosts is one problem. `task` is not part either. Families that want per-host Issues put the host in `agent` (`nora@vps-1`).
+Rules of the algorithm: numbers of 1–3 digits are **kept** (HTTP status, exit codes, errno); quoted strings are **kept** (`reading 'userId'` and `reading 'orgId'` are two problems); paths, URLs, UUIDs, long hex, IPs, ports and line:col positions are wiped. `host` and `task` are not part of the fingerprint. Families that want per-host records put the host in `agent` (`nora@vps-1`).
+
+Normative vectors (tests MUST pin these; `agent = "a"` for all):
+
+| message | normalized |
+|---|---|
+| `HTTP 404 fetching invoice 1234` | `http 404 fetching invoice #` |
+| `HTTP 500 fetching invoice 9876` | `http 500 fetching invoice #` (≠ previous) |
+| `ECONNREFUSED 10.0.0.1:5432` | `econnrefused #ip#:#` |
+| `ECONNREFUSED db.internal:6379` | `econnrefused db.internal:#` (≠ previous — a hostname is not an IP; accepted) |
+| `TypeError: Cannot read properties of undefined (reading 'userId')` | `typeerror: cannot read properties of undefined (reading 'userid')` |
+| `TypeError: Cannot read properties of undefined (reading 'orgId')` | `... (reading 'orgid')` (≠ previous) |
+| `ENOENT: no such file, open '/tmp/run-abc/a.txt'` | `enoent: no such file, open '#path#'` |
+| `ENOENT: no such file, open '/tmp/run-xyz/a.txt'` | same as previous |
+| `Error at /opt/app/src/x.js:123:45` | `error at #path#:#` |
 
 ### 2.2 Heartbeat events
 
-Same object with `kind: "heartbeat"`, no `fingerprint`, `message` MAY be a short status (`"idle"`, `"run 42 ok"`), `detail` SHOULD be empty. `meta.role` = `"watcher"` for watcher heartbeats (used by the dead-man check), otherwise absent.
+Same object with `kind: "heartbeat"`, no `fingerprint`/`fpv`, `message` MAY be a short status, `detail` SHOULD be empty. `meta.role` = `"watcher"` for `watch --role watcher`, `"agent-host"` for `watch --role agent-host` (§11), otherwise absent.
 
 ---
 
@@ -88,123 +108,182 @@ Home: `ERRMETER_HOME` → else `path.join(os.homedir(), ".errmeter")`. Same on m
 
 | path | content |
 |---|---|
-| `spool/pending/<ts>-<id>.json` | one event; `<ts>` = `ts` with `:` and `.` replaced by `-` (sortable, filesystem-safe), `<id>` = event id |
+| `spool/pending/<ts>-<id>.json` | one event; `<ts>` = `ts` with `:` and `.` replaced by `-`; `<id>` = event id |
+| `spool/pending/<fingerprint>.count.json` | overflow counter (§3.3): `{ "fingerprint", "fpv", "agent", "host", "message", "count", "first_ts", "last_ts" }` |
 | `spool/pending/*.tmp` | in-flight writes; readers ignore; older than 60 s = garbage, flush deletes |
-| `spool/sent/<same name>` | delivered; moved here by flush after the sink confirmed; deleted after `sent_retention_days` |
-| `spool/dead/<same name>` | refused by the sink as unprocessable (bad JSON, unknown `kind`) or evicted by `pending_hard_limit`; deleted after `dead_retention_days` |
-| `spool/flush.lock` | JSON `{ "pid": 123, "ts": "...", "host": "..." }`; created with `wx` flag (exclusive). A lock older than `lock_stale_sec` MAY be deleted by the next flush. |
+| `spool/sent/<same name>` | delivered; moved here after the sink confirmed; deleted after `sent_retention_days` |
+| `spool/dead/<same name>` | **unprocessable only** (bad JSON, unknown `kind`, unknown higher `schema` after one delivery attempt as raw text failed). Never used for capacity. Deleted after `dead_retention_days`. |
+| `spool/flush.lock` | see §3.2 |
 
-Write protocol (emit): serialize → write `<name>.tmp` → `fsync` (best effort; ignore errors) → `rename` to `<name>.json`. Never open the final name for writing.
+### 3.1 Write / move protocol
 
-Read protocol (flush): `readdir` `pending/`, ignore `.tmp`, sort by name (= by time), process oldest first, up to `max_events_per_pass`. A file that fails `JSON.parse` goes to `dead/`.
+- Write (emit): serialize → write `<name>.tmp` → `fsync` (best effort) → `rename` to `<name>.json`. Never open the final name for writing.
+- Move (flush): `unlink` the destination if it exists (Windows `rename` fails on an existing target), then `rename`. A move that fails is retried next pass; the event stays pending (duplicate delivery is prevented by the board markers, §5.1, not by the move).
+- Read (flush): `readdir` `pending/`, ignore `.tmp`, sort by name, oldest first, up to `max_events_per_pass`. Counter files are processed after event files.
+- Fallback: if the home is unwritable, emit uses `path.join(os.tmpdir(), "errmeter-spool")` with the same layout and sets `meta._spool_fallback`. flush drains both.
 
-Fallback: if the home is unwritable, emit uses `path.join(os.tmpdir(), "errmeter-spool")` with the same layout and sets `meta._spool_fallback = "<original path>"`. flush drains both.
+### 3.2 Flush lock (single-flight per home)
 
-Limits [default]: `detail_max_bytes` 8192 · `tail_lines` 40 · `pending_soft_limit` 5000 (warn) · `pending_hard_limit` 20000 (evict oldest → dead) · `sent_retention_days` 7 · `dead_retention_days` 30 · `lock_stale_sec` 600 · `max_events_per_pass` 500.
+- Acquire: `open(flush.lock, "wx")` and write `{ "pid", "nonce", "ts", "host" }`. Failure = someone holds it → exit 0 silently (emit-spawned) or return "busy" (`flush` command, exit 1).
+- Refresh: the holder rewrites `ts` every `lock_refresh_sec` (30) while working. The holder MUST NOT sleep longer than `lock_refresh_sec` inside one pass; backoff waits longer than that are done by **exiting** and leaving events pending (§5.1 backoff is remembered in `state/last_flush.json`, not slept in-process).
+- Steal: a lock whose `ts` is older than `lock_stale_sec` (600) MAY be stolen **only** by `rename(flush.lock, flush.lock.stale-<my nonce>)` followed by a fresh `wx` create. The rename is atomic; a second stealer's rename fails with `ENOENT` and it exits. Never `unlink` then create.
+
+### 3.3 Capacity: nothing unacknowledged is ever evicted
+
+- Below `pending_soft_limit` (5000 files): normal.
+- Between soft and hard limit: **compact mode** — emit writes events with empty `detail` and `meta._compact = "1"`. Content is reduced, every event still exists.
+- At or above `pending_hard_limit` (20000 files): **counter mode** — emit does not create a new event file; it upserts `pending/<fingerprint>.count.json` (increment `count`, update `last_ts`; write via tmp+rename of the counter file; a lost increment under a concurrent race is accepted). Heartbeats in counter mode are still written as files (they are coalesced by flush and are ≤ 1 per agent per pass).
+- flush delivers a counter as one occurrence comment with `count` and `first/last`, then deletes it. **No pending file is ever moved to `dead/` for capacity reasons.** Disk bound = `pending_hard_limit × 32 KiB` ≈ 640 MB worst case, in practice far lower because compact mode starts at the soft limit.
+- Requirements wording that follows from this: "nothing lost" means *no event below the hard limit is lost; above it, content is folded into counts* (R-F2, §6 of requirements.md).
+
+Limits [default]: `detail_max_bytes` 8192 · `tail_lines` 40 · `pending_soft_limit` 5000 · `pending_hard_limit` 20000 · `sent_retention_days` 7 · `dead_retention_days` 30 · `lock_refresh_sec` 30 · `lock_stale_sec` 600 · `max_events_per_pass` 500.
 
 ---
 
 ## 4. Redaction [frozen]
 
-Applied by emit to `task`, `message`, `detail`, and every `meta` value; applied again by flush to the same fields before egress (defence in depth). Order matters; each rule replaces with the literal shown.
+The redactor is one pure function `redact(text, maskList) → text`. It is applied to **every string that leaves the machine or is written by errmeter**: at emit (`task`, `message`, `detail`, `meta` values → spool), at flush (same fields again before egress), by watch to **hook stdout/stderr excerpts and outcome summaries** before `writeOutcome`, to alert bodies, and to every line of `errmeter.log`.
+
+Mask list construction: at process start each command reads the secret files it *can* read (board token, notify secrets — read-only, never sent by emit) and adds their contents to the mask list; if a file is unreadable the mask list simply lacks it. emit therefore masks the board token in the spool whenever the token file is readable by the emitting user (the common case: same user, same home). Env values are added for env var names matching rule 4.
 
 | # | rule | replacement |
 |---|---|---|
-| 1 | Any string in the runtime mask list (the loaded board token, notify secrets, values of env vars whose name matches rule 4) | `[REDACTED]` |
-| 2 | PEM blocks: `-----BEGIN [A-Z ]*PRIVATE KEY-----` … `-----END [A-Z ]*PRIVATE KEY-----` (multi-line) | `[REDACTED PEM]` |
-| 3 | Known token shapes: `ghp_[A-Za-z0-9]{20,}`, `github_pat_[A-Za-z0-9_]{20,}`, `gho_`/`ghu_`/`ghs_`/`ghr_` + 20+, `sk-[A-Za-z0-9_-]{16,}`, `xox[abprs]-[A-Za-z0-9-]{10,}`, `AKIA[0-9A-Z]{16}`, `AIza[0-9A-Za-z_-]{35}`, `[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}` (Telegram bot) | `[REDACTED TOKEN]` |
+| 1 | Any string in the mask list (≥ 8 chars) | `[REDACTED]` |
+| 2 | PEM blocks `-----BEGIN [A-Z ]*PRIVATE KEY-----` … `-----END [A-Z ]*PRIVATE KEY-----` | `[REDACTED PEM]` |
+| 3 | Known shapes: `ghp_[A-Za-z0-9]{20,}`, `github_pat_[A-Za-z0-9_]{20,}`, `gh[ousr]_[A-Za-z0-9]{20,}`, `sk-[A-Za-z0-9_-]{16,}`, `xox[abprs]-[A-Za-z0-9-]{10,}`, `AKIA[0-9A-Z]{16}`, `AIza[0-9A-Za-z_-]{35}`, `[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}` (Telegram bot), `https://hooks\.slack\.com/services/[A-Za-z0-9/]+`, `https://discord(app)?\.com/api/webhooks/[^\s]+` | `[REDACTED TOKEN]` |
 | 4 | `key=value` / `key: value` / `"key": "value"` where key matches `/(token|secret|password|passwd|pwd|api[_-]?key|auth|bearer|cookie|session)/i` | key kept, value → `[REDACTED]` |
-| 5 | `Authorization: <scheme> <value>` headers and `Bearer <value>` | `Authorization: [REDACTED]` / `Bearer [REDACTED]` |
-| 6 | URL userinfo `scheme://user:pass@host` and query params named as in rule 4 | `scheme://[REDACTED]@host`, `?key=[REDACTED]` |
-| 7 | Home directory paths: the literal `os.homedir()` (and `%USERPROFILE%` form on Windows) | `~` |
-| 8 | Tail: keep only the last `tail_lines` lines of `detail` | prepend `[errmeter: truncated to last N lines]` |
+| 5 | `Authorization: <scheme> <value>` and `Bearer <value>` | `Authorization: [REDACTED]` / `Bearer [REDACTED]` |
+| 6 | URL userinfo `scheme://user:pass@host`; query params named as in rule 4 | `scheme://[REDACTED]@host`, `?key=[REDACTED]` |
+| 7 | `os.homedir()` literal (and `%USERPROFILE%` form) | `~` |
+| 8 | Tail: keep the last `tail_lines` lines of `detail` | prepend `[errmeter: truncated to last N lines]` |
 
-Redaction MUST be pure and deterministic (same input → same output) so tests can pin it. The redactor never logs what it removed.
+Deterministic; never logs what it removed. Vectors in `test/fixtures/redact/`.
 
 ---
 
 ## 5. Sink adapter interface [frozen]
 
-A sink is a module exporting an object with the following async functions. All take `ctx` first: `{ config, log, http, now }`. All throw on transport failure (flush retries); they return `{ skipped: true }` for idempotent no-ops.
+A sink module exports the functions below. All take `ctx` first: `{ config, home, log, http, now }` (`home` = resolved errmeter home; `now()` = board time when known, else local). Transport failures throw (flush retries); idempotent no-ops return `{ skipped: true }`. **This table is the only list of names**; architecture.md refers to it.
 
 ```js
-// delivery (used by flush)
-deliverHeartbeat(ctx, event)                 // → { ref }            upsert the per-agent liveness record
-deliverFailureGroup(ctx, group)              // → { ref, created }   group = { fingerprint, events: [oldest..newest], count }
-// board reads/writes (used by watch; a sink that is not a board throws NotABoard)
-listOpenFailures(ctx)                        // → [ IssueSummary ]
-getFailure(ctx, ref)                         // → IssueDetail (with claim comments)
-claim(ctx, ref, { watcherId, expiresAt })    // → { won: bool, claimRef }
-renewClaim(ctx, ref, { watcherId, expiresAt })
-releaseClaim(ctx, ref, { watcherId })
-writeOutcome(ctx, ref, outcome)              // outcome = { status: "repaired"|"dispatch-failed"|"needs-human", summary, url? }
-listHeartbeats(ctx)                          // → [ { agent, host, role?, lastSeen (ISO), ref } ]
-upsertAlert(ctx, alert)                      // alert = { key, title, body, mention? } ; dedup by key
+// delivery (flush)
+deliverHeartbeat(ctx, event)                    // → { ref }
+deliverFailureGroup(ctx, group)                 // → { ref, created, delivered: [ids] }
+   // group = { fingerprint, fpv, agent, events: [oldest..newest], count, counter? }
+// board (watch). Non-board sinks throw NotABoard.
+listOpenFailures(ctx)                           // → [ FailureSummary ]      (paginated, budgeted, §5.4)
+getFailure(ctx, ref)                            // → FailureDetail
+claim(ctx, ref, { watcherId, ttlSec })          // → { won, claimRef, expiresAt }   atomic: post → re-read → tie-break → cleanup (§6)
+renewClaim(ctx, ref, { watcherId, claimRef, ttlSec })  // → { ok, expiresAt }   MUST be confirmed 2xx to count
+releaseClaim(ctx, ref, { watcherId, claimRef })
+writeOutcome(ctx, ref, outcome)                 // outcome = { status: "repaired"|"dispatch-failed"|"needs-human", summary, url?, watcherId }
+listHeartbeats(ctx)                             // → [ HeartbeatRecord ]
+upsertAlert(ctx, alert)                         // alert = { key, title, body, mention? } → { ref, winner }  (§5.3)
 ```
 
-Idempotency keys the sink MUST honour: event `id` (never two board writes for one id), `fingerprint` (never two open failure records for one fingerprint), alert `key` (one open alert record per key).
+Types [frozen field lists]:
 
-`ref` is opaque to callers (for `github-issue` it is the Issue number; for `file` it is a line offset; for `webhook` it is the response id or `null`).
+```
+FailureSummary  = { ref, fingerprint, fpv, agent, host, title, labels: [string], openedAt, lastOccurrenceAt, occurrences, claim: Claim|null, lastOutcome: Outcome|null }
+FailureDetail   = FailureSummary + { latest: Event, claims: [Claim], outcomes: [Outcome], occurrenceIds: [string] }
+Claim           = { claimRef, watcherId, createdAt, expiresAt, live: boolean }
+Outcome         = { status, watcherId, at, summary, url? }
+HeartbeatRecord = { ref, agent, host, role: "watcher"|"agent-host"|null, lastSeen (ISO from marker), message }
+Event           = the §2 object
+```
 
-### 5.1 `github-issue` sink board layout [frozen]
+Idempotency keys the sink MUST honour: event `id` (never two board writes for one id), `fingerprint` (never two *open* failure records for one fingerprint — with the reconciliation in §5.2), alert `key` (one open alert record per key).
 
-| thing | value |
-|---|---|
-| Failure Issue title | `[errmeter] <agent>: <message first 80 chars>` |
-| Failure Issue body | human summary + fenced `detail` + hidden marker line `<!-- errmeter:fp=<fingerprint> id=<first event id> schema=1 -->` |
-| Occurrence comment | `<!-- errmeter:occurrence ids=<id1,id2,...> count=<n> first=<ts> last=<ts> -->` + human summary + latest `detail` |
-| Heartbeat Issue title | `[errmeter] heartbeat: <agent>@<host>` (one per agent@host, never closed by errmeter) |
-| Heartbeat Issue body | marker `<!-- errmeter:heartbeat agent=<agent> host=<host> role=<role> -->` + last message; **liveness = Issue `updated_at`** (body edit) |
-| Alert Issue title | `[errmeter] alert: <key>` (e.g. `all-watchers-silent`, `gap:<agent>@<host>`) |
-| Claim comment | `<!-- errmeter:claim watcher=<watcherId> expires=<ISO> -->` (see §6) |
-| Outcome comment | `<!-- errmeter:outcome status=<status> watcher=<watcherId> -->` + summary + url |
+### 5.1 `github-issue` board layout [frozen]
 
-Labels (created by `errmeter init`, all prefixed to avoid collisions with a family's own labels):
+All markers are HTML comments on their own line; `key=value` pairs separated by single spaces; values never contain spaces (ids are comma-joined). Every marker starts with `errmeter:`.
+
+| record | title | body / comment |
+|---|---|---|
+| Failure Issue | `[errmeter] <agent>: <newest message, first 80 chars>` | marker `<!-- errmeter:failure fp=<fingerprint> fpv=1 ids=<id,...> count=<n> first=<ts> last=<ts> schema=1 -->` + human summary + `latest` event as a fenced ```json block (full §2 object, already redacted) |
+| Occurrence comment | — | `<!-- errmeter:occurrence ids=<id,...> count=<n> first=<ts> last=<ts> -->` + summary + fenced ```json `latest` event (if a counter: `ids=` empty, `count` from the counter) |
+| Heartbeat Issue | `[errmeter] heartbeat: <agent>@<host>` | `<!-- errmeter:heartbeat agent= host= role= ts=<ISO of the event> -->` + last message. **Liveness = `ts` in the marker**, never Issue `updated_at`. |
+| Alert Issue | `[errmeter] alert: <key>` | `<!-- errmeter:alert key= -->` + body; each alert episode is a comment `<!-- errmeter:alert-episode key= host= ts= -->` (§5.3) |
+| Claim comment | — | `<!-- errmeter:claim watcher=<id> expires=<ISO> ref=<claimRef-or-new> -->` |
+| Release comment | — | `<!-- errmeter:release watcher=<id> ref=<claimRef> -->` |
+| Outcome comment | — | `<!-- errmeter:outcome status= watcher= ts= -->` + redacted summary + url + fenced last-20-lines excerpt (redacted) |
+
+`ids=` in a failure marker or occurrence marker lists **every** event id delivered by that board write. Crash recovery: a pending event whose `id` appears in any marker of the open (or most recently closed) Issue for its fingerprint is moved to `sent/` without a new write.
+
+Labels (created by `errmeter init`):
 
 | label | meaning |
 |---|---|
 | `errmeter` | every Issue errmeter creates |
 | `errmeter:failure` / `errmeter:heartbeat` / `errmeter:alert` | record type |
-| `errmeter:role:watcher` | heartbeat Issue of a watcher |
-| `errmeter:claimed` | an unexpired claim exists (mirror of the claim comment; the comment is authoritative) |
-| `errmeter:dispatched` | hook was started at least once |
-| `errmeter:repaired` | last hook run exited 0 (a fix was *proposed*) |
-| `errmeter:dispatch-failed` | last hook run failed |
+| `errmeter:role:watcher` / `errmeter:role:agent-host` | heartbeat Issue of a loop process |
+| `errmeter:claimed` | advisory mirror of a live claim (comments are authoritative) |
+| `errmeter:dispatched` | hook started at least once |
+| `errmeter:repaired` | last outcome exit 0 (a fix was *proposed*) |
+| `errmeter:dispatch-failed` | last outcome failed |
 | `errmeter:needs-human` | escalated; owner notified |
 
-Fingerprint lookup order: `state/fingerprints.json` cache → list open Issues with label `errmeter:failure` (100/page, all pages, budgeted) and match the `fp=` marker → not found = create. A cache hit whose Issue turns out closed → create a new Issue and update the cache (a closed problem that returns is a new record, linked by the marker's `fp`).
+Comment throttle [default]: `max_comments_per_issue_per_hour` 12, counted from the `ts=` of occurrence markers on that Issue (read from the board, so all hosts share the count). Beyond the cap, flush leaves the events pending (they fold into the next comment when the window frees). Heartbeat and claim writes are not throttled.
 
-API budget [default]: `max_api_calls_per_pass` 60; backoff on 403/429 honouring `Retry-After` / `X-RateLimit-Reset`, capped at 1 h; on 5xx exponential from 5 s.
+### 5.2 Fingerprint lookup and reconciliation [frozen]
 
-### 5.2 `file` sink
+Order: `state/fingerprints.json` cache (`fp → { ref, state }`) → list open Issues with label `errmeter:failure` (`per_page=100`, all pages, budgeted §5.4) and match `fp=` in the failure marker → not found = create.
 
-Appends one JSON line per board write to `file.path` (default `~/.errmeter/board.jsonl`): `{ "op": "failure"|"occurrence"|"heartbeat"|"claim"|"outcome"|"alert", ...payload, "ts" }`. Implements the board functions by scanning the file (same host only). Intended for tests and single-machine families.
+- Budget exhausted before the listing completed → **unknown**: do not create, leave events pending, record `lookup_incomplete` in `state/last_flush.json`. Never create on an incomplete listing.
+- Two open Issues with the same `fp` (concurrent create from two hosts): the **lowest Issue number** is canonical. The finder posts on the other `<!-- errmeter:duplicate-of ref=<n> -->`, closes it (the one thing errmeter may close), and updates the cache.
+- Cache hit whose Issue is closed and **not** by errmeter as a duplicate: create a new Issue (a returning problem is a new record) and update the cache.
+- `deliverFailureGroup` when the Issue exists: filter `events` to ids not already in any marker, then one occurrence comment; `delivered` = the ids actually written.
 
-### 5.3 `webhook` sink
+### 5.3 Alerts: board-first, single winner [frozen]
 
-`POST webhook.url` with `Content-Type: application/json`, body = the event (heartbeat) or `{ fingerprint, count, events }` (failure group); optional `webhook.headers_file` for auth headers. 2xx = delivered. Board functions throw `NotABoard`; `watch` refuses to start against it.
+`upsertAlert` = ensure the alert Issue exists → post an episode comment → re-read → the episode comment with the **lowest id** whose `ts` is within `renotify_sec` of now is the winner. Return `{ winner: <my comment is the winner> }`. **Only the winner calls `notify`.** Losers delete their own episode comment (by the id they just created; never another id). This is the claim protocol (§6) reused for alerts.
+
+### 5.4 Pagination and API budget [frozen]
+
+- Every list call uses `per_page=100` and follows `Link: rel="next"` until exhausted or `max_pages_per_list` (10) is hit. An exhausted page budget is **incomplete** and MUST be treated as unknown (no create, no dispatch, no alert).
+- `max_api_calls_per_pass` (60) per flush pass and per watch tick. Backoff on 403/429 honours `Retry-After` / `X-RateLimit-Reset`; on 5xx exponential from 5 s. Backoff longer than `lock_refresh_sec` is stored in `state/last_flush.json` and the process exits/skips the tick.
+- Comment reads for a claim decision (§6) MUST be complete (all pages); if not, the watcher does not dispatch.
+
+### 5.5 `file` sink
+
+Appends one JSON line per board write to `file.path` (default `<home>/board.jsonl`): `{ "seq", "op", ...payload, "ts" }` where `seq` is a monotonically increasing integer maintained in `<home>/board.seq` (read → increment → write via tmp+rename, under the flush lock). Board functions scan at most the last `file.scan_max_lines` (50 000) lines. Tie-break for claims/alerts = lowest `seq`. Same-host only.
+
+### 5.6 `webhook` sink
+
+`POST webhook.url`, `Content-Type: application/json`, body = event (heartbeat) or `{ fingerprint, fpv, agent, count, events }` (failure group); `webhook.headers_file` for auth headers. 2xx = delivered. Board functions throw `NotABoard`; `watch` refuses to start against it.
 
 ---
 
 ## 6. Claim protocol [frozen] (D-4)
 
-State of a failure record is derived from its comments, newest last:
+### 6.0 Clock
 
-1. A **claim** is a comment whose first line matches `<!-- errmeter:claim watcher=<id> expires=<ISO> -->`.
-2. A claim is **live** if `expires` is in the future **and** no later `errmeter:outcome` or `errmeter:release` comment by the same watcher exists.
-3. The **holder** is the author of the live claim with the **lowest comment id**. (Author is the same user for all watchers sharing a token, so `watcher=` in the marker is the identity; comment id is the tie-break because GitHub assigns them monotonically per repository.)
-4. **To claim**: post a claim comment with `expires = now + claim_ttl_sec` → re-read the comments → if you are the holder, add label `errmeter:claimed` and proceed; otherwise delete your own claim comment (or post `<!-- errmeter:release watcher=<id> -->` if deletion is not permitted) and skip.
-5. **To renew** while the hook runs: post a new claim comment every `renew_sec`; the old one is superseded by `expires` only (no deletion needed). `renew_sec` MUST be < `claim_ttl_sec / 2`.
-6. **Stale**: no live claim. Any watcher may claim. The label `errmeter:claimed` is advisory; watchers MUST evaluate the comments, not the label, before dispatching.
-7. **Terminal**: a record with `errmeter:needs-human`, or closed, is never claimed.
+All `expires` comparisons use **board time**: the `Date` header of the response that returned the comments being evaluated. Local clocks are used only for scheduling ticks.
 
-Defaults [default]: `claim_ttl_sec` 1800 · `renew_sec` 300 · `escalate_after` 2 · `max_concurrent` 1.
+### 6.1 State derived from comments
+
+1. A **claim** is a comment whose first line is an `errmeter:claim` marker; `ref` in the marker is the claim id it renews (`new` for a fresh claim).
+2. A claim is **live** if `expires` > board time and no later `errmeter:release` or `errmeter:outcome` by the same `watcher=` exists.
+3. The **holder** is the `watcher=` of the live claim with the **lowest comment id** among all comments **listed ascending with full pagination** (§5.4). Comment ids are used as returned by the list endpoint; the contract relies on list order, not on any global id property.
+4. **Eligible for claim** = Issue open, no `errmeter:needs-human`, no live claim, **and** (no outcome yet **or** an occurrence marker with `last=` later than the last outcome's `ts=`). A `repaired` or `dispatch-failed` record is therefore not re-dispatched until the problem happens again.
+5. **Consecutive failures** = number of trailing `dispatch-failed` outcomes since the last occurrence marker. `≥ escalate_after` → `needs-human` (§9).
+
+### 6.2 Operations
+
+- **claim**: post `errmeter:claim ref=new expires=<board now + ttlSec>` → re-read all comments → if holder: add label `errmeter:claimed`, return `{ won: true, claimRef: <own comment id> }`; else delete **exactly the comment id just created** (fallback: post `errmeter:release` for it), return `{ won: false }`.
+- **renew**: post `errmeter:claim ref=<claimRef> expires=<board now + ttlSec>`. Counts as renewed **only** on a 2xx response. Renewed every `renew_sec`; `renew_sec` MUST be ≤ `claim_ttl_sec / 3`.
+- **release**: post `errmeter:release ref=<claimRef>`; remove label.
+- **fence** (the rule that prevents two hooks): a watcher MUST terminate its running hook (§9 kill sequence) immediately when a renew fails or is not confirmed by `expires − renew_sec`, and in any case no later than `expires − kill_grace_sec` (30). A hook is never allowed to outlive the claim it runs under. If the watcher process itself dies, the hook may survive until its own `timeout_sec`; therefore **`dispatch.timeout_sec` MUST be ≤ `claim_ttl_sec − kill_grace_sec`** (validated at startup) — so a takeover after expiry can never overlap a still-running orphan hook. Watcher restart also kills any pid recorded in `state/dispatch/*.json` before its first tick.
+
+Defaults [default]: `claim_ttl_sec` 900 · `renew_sec` 180 · `kill_grace_sec` 30 · `dispatch.timeout_sec` 840 (≤ 900 − 30; families with long repairs raise both together) · `escalate_after` 2 · `max_concurrent` 1.
+
+Worst-case window with these defaults: a watcher that hard-crashes leaves the Issue idle for at most `claim_ttl_sec` before takeover (a *gap*, never an *overlap*).
 
 ---
 
 ## 7. Configuration [frozen keys, default values]
 
-File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, comments not allowed. Secrets are **never** in this file; they are referenced by `*_file` keys or supplied by env.
+File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, no comments. **Secrets are never in this file and never in environment variables except `ERRMETER_GITHUB_TOKEN`**; notify secrets are file-only.
 
 ```json
 {
@@ -220,17 +299,18 @@ File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, comments not allowe
   },
   "spool": { "tail_lines": 40, "detail_max_bytes": 8192, "sent_retention_days": 7 },
   "watch": {
+    "role": "watcher",
     "watcher_id": "vps-1",
     "interval_sec": 60,
-    "claim_ttl_sec": 1800,
-    "renew_sec": 300,
+    "claim_ttl_sec": 900,
+    "renew_sec": 180,
     "max_concurrent": 1,
     "escalate_after": 2,
     "heartbeat_gap_sec": 900,
     "watcher_gap_sec": 600,
     "renotify_sec": 21600,
     "gaps": { "nora@vps-1": 3600 },
-    "dispatch": { "command": ["node", "/opt/family/repair.js"], "timeout_sec": 3600, "cwd": "/opt/family" }
+    "dispatch": { "command": ["node", "/opt/family/repair.js"], "timeout_sec": 840, "cwd": "/opt/family", "pass_env": ["PATH", "HOME", "LANG", "TMPDIR", "TEMP", "SYSTEMROOT", "USERPROFILE"] }
   },
   "notify": [
     { "type": "telegram", "bot_token_file": "~/.errmeter/telegram-token", "chat_id": "123456789" },
@@ -243,78 +323,89 @@ File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, comments not allowe
 
 Precedence: CLI flag > environment variable > config file > built-in default.
 
-Environment variables [frozen names]: `ERRMETER_HOME`, `ERRMETER_CONFIG`, `ERRMETER_AGENT`, `ERRMETER_GITHUB_TOKEN`, `ERRMETER_LOG_LEVEL` (`error|warn|info|debug`, default `info`). No other env var is read.
+Environment variables read [frozen names]: `ERRMETER_HOME`, `ERRMETER_CONFIG`, `ERRMETER_AGENT`, `ERRMETER_GITHUB_TOKEN`, `ERRMETER_LOG_LEVEL`. No other variable is read.
 
-`~` in any `*_file` path expands to `os.homedir()`. Only one `sink` (D-3). `notify` is an array; each entry is tried in order, all are sent (best effort, failures logged). Unknown `type` values fail at startup of flush/watch, not at emit.
-
-`init` writes this file with the family's answers and refuses to overwrite an existing one without `--force`.
+`~` in `*_file` expands to `os.homedir()`. One `sink` (D-3). `notify` entries are tried in order, all sent (best effort). `watch.role`: `watcher` (full loop) or `agent-host` (flush + own heartbeat + dead-man only; no claim/dispatch/gap). Unknown `type`/`role` fails at flush/watch startup, never at emit. `init` writes this file and refuses to overwrite without `--force`.
 
 ---
 
 ## 8. Token and permission boundary [frozen]
 
-- The board token is a GitHub **fine-grained** personal access token (or a GitHub App installation token the family manages itself) with repository access limited to **the inbox repo only** and permissions **Issues: Read and write**, **Metadata: Read**. No Contents, no Actions, no Pull requests, no Workflows.
-- Source: `ERRMETER_GITHUB_TOKEN` → else `sink.token_file`. On POSIX the file MUST be mode `0600` or stricter; errmeter refuses (`EPERM_TOKEN_FILE_MODE`) otherwise. On Windows the check is skipped and documented.
-- `errmeter init --check` and `errmeter status --check` verify: `GET /repos/{repo}` succeeds, `GET /repos/{repo}/issues?per_page=1` succeeds, `POST /repos/{repo}/labels` (creating the errmeter labels) succeeds, and **`GET /repos/{repo}/contents/`** is `403/404` (proof that Contents is not granted; a `200` is reported as *over-scoped* and is a warning, not a failure, because some families legitimately reuse tokens — but the human checkpoint #2 in EPIC #1 expects the warning to be absent).
-- The token string is added to the redactor mask list immediately after loading. It MUST NOT be passed to the dispatch hook (not in env, not in the event file, not on stdin) and MUST NOT appear in `errmeter.log` at any log level.
-- Notify secrets follow the same `*_file` + `0600` rule.
+- Board token: GitHub **fine-grained** PAT (or an installation token the family manages) with access to **the inbox repo only**, permissions **Issues: Read and write**, **Metadata: Read**. Nothing else.
+- Source: `ERRMETER_GITHUB_TOKEN` → else `sink.token_file`. POSIX: file mode MUST be `0600` or stricter (`EPERM_TOKEN_FILE_MODE` otherwise). Windows: mode check is not available through `fs.stat`; errmeter warns once and relies on the user profile ACL. This is one of the three platform-specific behaviours allowed by N-4.
+- `init --check` / `status --check` verify **positively** what errmeter needs: `GET /repos/{repo}`, `GET /repos/{repo}/issues?per_page=1`, creating the errmeter labels (`POST /repos/{repo}/labels`, idempotent on 422 already-exists), and creating+closing one probe Issue titled `[errmeter] probe` (proves Issues write). They **also** probe `GET /repos/{repo}/contents/` and `GET /repos/{repo}/pulls?per_page=1`: a `200` is reported as **over-scoped** (warning). A `403`/`404` is *consistent with* least privilege but is **not proof** — an empty repo returns 404 even with Contents read; the authoritative check is the human checkpoint #2 in EPIC #1 (owner looks at the token's permission page). The output says exactly this.
+- The token string is added to the mask list after loading. It is **not** passed to the dispatch hook (§9 env allowlist), not written to any file errmeter creates, and never logged.
+- Notify secrets: file-only, same `0600` rule, same mask-list treatment.
 
 ---
 
 ## 9. Dispatch hook contract [frozen] (D-5, D-6)
 
-Invocation by `watch` after a won claim:
+Invocation by `watch --role watcher` after `claim` returned `won: true`:
 
-- `spawn(command[0], command.slice(1), { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true })`
-- **stdin**: the dispatch payload JSON, then EOF. **`ERRMETER_EVENT_FILE`**: path to the same JSON written under `<home>/state/dispatch/<issue>.json`.
-- **env** (added to the inherited environment): `ERRMETER_ISSUE_NUMBER`, `ERRMETER_ISSUE_URL`, `ERRMETER_AGENT`, `ERRMETER_HOST`, `ERRMETER_FINGERPRINT`, `ERRMETER_EVENT_FILE`, `ERRMETER_HOME`, `ERRMETER_WATCHER_ID`. **Removed** from the environment before spawn: `ERRMETER_GITHUB_TOKEN`.
-- Dispatch payload:
+- `spawn(command[0], command.slice(1), { cwd, env, stdio: ['pipe','pipe','pipe'], shell: false, windowsHide: true, detached: process.platform !== 'win32' })`. POSIX: the hook is its own process group (`detached: true`) so the whole tree can be signalled; Windows: killed with `taskkill /PID <pid> /T /F`. (Platform-specific behaviour #2 allowed by N-4.)
+- **env**: **not inherited**. Built from `pass_env` (config; default list in §7) copied from the watcher's environment, plus: `ERRMETER_ISSUE_NUMBER`, `ERRMETER_ISSUE_URL`, `ERRMETER_AGENT`, `ERRMETER_HOST`, `ERRMETER_FINGERPRINT`, `ERRMETER_EVENT_FILE`, `ERRMETER_WATCHER_ID`, `ERRMETER_CLAIM_EXPIRES` (ISO). `ERRMETER_HOME`, `ERRMETER_GITHUB_TOKEN`, and every `ERRMETER_*` not listed here are never passed.
+- **stdin**: the dispatch payload JSON, then EOF. `ERRMETER_EVENT_FILE`: the same JSON at `<home>/state/dispatch/<issue>.json` (also records `pid` for restart cleanup).
+- Payload:
 
 ```json
 {
   "schema": 1,
   "issue": { "ref": 42, "url": "https://github.com/owner/errmeter-inbox/issues/42", "title": "...", "occurrences": 7, "first_ts": "...", "last_ts": "..." },
-  "latest": { "...": "the newest event object (§2)" },
+  "latest": { "schema": 1, "id": "...", "ts": "...", "kind": "error", "agent": "...", "host": "...", "message": "...", "detail": "...", "fingerprint": "...", "fpv": 1, "meta": {} },
   "attempt": 1,
-  "watcher_id": "vps-1"
+  "watcher_id": "vps-1",
+  "claim_expires": "2026-09-05T13:22:41Z"
 }
 ```
 
-- **Exit code** `0` = repair attempted; the **last non-empty stdout line** is recorded as the outcome summary (a PR URL by convention). Any other exit code, a timeout (`timeout_sec`, kill signal `SIGTERM` then `SIGKILL` after 10 s; on Windows `taskkill /T /F`), or a spawn error = `dispatch-failed`; the last 20 lines of stderr are recorded.
-- `watch` writes the outcome comment and label (§5.1), and after `escalate_after` consecutive failures for the same record adds `errmeter:needs-human` and notifies the owner once.
-- **Boundary (D-6)**: the hook MAY open pull requests and post comments in target repos using its own credentials. The hook MUST NOT merge, push to protected branches, or close the inbox Issue; `repaired` means "a fix was proposed". errmeter cannot police the hook's own credentials — this is the family's rule and is stated in `docs/integrations/` for the hook authors. errmeter's own token structurally cannot do any of these (§8).
+`latest` is the full §2 object inline, reconstructed from the fenced JSON block of the newest occurrence (or the Issue body).
+
+- **Exit code** `0` = repair attempted; the **last non-empty stdout line** (redacted, ≤ 500 chars) is the outcome summary (a PR URL by convention). Any other exit, a timeout (`timeout_sec`; kill = `SIGTERM` to the group, `SIGKILL` after 10 s; Windows `taskkill /T /F`), a fence kill (§6.2), or a spawn error = `dispatch-failed`; the last 20 lines of stderr are recorded **after redaction**.
+- After `escalate_after` consecutive failures: label `errmeter:needs-human`, owner notified once via `upsertAlert` key `needs-human:<issue>`.
+- **Boundary (D-6)**: the hook MAY open pull requests and comment in target repos with its own credentials. It MUST NOT merge, push to protected branches, or close the inbox Issue; `repaired` means "a fix was proposed". errmeter cannot police the hook's credentials; this rule is restated in `docs/integrations/` for hook authors. errmeter's own token structurally cannot do any of these (§8).
 
 ---
 
-## 10. Node.js 18 floor: allowed and banned [frozen]
+## 10. Node.js 18 floor [frozen]
 
-Allowed (present in Node 18.0): `node:fs` (incl. `fs.promises`, `fs.rmSync`, `fs.mkdirSync({recursive})`), `node:path`, `node:os`, `node:crypto` (`randomUUID`, `createHash`), `node:https`/`node:http`, `node:child_process` (`spawn`, `execFile`), `node:util` (`parseArgs` **not** allowed — added in 18.3, use a hand-written flag parser), `node:test` (18.0+, use only in tests), `node:assert`, `node:events`, `node:stream`, `node:readline`, `node:url`, `AbortController`, optional chaining, nullish coalescing, class fields, top-level `await` is **not** used (CommonJS only).
+Two lists, different meanings. #7's matrix tests the first; lint/review enforces the second.
 
-Banned: global `fetch` (ExperimentalWarning on 18), `structuredClone` on anything but plain data, `Array.prototype.{toSorted,toReversed,with}` (20+), `Object.groupBy`, `Set` methods (union etc.), `Promise.withResolvers`, `import` syntax (ESM) anywhere in `src/` or `bin/`, `--experimental-*` flags, `node:sqlite`, `node:test` `mock.timers`, `fs.cpSync` (18.0 experimental), `util.parseArgs`, `String.prototype.isWellFormed`, RegExp `v` flag, any TypeScript, any `package.json` `dependencies`/`devDependencies`.
+**A. Not available or experimental at Node 18.0 — MUST NOT be used** (using them breaks on the floor): global `fetch` / `Request` / `Response` (ExperimentalWarning on 18), `util.parseArgs` (18.3), `node:test` `describe`/`it` (18.7 — tests use `test()` only) and `mock.timers` (20), `fs.cpSync` (experimental), `Array.prototype.{toSorted,toReversed,with,toSpliced}` (20), `Object.groupBy` / `Map.groupBy` (21), `Set.prototype.{union,intersection,…}` (22), `Promise.withResolvers` (22), `String.prototype.isWellFormed` (20), RegExp `v` flag (20), `node:sqlite` (22), `Array.fromAsync` (22), `--experimental-*` flags, `--env-file` (20).
 
-`package.json` `engines.node` = `">=18"`. `bin/errmeter.js` begins with a version guard that prints one line and exits 2 below 18.
+**B. Available at 18 but prohibited by project policy** (simplicity, zero build): ESM `import`/`export` in `src/` and `bin/` (CommonJS only, so a single `node bin/errmeter.js` works with no `type` field games), TypeScript, any `dependencies`/`devDependencies`, `structuredClone` on non-plain data, `worker_threads`, native addons.
+
+Allowed and expected: `node:fs` (incl. `promises`, `rmSync`, `mkdirSync({recursive})`, `renameSync`, `openSync` with `wx`), `node:path`, `node:os`, `node:crypto` (`randomUUID`, `createHash`), `node:https`/`node:http`, `node:child_process` (`spawn`, `execFile`), `node:util` (except `parseArgs`), `node:test` `test()` + `node:assert` (tests only), `node:events`, `node:stream`, `node:readline`, `node:url`, `AbortController`, optional chaining, nullish coalescing, class fields, `Array.prototype.at`, `Object.hasOwn`, `String.prototype.replaceAll`. Anything available in 18.0 and not in list B is permitted.
+
+`package.json` `engines.node` = `">=18"`. `bin/errmeter.js` starts with a version guard (exit 2 below 18).
 
 ---
 
 ## 11. CLI surface [frozen names and exit codes]
 
-`errmeter <command> [flags]`. Global flags: `--home <dir>`, `--config <file>`, `--json`, `--quiet`, `--version`, `--help`.
+`errmeter <command> [flags]`. Global: `--home <dir>`, `--config <file>`, `--json`, `--quiet`, `--version`, `--help`.
 
 | command | flags | exit codes |
 |---|---|---|
-| `emit` | `--agent <name>`, `--kind error\|heartbeat` (default `error`), `--message <text>` (or first line of detail), `--detail-file <path>` \| `--detail -` (stdin), `--tail <n>`, `--task <text>`, `--meta k=v` (repeatable), `--no-flush` | `0` always after the spool write succeeded (including fallback); `2` usage error only |
-| `flush` | `--once` (default), `--dry-run` | `0` all pending delivered or nothing pending; `1` some remain pending (transient); `3` config/token error |
-| `watch` | `--once` (single tick, for tests), `--interval <sec>` | runs until signal; `--once` returns `0`/`1`/`3` like flush |
-| `init` | `--repo`, `--family`, `--host`, `--force`, `--check` | `0` ok; `3` token/permission problem (message names the missing permission); `4` refused to overwrite |
-| `status` | `--check` (network), `--notify-test` | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present); `3` cannot check |
-| `install` / `uninstall` | `--dry-run`, `--user\|--system` | defined in #6 within these exit-code meanings |
+| `emit` | `--agent`, `--kind error\|heartbeat` (default `error`), `--message <text>`, `--detail-file <path>` \| `--detail -` (stdin), `--tail <n>`, `--task`, `--meta k=v` (repeatable), `--no-flush` | `0` after the spool write succeeded (incl. fallback and counter mode); `2` usage error only |
+| `flush` | `--dry-run` (list the board writes it would make — groups, counts, target refs — and touch nothing: no lock, no network write, no spool move; reads are allowed) | `0` nothing pending remains; `1` some remain (transient/busy/lookup incomplete); `3` config/token error |
+| `watch` | `--role watcher\|agent-host` (default from config), `--once` (single tick), `--interval <sec>` | runs until signal; `--once` returns `0`/`1`/`3` like flush |
+| `init` | `--repo`, `--family`, `--host`, `--role`, `--force`, `--check` | `0` ok (warnings printed for over-scope); `3` token/permission problem (names the failing probe); `4` refused to overwrite |
+| `status` | `--check` (network), `--notify-test` | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present, zero watcher heartbeats known); `3` cannot check |
+| `install` / `uninstall` | `--role`, `--dry-run`, `--user\|--system` | defined in #6 within these exit-code meanings |
 
-Output: without `--json`, one summary line per command on stdout, diagnostics on stderr. With `--json`, one JSON object on stdout, nothing else.
+Output: without `--json`, one summary line on stdout, diagnostics on stderr. With `--json`, one JSON object on stdout.
 
 ---
 
 ## 12. Test hooks (non-normative, for #3–#7)
 
 - `ERRMETER_HOME` pointed at a temp dir isolates every test.
-- The `file` sink is the reference board for unit tests of `watch`/`claim`; the `github-issue` sink is tested against a local `node:http` fake that implements the handful of endpoints used (`GET/POST/PATCH /repos/:r/issues*`, `/labels`, `/issues/:n/comments`, `DELETE /issues/comments/:id`, `GET /repos/:r`, `GET /repos/:r/contents/`).
-- Redaction test vectors live in `test/fixtures/redact/*.txt` with `*.expected` siblings.
+- The `file` sink is the reference board for `watch`/`claim` unit tests; `github-issue` is tested against a local `node:http` fake implementing: `GET /repos/:r`, `GET/POST/PATCH /repos/:r/issues*`, `GET/POST /repos/:r/issues/:n/comments` (with `Link` pagination), `DELETE /repos/:r/issues/comments/:id`, `POST /repos/:r/labels`, `GET /repos/:r/contents/`, `GET /repos/:r/pulls`, and a `Date` header on every response.
+- Fixtures: `test/fixtures/redact/*.txt` + `.expected`; `test/fixtures/fingerprint.json` = the §2.1 vector table.
+
+---
+
+## Changelog
+
+- **v1.1 (2026-09-05)** after round-1 five-seat review (GLM 5.3 / Gemini 3.8 Flash / Muse Spark 1.3 / Grok 4.6 / Codex GPT-5.6 Sol, all NO-GO): fence rule + `timeout ≤ ttl − grace` + board-time clock (W3); `repaired` not re-dispatched until a new occurrence; alerts board-first single-winner + empty-set rule + `agent-host` role so the dead-man has a periodic trigger (W4); no capacity eviction — compact/counter modes (W2); `ids=` on every marker + duplicate-Issue reconciliation + lookup fail-closed on incomplete listing (W2); notify secrets file-only, hook env allowlist, redaction of hook output and logs, emit masks the token (W1); fingerprint v1 rewritten with vectors; sink types frozen; heartbeat liveness from marker `ts`; pagination/budget rules; §10 split into "absent at 18" vs "policy"; lock steal via atomic rename; Windows rename note; N-4 wording aligned (three named platform branches).
