@@ -118,6 +118,9 @@ Home: `ERRMETER_HOME` → else `path.join(os.homedir(), ".errmeter")`. Same on m
 | `spool/dead/<same name>` | **unprocessable only** (bad JSON, unknown `kind`, unknown higher `schema` after one delivery attempt as raw text failed). Never used for capacity. Deleted after `dead_retention_days` **or when `dead/` exceeds `dead_max_bytes` (oldest first)**. |
 | `spool/flush.lock` | see §3.2 |
 
+Heartbeat upsert file names use `encodeURIComponent(agent)@encodeURIComponent(host)`; heartbeat lines in the overflow log carry `-` as fingerprint and `0` as fpv.
+Reserved `_`-prefixed meta keys sit outside the 16-entry cap.
+
 ### 3.1 Write / move protocol
 
 - Write (emit): serialize → write `<name>.tmp` → `fsync` (best effort) → `rename` to `<name>.json`. Never open the final name for writing.
@@ -417,6 +420,8 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- v1.7 note (2026-09-05, #12): clarify heartbeat file-name encoding, overflow heartbeat sentinels, and reserved metadata outside the 16-entry cap; no field or format change.
 
 - **v1.7 (2026-09-05)** after round-7 confirmation (Codex NO-GO on one item): cut checkpoint persists the active pass's `end` offset, fixed at pass open, so bytes arriving after it always belong to the next pass (Codex's stated condition applied verbatim).
 

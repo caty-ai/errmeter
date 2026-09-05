@@ -8,8 +8,10 @@ const command = process.argv[2];
 if (command === 'emit') {
   require('../src/emit').main(process.argv.slice(3));
 } else if (command === 'flush') {
-  process.stderr.write('flush: not implemented in this build (see #4)\n');
-  process.exitCode = 3;
+  Promise.resolve(require('../src/flush').main(process.argv.slice(3))).catch(() => {
+    if (!process.argv.includes('--quiet')) process.stderr.write('flush: unexpected failure\n');
+    process.exitCode = 1;
+  });
 } else if (command === '--version') {
   process.stdout.write(require('../package.json').version + '\n');
 } else if (command === '--help' || command === undefined) {

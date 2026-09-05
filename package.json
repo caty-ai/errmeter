@@ -6,6 +6,6 @@
   "private": true,
   "engines": { "node": ">=18" },
   "bin": { "errmeter": "bin/errmeter.js" },
-  "scripts": { "test": "node --test test/*.test.js" },
+  "scripts": { "test": "node --test test/*.test.js test/sinks/*.test.js" },
   "repository": { "type": "git", "url": "https://github.com/caty-ai/errmeter.git" }
 }

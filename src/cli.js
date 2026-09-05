@@ -43,4 +43,24 @@ function parse(argv) {
   if (!result.help && !result.version && result.kind === 'error' && result.message === undefined) throw new UsageError('emit: message is required');
   return result;
 }
-module.exports = { parse, UsageError, USAGE };
+function parseFlush(argv) {
+  const result = {};
+  const boolean = new Set(['json', 'quiet', 'dry-run', 'linger', 'help', 'version']);
+  for (let i = 0; i < argv.length; i++) {
+    const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
+    if (!match) throw new UsageError('flush: expected a flag');
+    const key = match[1];
+    if (boolean.has(key)) {
+      if (match[2] !== undefined) throw new UsageError('flush: boolean flags take no value');
+      result[key] = true;
+    } else {
+      if (key !== 'home' && key !== 'config') throw new UsageError('flush: unknown flag');
+      const value = match[2] === undefined ? argv[++i] : match[2];
+      if (value === undefined || (match[2] === undefined && value.startsWith('--'))) throw new UsageError('flush: missing flag value');
+      if (!value) throw new UsageError('flush: empty path');
+      result[key] = value;
+    }
+  }
+  return result;
+}
+module.exports = { parse, parseFlush, UsageError, USAGE };
