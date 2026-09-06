@@ -5,7 +5,7 @@ The local Codex notify contract supplies a JSON event as the final program argum
 1. Wrap `codex exec` in `sitter-run` for reliable process-exit/stall reporting; see [sitter](sitter.md).
 2. Use `tools/host-hooks/examples/codex-notify-emit.sh` for a turn-end heartbeat and best-effort failure detection.
 
-The inspected config already uses a notify wrapper with a `--previous-notify` argument containing an encoded argv array. Preserve the **whole current array**, including that wrapper and its arguments. The owner installer reads it rather than assuming any specific program. A portable example is:
+The inspected config already uses a notify wrapper with a `--previous-notify` argument containing an encoded argv array. Preserve the **whole current array**, including that wrapper and its arguments. The host-hook installer reads it rather than assuming any specific program. A portable example is:
 
 ```toml
 notify = ["bash", "/absolute/path/to/.errmeter/hooks/codex-notify-emit.sh", "--previous-notify", "[\"node\",\"/absolute/path/to/previous-notify.js\"]"]

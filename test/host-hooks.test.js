@@ -265,7 +265,7 @@ test('job-heartbeat patch always applies to the checked-in snapshot and live sou
     assert.match(patched, /subprocess.run\(command, check=False, timeout=10/);
     return patched;
   }
-  const stripHeader = text => text.replace(/^# Snapshot of the upstream `scripts\/job-heartbeat` the patch was generated against\.\n# The upstream revision is recorded in the patch header\.\n/m, '');
+  const stripHeader = text => text.replace(/^# Snapshot of the upstream `scripts\/job-heartbeat` the patch was generated against\.\n# The patch header records the blob hashes of the upstream file before and after the change\.\n/m, '');
   const snapshotText = stripHeader(fs.readFileSync(snapshotSource, 'utf8'));
   const patchedText = stripHeader(checkPatch(snapshotSource));
   function verifyLive(source) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Snapshot of the upstream `scripts/job-heartbeat` the patch was generated against.
-# The upstream revision is recorded in the patch header.
+# The patch header records the blob hashes of the upstream file before and after the change.
 """Emit a standard automation-job heartbeat JSON file."""
 
 import argparse
