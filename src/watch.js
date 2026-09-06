@@ -137,6 +137,7 @@ async function tick(ctx, options = {}) {
   ctx.running ||= new Map();
   ctx.apiCalls = 0;
   ctx.lookup_incomplete = false;
+  ctx.claimBudgetStalled = false;
   ctx.errors = [];
   delete ctx.boardTime;
   const summary = { ts: new Date(ctx.clock()).toISOString(), role: ctx.config.watch.role,
@@ -144,6 +145,7 @@ async function tick(ctx, options = {}) {
     scanned: 0, unscanned: 0, lookup_incomplete: false, errors: ctx.errors };
   const escalation = { used: false };
   let scanWindow, scanPredecessor;
+  let zeroScanBudget = false, detailReadFailures = 0;
   const confirmedRefs = new Set(), pendingClaims = new Set();
   const sink = ctx.sink;
   try {
@@ -175,6 +177,7 @@ async function tick(ctx, options = {}) {
     else if (cursor != null) scanCursor(ctx, null);
     summary.unscanned = candidates.length;
     const scanMaxConfirms = Math.max(0, Math.floor(((ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60) - 10) / 2));
+    zeroScanBudget = scanMaxConfirms === 0 && candidates.length > 0;
     scanPredecessor = candidates.at(-1)?.ref;
     scanWindow = candidates.slice(0, scanMaxConfirms);
     candidates = scanWindow;
@@ -191,7 +194,9 @@ async function tick(ctx, options = {}) {
         summary.unscanned--;
         confirmedRefs.add(record.ref);
         if (budgetError(error) || ctx.lookup_incomplete) { ctx.lookup_incomplete = true; break; }
-        reportError(ctx, error);
+        detailReadFailures++;
+        if (detailReadFailures === 1) reportError(ctx, new Error('watch: detail read failed (ref=' + record.ref + '): ' +
+          (error.message || error.code || 'detail read failed')));
         continue;
       }
       if (ctx.lookup_incomplete) break;
@@ -261,12 +266,22 @@ async function tick(ctx, options = {}) {
     await reconcileNeedsHuman(ctx, failures, summary);
   } catch (error) { reportError(ctx, error); }
   finally {
+    if (detailReadFailures > 1) reportError(ctx, new Error('watch: ' + (detailReadFailures - 1) + ' further detail reads failed this tick'));
     // Contract §5.4: listing (1), detail (2), claim preflight (2), then
     // claim POST + confirmation pages + claimed-label write (max_pages + 2).
+    // This is a lower bound; extra listing/detail pages require more calls.
     const maximum = ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60;
     const minimum = (ctx.config.max_pages_per_list ?? ctx.config.sink?.max_pages_per_list ?? 10) + 7;
-    if (maximum < minimum && pendingClaims.size && !summary.dispatched && ctx.lookup_incomplete) {
-      reportError(ctx, new Error('watch: api budget too small to elect one claim (max_api_calls_per_pass=' + maximum + ', minimum=' + minimum + ')'));
+    // lookup_incomplete can also reflect non-budget incompleteness; below the
+    // minimum, the advice to increase the budget is still independently true.
+    if (zeroScanBudget || (maximum < minimum && pendingClaims.size && !summary.dispatched && ctx.lookup_incomplete)) {
+      ctx.claimBudgetStalled = true;
+      const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + maximum + ', minimum=' + minimum +
+        '); require max_api_calls_per_pass>=minimum; multi-page listings may need more';
+      if (!ctx.reportedBudgetStall) {
+        ctx.reportedBudgetStall = true;
+        reportError(ctx, new Error(message));
+      }
     }
     if (confirmedRefs.size) {
       // Retry a confirmed eligible row before spending another tick elsewhere.
@@ -279,6 +294,10 @@ async function tick(ctx, options = {}) {
     try { saveLastWatch(ctx, summary); } catch (error) { reportError(ctx, error, summary.errors); }
   }
   return summary;
+}
+
+function watchExitCode(summary, ctx) {
+  return summary.flush === 3 ? 3 : summary.flush || summary.pending_remaining || summary.lookup_incomplete || ctx.claimBudgetStalled || summary.errors.length || summary.dispatch_failed ? 1 : 0;
 }
 
 async function watch(argv, env = process.env, io = {}) {
@@ -324,7 +343,7 @@ async function watch(argv, env = process.env, io = {}) {
     do {
       if (ctx.signal.aborted) break;
       const summary = await tick(ctx, { ...io, once: flags.once });
-      code = summary.flush === 3 ? 3 : summary.flush || summary.pending_remaining || summary.lookup_incomplete || summary.errors.length || summary.dispatch_failed ? 1 : 0;
+      code = watchExitCode(summary, ctx);
       if (!flags.quiet) output(stdout, flags.json ? JSON.stringify(cleanValue(summary, masks)) + '\n'
         : 'watch: role=' + summary.role + ' flush=' + summary.flush + ' eligible=' + summary.eligible + ' claimed=' + summary.claimed + ' dispatched=' + summary.dispatched + ' gaps=' + summary.gaps + ' scanned=' + summary.scanned + ' unscanned=' + summary.unscanned +
           (summary.errors.length ? ' errors=' + summary.errors.join('; ').replace(/[\r\n]+/g, ' ') : '') + '\n');
@@ -342,4 +361,4 @@ function main(argv) {
     if (!argv.includes('--quiet')) output(process.stderr, 'watch: unexpected failure\n'); process.exitCode = 1;
   });
 }
-module.exports = { watch, tick, main };
+module.exports = { watch, tick, watchExitCode, main };

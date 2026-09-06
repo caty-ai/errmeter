@@ -387,9 +387,8 @@ async function dispatch(ctx, issue, claim, options = {}) {
       // The aggregate outcome failure is repaired only if the refreshed state
       // proves all other outcome label operations already succeeded.
       const labels = new Set((refreshed?.labels || []).map(label => typeof label === 'string' ? label : label.name));
-      const other = status === 'repaired' ? 'errmeter:dispatch-failed' : 'errmeter:repaired';
       if (!ctx.lookup_incomplete && labels.has('errmeter:dispatched') && labels.has('errmeter:' + status) &&
-          !labels.has(other) && !labels.has('errmeter:claimed')) labelsFailed = false;
+          !labels.has('errmeter:repaired') && !labels.has('errmeter:claimed')) labelsFailed = false;
     }
     catch (_) { labelsFailed = true; ctx.log?.('dispatch: escalation label update failed'); }
   }

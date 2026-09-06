@@ -7,7 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
-const { watch, tick } = require('../src/watch');
+const { watch, tick, watchExitCode } = require('../src/watch');
 const { flush } = require('../src/flush');
 const { checkGaps } = require('../src/heartbeat');
 const { parseWatch, parseRun } = require('../src/cli');
@@ -120,11 +120,12 @@ test('last watch snapshot write failure is reported without rejecting the tick',
   assert.equal(fs.readFileSync(path.join(f.home, 'state'), 'utf8'), 'blocked');
 });
 
-for (const budget of [16, 17, 60]) test('GitHub claim budget ' + (budget === 16 ? 'minimum-1 reports the pinned stall' : budget === 17 ? 'minimum elects one claim' : 'default retains healthy text'), async t => {
+for (const budget of [1, 10, 11, 16, 17, 60]) test('GitHub claim budget ' + (budget <= 11 ? budget + ' reports a zero-scan stall' : budget === 16 ? 'minimum-1 reports the pinned stall' : budget === 17 ? 'minimum elects one claim' : 'default retains healthy text'), async t => {
   const stamp = '2026-09-06T00:00:00.000Z';
   const fake = await createGithubFake({ now: new Date(stamp) });
   t.after(() => fake.close());
-  for (let ref = 1; ref <= 2; ref++) fake.seedIssue({
+  const candidateCount = budget <= 11 ? 1 : 2;
+  for (let ref = 1; ref <= candidateCount; ref++) fake.seedIssue({
     body: '<!-- errmeter:failure fp=0123456789abcdef fpv=1 count=1 last=' + stamp + ' -->', labels: ['errmeter:failure']
   });
   const f = fixture(t, { sink: { type: 'github-issue', repo: 'test/inbox', api_base: fake.url },
@@ -138,16 +139,68 @@ for (const budget of [16, 17, 60]) test('GitHub claim budget ' + (budget === 16 
     checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
   });
   const summary = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17)';
-  assert.equal(dispatches, budget === 16 ? 0 : 1);
+  const stalled = budget < 17;
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + budget + ', minimum=17); require max_api_calls_per_pass>=minimum; multi-page listings may need more';
+  assert.equal(dispatches, stalled ? 0 : 1);
   assert.equal(summary.dispatched, dispatches);
   assert.equal(summary.claimed, dispatches);
-  assert.equal(code, budget === 16 ? 1 : 0);
-  assert.deepEqual(summary.errors, budget === 16 ? [message] : []);
+  assert.equal(code, stalled ? 1 : 0);
+  assert.deepEqual(summary.errors, stalled ? [message] : []);
   assert.equal(summary.lookup_incomplete, budget === 16);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: budget === 16 ? 2 : 1 });
-  assert.equal(stdout, 'watch: role=watcher flush=0 eligible=1 claimed=' + dispatches + ' dispatched=' + dispatches + ' gaps=0 scanned=1 unscanned=1' + (budget === 16 ? ' errors=' + message : '') + '\n');
-  assert.equal(stderr, budget === 16 ? message + '\n' : '');
+  if (budget <= 11) assert.equal(fs.existsSync(path.join(f.home, 'state', 'scan_cursor.json')), false);
+  else assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: stalled ? 2 : 1 });
+  assert.equal(stdout, 'watch: role=watcher flush=0 eligible=' + (budget <= 11 ? 0 : 1) + ' claimed=' + dispatches + ' dispatched=' + dispatches + ' gaps=0 scanned=' + (budget <= 11 ? 0 : 1) + ' unscanned=1' + (stalled ? ' errors=' + message : '') + '\n');
+  assert.equal(stderr, stalled ? message + '\n' : '');
+});
+
+test('watch --once budget 10 with an empty board stays silent and exits 0', async t => {
+  const f = fixture(t, { max_api_calls_per_pass: 10,
+    watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
+  let stdout = '', stderr = '';
+  const code = await watch(['--once', '--json'], f.env, {
+    cleanup: () => {}, emit: () => 0, flush: async () => 0,
+    sink: { listOpenFailures: async () => [] }, checkGaps: async () => ({ gaps: 0 }),
+    stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(JSON.parse(stdout).errors, []);
+  assert.equal(JSON.parse(stdout).lookup_incomplete, false);
+  assert.equal(stderr, '');
+});
+
+for (const budget of [10, 16]) test('budget ' + budget + ' reports once per context while every stalled tick retains its private failure flag', async t => {
+  const f = fixture(t), logs = [], emits = [];
+  const makeContext = () => {
+    const { ctx } = context({ home: f.home, log: message => logs.push(message),
+      emit: args => { if (args.includes('error')) emits.push(args); return 0; }, sink: {
+        listOpenFailures: async () => [{ ref: 1 }], getFailure: async () => ({ ref: 1 }),
+        claim: async () => { throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); }
+      } });
+    ctx.config.max_api_calls_per_pass = budget;
+    return ctx;
+  };
+  const ctx = makeContext();
+  const first = await tick(ctx);
+  assert.equal(watchExitCode(first, ctx), 1);
+  assert.equal(ctx.claimBudgetStalled, true);
+  const second = await tick(ctx);
+  assert.equal(watchExitCode(second, ctx), 1);
+  assert.equal(first.errors.length, 1);
+  assert.deepEqual(second.errors, []);
+  assert.equal(ctx.claimBudgetStalled, true);
+  assert.equal(first.lookup_incomplete, budget === 16);
+  assert.equal(second.lookup_incomplete, budget === 16);
+  assert.equal(logs.length, 1); assert.equal(emits.length, 1);
+  ctx.config.max_api_calls_per_pass = budget - 1;
+  assert.deepEqual((await tick(ctx)).errors, []);
+  assert.equal(ctx.claimBudgetStalled, true);
+  const restarted = makeContext();
+  restarted.config.max_api_calls_per_pass = budget - 1;
+  assert.equal((await tick(restarted)).errors.length, 1);
+  assert.equal(logs.length, 2); assert.equal(emits.length, 2);
+  ctx.sink.listOpenFailures = async () => [];
+  await tick(ctx);
+  assert.equal(ctx.claimBudgetStalled, false);
 });
 
 for (const board of ['empty', 'claimed', 'ineligible']) test('tiny GitHub claim budget does not report a stall for ' + board + ' board', async t => {
@@ -341,10 +394,45 @@ for (const code of [null, 'EAPI_BUDGET']) test('a persistently failing detail re
   assert.equal(first.scanned, code ? 1 : 2); assert.equal(first.unscanned, code ? 1 : 0); assert.equal(first.dispatched, 0);
   assert.equal(first.gapChecks, code ? 0 : 1);
   assert.equal(first.lookup_incomplete, Boolean(code));
-  assert.deepEqual(first.errors, code ? [] : ['detail failed']);
+  assert.deepEqual(first.errors, code ? [] : ['watch: detail read failed (ref=1): detail failed']);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: code ? 1 : 2 });
   const second = await failingDetailProcess(f.home, 'second', code);
   assert.equal(second.scanned, 1); assert.equal(second.dispatched, 1); assert.equal(second.lookup_incomplete, false);
+});
+
+test('a failed first detail read still dispatches the second eligible row in the same tick', async t => {
+  const f = fixture(t), claims = [], dispatches = [];
+  let gaps = 0;
+  const { ctx } = context({ home: f.home, checkGaps: async () => { gaps++; return { gaps: 0 }; }, sink: {
+    listOpenFailures: async () => [{ ref: 1 }, { ref: 2 }],
+    getFailure: async (ctx, ref) => { if (ref === 1) throw new Error('detail unavailable'); return { ref }; },
+    claim: async (ctx, ref) => { claims.push(ref); return { won: true }; }
+  }, dispatch: async (ctx, detail) => { dispatches.push(detail.ref); return { status: 'repaired' }; } });
+  const summary = await tick(ctx, { once: true });
+  assert.equal(summary.scanned, 2); assert.equal(summary.unscanned, 0);
+  assert.equal(summary.claimed, 1); assert.equal(summary.dispatched, 1);
+  assert.equal(summary.lookup_incomplete, false);
+  assert.deepEqual(summary.errors, ['watch: detail read failed (ref=1): detail unavailable']);
+  assert.deepEqual(claims, [2]); assert.deepEqual(dispatches, [2]); assert.equal(gaps, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: 2 });
+});
+
+test('many failing detail reads emit one concrete error and one aggregate without losing cursor progress', async t => {
+  const f = fixture(t), logs = [], emits = [];
+  let gaps = 0;
+  const { ctx } = context({ home: f.home, maskList: ['private-token'], log: message => logs.push(message),
+    emit: args => { if (args.includes('error')) emits.push(args); return 0; },
+    checkGaps: async () => { gaps++; return { gaps: 0 }; }, sink: {
+      listOpenFailures: async () => Array.from({ length: 5 }, (_, index) => ({ ref: index + 1 })),
+      getFailure: async () => { throw new Error('unavailable private-token'); }
+    } });
+  const summary = await tick(ctx);
+  assert.deepEqual(summary.errors, ['watch: detail read failed (ref=1): unavailable [REDACTED]',
+    'watch: 4 further detail reads failed this tick']);
+  assert.deepEqual(logs, summary.errors); assert.equal(emits.length, 2);
+  assert.equal(summary.scanned, 5); assert.equal(summary.unscanned, 0);
+  assert.equal(summary.lookup_incomplete, false); assert.equal(gaps, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: 5 });
 });
 
 test('a stale-labelled eligible row after 24 quiescent rows dispatches on the next tick', async t => {
