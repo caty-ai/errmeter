@@ -13,7 +13,7 @@ function template(flags) {
   const host = flags.host || os.hostname().split('.')[0];
   return { schema: 1, family: flags.family || '', host,
     sink: { type: 'github-issue', repo: flags.repo,
-      token_file: '~/.errmeter/github-token', api_base: 'https://api.github.com' },
+      token_file: '~/.errmeter/github-token', api_base: flags['api-base'] || 'https://api.github.com' },
     watch: { role: flags.role || 'watcher' },
     notify: [], owner: { mention: '' } };
 }

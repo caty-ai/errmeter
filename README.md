@@ -129,6 +129,8 @@ Create your private inbox repository first. Replace `<owner>/<inbox>` below with
 errmeter init --repo <owner>/<inbox> --role agent-host
 ```
 
+Use `init --api-base URL` for a custom HTTPS API endpoint (HTTP is allowed only for localhost/127.0.0.1); uninstall and install/uninstall dry-runs need no token, and stale install records are noted in dry-run previews. Linux user status probes linger only with `--check` or when a registered service's status is degraded.
+
 Save your fine-grained token in `~/.errmeter/github-token` as plain text, with file mode **0600** on macOS/Linux (only your user can read and write it). On Windows, use `%USERPROFILE%\.errmeter\github-token` and restrict its profile ACL to your user. Keep the token out of shell history, messages, and logs.
 
 With that token in place, verify access. This check uses the network, creates the required labels, and creates and closes a probe Issue; it needs a valid token. Review the token's permission page yourself too: the probe cannot prove least privilege.

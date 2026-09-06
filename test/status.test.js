@@ -23,6 +23,26 @@ function lastFlush(f, value) {
   fs.writeFileSync(path.join(f.home, 'state', 'last_flush.json'), JSON.stringify(value));
 }
 
+for (const registered of [false, true]) for (const degraded of [false, true]) for (const check of [false, true]) test('Linux linger gating registered=' + registered + ' degraded=' + degraded + ' check=' + check, async t => {
+  const f = fixture(t); const calls = [];
+  if (!degraded) {
+    lastFlush(f, { ts: '2026-09-05T23:59:00Z' });
+    fs.writeFileSync(path.join(f.home, 'state/last_watch.json'), JSON.stringify({ ts: '2026-09-05T23:59:00Z' }));
+  }
+  const io = { ...f.io, platform: 'linux', username: 'test-user', registrationStatus: undefined,
+    sink: { async listHeartbeats() { return [{ role: 'watcher' }]; } }, runner: { async exec(command, args) {
+      calls.push({ command, args });
+      if (command === 'loginctl') return { code: 0, stdout: 'Linger=yes' };
+      if (args.includes('is-enabled')) return registered ? { code: 0, stdout: 'enabled' } : { code: 4, stdout: 'not-found' };
+      return { code: 0, stdout: 'MainPID=123' };
+    } } };
+  assert.equal(await status(check ? ['--check', '--json'] : ['--json'], f.env, io), degraded ? 1 : 0);
+  assert.equal(calls.filter(call => call.command === 'loginctl').length, check || registered && degraded ? 1 : 0);
+  assert.equal(calls.filter(call => call.args.includes('is-enabled')).length, 1);
+  assert.equal(calls.filter(call => call.args.includes('is-active')).length, 1);
+  assert.equal(f.out().result.watcher.linger, check || registered && degraded ? 'yes' : 'not probed (use --check)');
+});
+
 test('local status needs no token, reads no board and reports successful flush and registration', async t => {
   const f = fixture(t, { sink: { type: 'github-issue', repo: 'test/inbox', token_file: '/missing' } });
   lastFlush(f, { ts: '2026-09-05T23:59:00Z', pending_remaining: 0, errors: [] });

@@ -3,7 +3,7 @@
 const USAGE = 'Usage: errmeter <emit|flush|watch|init|status|install|uninstall> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
   'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n' +
   'watch: [--role watcher|agent-host] [--once] [--interval SEC]\n' +
-  'init: [--repo OWNER/REPO] [--family NAME] [--host NAME] [--role watcher|agent-host] [--force] [--check]\n' +
+  'init: [--repo OWNER/REPO] [--api-base URL] [--family NAME] [--host NAME] [--role watcher|agent-host] [--force] [--check]\n' +
   'status: [--check] [--notify-test] [--role watcher|agent-host]\n' +
   'install/uninstall: [--role watcher|agent-host] [--dry-run] [--user|--system]\n' +
   'Values starting with -- must be passed as --flag=value.\n';
@@ -156,7 +156,7 @@ function parseStatus(argv) {
 function parseInit(argv) {
   const result = {};
   const boolean = new Set(['json', 'quiet', 'force', 'check', 'help', 'version']);
-  const values = new Set(['home', 'config', 'repo', 'family', 'host', 'role']);
+  const values = new Set(['home', 'config', 'repo', 'family', 'host', 'role', 'api-base']);
   for (let i = 0; i < argv.length; i++) {
     const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
     if (!match) throw new UsageError('init: expected a flag');
@@ -172,6 +172,12 @@ function parseInit(argv) {
     }
   }
   if (result.role !== undefined && !['watcher', 'agent-host'].includes(result.role)) throw new UsageError('init: invalid role');
+  if (result['api-base'] !== undefined) {
+    try {
+      const url = new URL(result['api-base']);
+      if (url.username || url.password || !(url.protocol === 'https:' || url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) throw new Error();
+    } catch (_) { throw new UsageError('init: invalid --api-base (use HTTPS, or HTTP on localhost/127.0.0.1)'); }
+  }
   return result;
 }
 module.exports = { parse, parseFlush, parseWatch, parseRun, parseInstall, parseStatus, parseInit, UsageError, USAGE };
