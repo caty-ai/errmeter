@@ -1,0 +1,6 @@
+email-address	\b[A-Z0-9._%+\-]+@(?!example\.(?:com|org|net|invalid)\b)(?![A-Z0-9.\-]*\.json\b)[A-Z0-9.\-]+\.[A-Z]{2,}\b
+handoff-dir	_handoffs/
+personal-home-path	/Users/[a-z]+/
+personal-hostname	jikumarushouno
+owner-handle	@shojikumaru\b
+private-inbox-name	shojikumaru/errmeter-inbox

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**🇺🇸 English** ｜ [🇯🇵 日本語](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.ja.md) ｜ [🇨🇳 简体中文](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.zh.md) ｜ [🇹🇭 ไทย](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.th.md)
+[🇺🇸 English](https://github.com/caty-ai/errmeter/blob/main/README.md) ｜ [🇯🇵 日本語](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.ja.md) ｜ [🇨🇳 简体中文](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.zh.md) ｜ **🇹🇭 ไทย**
 
 ![errmeter: a shout that is never lost. Four connected nodes carry an alert from emit through a local spool and a sink to watch.](https://github.com/caty-ai/errmeter/raw/main/assets/readme/hero.png)
 

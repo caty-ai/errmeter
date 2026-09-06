@@ -337,7 +337,7 @@ File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, no comments. **Secr
     { "type": "slack", "webhook_url_file": "~/.errmeter/slack-webhook" },
     { "type": "webhook", "url": "https://example.invalid/hook", "headers_file": "~/.errmeter/hook-headers" }
   ],
-  "owner": { "mention": "@shojikumaru" }
+  "owner": { "mention": "@owner" }
 }
 ```
 
