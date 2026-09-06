@@ -7,9 +7,15 @@ const path = require('node:path');
 const os = require('node:os');
 const { init } = require('../src/init');
 const { PERMISSION_NOTE } = require('../src/status');
+const { createGithubFake } = require('./fixtures/github-fake');
 const EXPECTED_LABELS = ['errmeter', 'errmeter:failure', 'errmeter:heartbeat', 'errmeter:alert',
   'errmeter:role:watcher', 'errmeter:role:agent-host', 'errmeter:claimed', 'errmeter:dispatched',
   'errmeter:repaired', 'errmeter:dispatch-failed', 'errmeter:needs-human'];
+
+test('init help documents the API base option', () => {
+  const initUsage = require('../src/cli').USAGE.split('\n').find(line => line.startsWith('init:'));
+  assert.ok(initUsage.includes('[--api-base URL]'));
+});
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-init-test-'));
@@ -32,6 +38,50 @@ function transport(requests, options = {}) {
     return { status: 200, body: [] };
   };
 }
+
+for (const apiBase of ['https://enterprise.example/api/v3', 'http://localhost:8080', 'http://127.0.0.1:8080/api/v3']) test('init creates and checks custom API base ' + apiBase, async t => {
+  const f = fixture(t); const requests = [];
+  assert.equal(await init(['--repo', 'test/inbox', '--api-base', apiBase, '--check', '--json'],
+    { ...f.env, ERRMETER_GITHUB_TOKEN: 'test-only-token' }, { ...f.io, http: transport(requests) }), 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'config.json'))).sink.api_base, apiBase);
+  assert.ok(requests.length > 0);
+  assert.ok(requests.every(request => request.url.startsWith(apiBase + '/repos/test/inbox')));
+});
+
+for (const apiBase of ['broken', 'ftp://localhost', 'http://example.com', 'http://127.0.0.2', 'http://[::1]', 'https://user:password@example.com']) test('init rejects invalid API base before writes: ' + apiBase, async t => {
+  const f = fixture(t);
+  assert.equal(await init(['--repo', 'test/inbox', '--api-base=' + apiBase, '--json'], f.env, f.io), 2);
+  assert.match(f.out().result.error, /invalid --api-base/);
+  assert.equal(fs.existsSync(path.join(f.home, 'config.json')), false);
+});
+
+test('init check reaches the loopback GitHub fake using only --api-base', async t => {
+  const f = fixture(t);
+  const fake = await createGithubFake(); t.after(() => fake.close());
+  assert.equal(await init(['--repo', 'test/inbox', '--api-base', fake.url, '--check', '--json'],
+    { ...f.env, ERRMETER_GITHUB_TOKEN: 'test-only-token' }, f.io), 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'config.json'))).sink.api_base, fake.url);
+  assert.equal(f.out().result.checked, true);
+  assert.deepEqual(fake.labels.map(label => label.name), EXPECTED_LABELS);
+  assert.equal(fake.issues.find(issue => issue.title === '[errmeter] probe').state, 'closed');
+  assert.ok(fake.requests.every(request => request.url.startsWith('/repos/test/inbox')));
+});
+
+test('init check transport errors identify only the configured API origin', async t => {
+  const f = fixture(t);
+  const apiBase = 'http://127.0.0.1:1/private-path?secret-query=hidden';
+  assert.equal(await init(['--repo', 'test/inbox', '--api-base', apiBase, '--force'], f.env, f.io), 0);
+  const token = 'tok-test-value';
+  assert.equal(await init(['--check', '--json'], { ...f.env, ERRMETER_GITHUB_TOKEN: token }, {
+    ...f.io, http: async () => { throw new Error('private-transport-details ' + token); }
+  }), 3);
+  assert.match(f.out().result.error, /transport to http:\/\/127\.0\.0\.1:1/);
+  assert.ok(f.out().stderr.includes('http://127.0.0.1:1'));
+  const output = f.out().stdout + f.out().stderr;
+  for (const privateText of ['private-transport-details', token, 'private-path', 'secret-query', 'hidden', 'api.github.com']) {
+    assert.ok(!output.includes(privateText));
+  }
+});
 
 test('init writes private complete config and directories without secrets or network', async t => {
   const f = fixture(t); const secret = ['private', 'credential'].join('.');

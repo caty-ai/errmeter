@@ -27,7 +27,7 @@ function buildSpec(flags, env = process.env, io = {}) {
   const adapter = platforms[platform];
   if (!adapter) throw new Error('unsupported platform');
   const resolved = io.resolved || (io.resolveConfig || resolveConfig)(flags, env, { command: 'watch' });
-  const role = flags.role || resolved.config.watch.role;
+  const role = flags.role || resolved.config.watch?.role || 'watcher';
   if (!['watcher', 'agent-host'].includes(role)) throw new Error('invalid role');
   const scope = flags.system ? 'system' : 'user';
   const ctx = { ...resolved, platform, role, scope, env, homedir: io.homedir || os.homedir(), uid: io.uid ?? (process.getuid ? process.getuid() : 0),
@@ -55,7 +55,6 @@ function readInstallRecord(home, disk = fs, warnings = [], platform = process.pl
   return record;
 }
 function recordedSpec(spec, record, flags = {}) {
-  if (record.platform !== spec.platform) throw new Error('install record platform mismatch');
   const role = flags.role || record.role;
   const scope = flags.system ? 'system' : flags.user ? 'user' : record.scope;
   const sameTarget = role === record.role && scope === record.scope;
@@ -78,6 +77,14 @@ function writeInstallRecord(spec, disk) {
     try { disk.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
 }
+async function probeLinger(io = {}) {
+  try {
+    const result = await (io.runner || runner).exec('loginctl', ['show-user', io.username || os.userInfo().username, '-p', 'Linger']);
+    const match = /^Linger=(yes|no)\s*$/m.exec(result.stdout || '');
+    if (result.code === 0 && match) return match[1];
+  } catch (_) { /* Linger is advisory when loginctl is unavailable. */ }
+  return 'unknown';
+}
 async function registrationStatus(flags = {}, env = process.env, io = {}) {
   let spec = io.spec || buildSpec(flags, env, io);
   const warnings = [];
@@ -85,12 +92,7 @@ async function registrationStatus(flags = {}, env = process.env, io = {}) {
   if (record) spec = recordedSpec(spec, record, flags);
   const state = await spec.adapter.status(spec, io.runner || runner);
   if (spec.platform === 'linux' && spec.scope === 'user') {
-    state.linger = 'unknown';
-    try {
-      const result = await (io.runner || runner).exec('loginctl', ['show-user', spec.username, '-p', 'Linger']);
-      const match = /^Linger=(yes|no)\s*$/m.exec(result.stdout || '');
-      if (result.code === 0 && match) state.linger = match[1];
-    } catch (_) { /* Linger is advisory when loginctl is unavailable. */ }
+    state.linger = flags.check ? await probeLinger({ ...io, username: spec.username }) : 'not probed (use --check)';
   }
   return { ...state, warnings, registrationRecord: record ? path.join(spec.home, 'state/install.json') : null, installedRole: record?.role, label: spec.label, artefactPath: spec.artefactPath, role: spec.role, scope: spec.scope, platform: spec.platform };
 }
@@ -114,37 +116,51 @@ async function command(action, argv, env, io) {
     const platform = io.platform || process.platform;
     const adapter = platforms[platform];
     if (!adapter) throw new Error('unsupported platform');
-    // Reject explicitly privileged operations before touching the filesystem.
-    if (flags.system && adapter.assertPrivilege) await adapter.assertPrivilege({
-      scope: 'system', uid: io.uid ?? (process.getuid ? process.getuid() : 0), isElevated: io.isElevated
-    }, io.runner || runner);
     const home = io.resolved?.home || path.resolve(flags.home ?? env.ERRMETER_HOME ?? path.join(os.homedir(), '.errmeter'));
     const recordPath = path.join(home, 'state/install.json');
     const record = readInstallRecord(home, files, warnings, platform);
     const ignoredRecord = warnings.length > 0;
-    if (action === 'install' && ignoredRecord) return report({ command: action, status: 'stale-install-record',
-      message: 'stale install record at ' + recordPath + '; run uninstall to clean up' }, 4);
+    const staleMessage = 'stale install record at ' + recordPath + '; run uninstall to clean up';
+    if (action === 'install' && ignoredRecord) {
+      if (!flags['dry-run']) return report({ command: action, status: 'stale-install-record', message: staleMessage }, 4);
+      warnings.push(staleMessage);
+    }
     let spec;
-    if (action === 'uninstall' && record) {
-      // Removal needs registration identity, not a runnable watch config. A
-      // changed, missing or invalid config must not strand an installed job.
+    if (record) {
+      // Existing registration identity is sufficient for removal or a reinstall
+      // preview/refusal, even when the current config or credentials are broken.
       const configPath = path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json'));
       spec = buildSpec(flags, env, { ...io, nodePath: record.nodePath, binPath: record.binPath,
         resolved: { home, configPath, config: { watch: { role: record.role } } } });
     }
+    if (!spec && (action === 'uninstall' || flags['dry-run'])) {
+      let resolved;
+      try {
+        resolved = io.resolved || (io.resolveConfig || resolveConfig)(flags, env, { command: 'status' });
+        // Non-strict resolution deliberately swallows corrupt files; validate
+        // local settings separately without reading any credentials.
+        if (!io.resolved) require('./status').localConfig(flags, env, io);
+      } catch (error) {
+        if (!(error instanceof ConfigError)) throw error;
+        if (!flags.role || !(flags.user || flags.system)) throw new ConfigError(action + ': pass --role and --user|--system, or fix the config');
+        resolved = { home, configPath: path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json')),
+          config: { watch: { role: flags.role } } };
+      }
+      spec = buildSpec(flags, env, { ...io, resolved });
+    }
     spec ||= buildSpec(flags, env, io);
-    if (spec.adapter.assertPrivilege) await spec.adapter.assertPrivilege(spec, io.runner || runner);
     if (record && action === 'uninstall') {
       if (flags.role && flags.role !== record.role) warnings.push('explicit role ' + flags.role + ' differs from installed role ' + record.role);
       if ((flags.user || flags.system) && spec.scope !== record.scope) warnings.push('explicit scope ' + spec.scope + ' differs from installed scope ' + record.scope);
       spec = recordedSpec(spec, record, flags);
-      if (spec.adapter.assertPrivilege) await spec.adapter.assertPrivilege(spec, io.runner || runner);
     }
-    if (record && action === 'install' && !flags['dry-run']) {
+    if (record && action === 'install') {
       const existing = await registrationStatus(flags, env, { ...io, spec: recordedSpec(spec, record) });
-      return report({ command: action, status: existing.registered ? 'already-installed; uninstall first' : 'stale-install-record',
-        ...(!existing.registered ? { message: 'stale install record at ' + recordPath + '; run uninstall to clean up' } : {}) }, 4);
+      if (!flags['dry-run']) return report({ command: action, status: existing.registered ? 'already-installed; uninstall first' : 'stale-install-record',
+        ...(!existing.registered ? { message: staleMessage } : {}) }, 4);
+      if (!existing.registered) warnings.push(staleMessage);
     }
+    if (!flags['dry-run'] && spec.adapter.assertPrivilege) await spec.adapter.assertPrivilege(spec, io.runner || runner);
     if (spec.adapter.prepare) {
       await spec.adapter.prepare(spec, io.runner || runner, { dryRun: Boolean(flags['dry-run']) });
       spec.content = spec.adapter.render(spec);
@@ -165,8 +181,18 @@ async function command(action, argv, env, io) {
       ...(!state.registered ? { message: 'install: artefact exists at ' + spec.artefactPath + ' but the service is not registered — run uninstall to clean up, then install' } : {}) }, 4);
     if (action === 'install' && state.registered) return report({ ...summary, status: 'already-installed; uninstall first' }, 4);
     const ownsRecord = ignoredRecord || record && spec.label === record.label && spec.scope === record.scope;
+    const removeRecord = () => {
+      if (!ownsRecord) return;
+      try { files.unlinkSync(recordPath); }
+      catch (error) {
+        if (error.code !== 'ENOENT') {
+          notes.push('warning: could not remove install record at ' + recordPath + '; ' + safeReason(error));
+          summary.notes = notes;
+        }
+      }
+    };
     if (action === 'uninstall' && !exists && !state.registered) {
-      if (ownsRecord) files.unlinkSync(recordPath);
+      removeRecord();
       return report({ ...summary, status: 'not-installed' }, 0);
     }
     const exec = async item => {
@@ -199,7 +225,7 @@ async function command(action, argv, env, io) {
       if (state.registered) await spec.adapter.uninstall(spec, io.runner || runner);
       if (exists) files.unlinkSync(spec.artefactPath);
       for (const item of spec.afterRemove || []) await exec(item);
-      if (ownsRecord) files.unlinkSync(recordPath);
+      removeRecord();
     }
     return report({ ...summary, status: action === 'install' ? 'installed' : 'uninstalled' }, 0);
   } catch (error) {
@@ -213,4 +239,4 @@ function uninstall(argv, env = process.env, io = {}) { return command('uninstall
 function main(argv, action = 'install') {
   return (action === 'uninstall' ? uninstall : install)(argv).then(code => { process.exitCode = code; }, () => { process.exitCode = 3; });
 }
-module.exports = { install, uninstall, main, buildSpec, registrationStatus };
+module.exports = { install, uninstall, main, buildSpec, registrationStatus, probeLinger };

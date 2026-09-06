@@ -34,7 +34,11 @@ async function probePermissions(ctx) {
     const name = method + ' ' + target;
     let response;
     try { response = await githubIssue.request(ctx, method, requestTarget(target), body); }
-    catch (_) { const error = new Error('Permission probe failed: ' + name + ' (transport)'); error.probe = name; throw error; }
+    catch (_) {
+      const origin = new URL(ctx.config.sink.api_base || 'https://api.github.com').origin;
+      const error = new Error('Permission probe failed: ' + name + ' (transport to ' + origin + ')');
+      error.probe = name; throw error;
+    }
     if (!response || !accept(response)) {
       const status = Number.isInteger(response?.status) ? response.status : 'invalid response';
       const error = new Error('Permission probe failed: ' + name + ' (HTTP ' + status + ')');
@@ -174,7 +178,7 @@ async function status(argv, env = process.env, io = {}) {
     if (!object(lastWatch) || lastWatch.ts !== undefined && (typeof lastWatch.ts !== 'string' || !Number.isFinite(Date.parse(lastWatch.ts)))) throw new ConfigError('status: invalid last watch state');
     for (const key of ['dispatched', 'eligible', 'scanned', 'unscanned']) if (lastWatch[key] !== undefined && (!Number.isSafeInteger(lastWatch[key]) || lastWatch[key] < 0)) throw new ConfigError('status: invalid last watch state');
     if (lastWatch.role !== undefined && !['watcher', 'agent-host'].includes(lastWatch.role)) throw new ConfigError('status: invalid last watch state');
-    const registration = await (io.registrationStatus || require('./install').registrationStatus)(flags, env, { ...io, resolved });
+    const registration = await (io.registrationStatus || require('./install').registrationStatus)({ ...flags, check: false }, env, { ...io, resolved });
     const running = registration.running ?? null;
     const watcher = { registered: Boolean(registration.registered), running,
       pid: registration.pid ?? (typeof running === 'number' ? running : null),
@@ -212,6 +216,9 @@ async function status(argv, env = process.env, io = {}) {
     if (result.watcher_heartbeats === 0) result.warnings.push('no watcher known');
     const degraded = !last.ts || result.pending > result.pending_soft_limit || flushFailed || flushStale || watcher.registered && !lastWatch.ts ||
       result.gaps > 0 || result.watcher_heartbeats === 0 || result.notify?.failed?.length;
+    if (registration.platform === 'linux' && registration.scope === 'user' && (flags.check || watcher.registered && degraded)) {
+      watcher.linger = await require('./install').probeLinger(io);
+    }
     return report(degraded ? 1 : 0, result);
   } catch (error) {
     const usage = error instanceof require('./cli').UsageError;

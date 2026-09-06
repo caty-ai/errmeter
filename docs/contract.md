@@ -439,6 +439,8 @@ The watch text summary line carries `scanned=` / `unscanned=` and, when a tick r
 
 ## Changelog
 
+- v1.7 note (2026-09-06, #24): token-less uninstall and install/uninstall dry-run; stale install dry-run previews; Linux user loginctl probes only with --check or registered degraded status; init --api-base selects the existing sink.api_base setting. Exit-code meanings unchanged; no field, format, or config-key change.
+
 - v1.7 note (2026-09-06, #28): #22 text-line suffix `errors=` and the §5.4/§9/§11 rewordings are clarifications; the only behavioural addition is the watcher startup rejection (existing exit code 3) (runtime behaviour unchanged); no field, format, config key or default changes; no version bump.
 
 - v1.7 note (2026-09-06, #6 round-2): persist registration identity for role-safe status/uninstall; add explicit `status --role`, Windows system wrapper location, and Linux user linger diagnostics. No existing config or exit-code change.
