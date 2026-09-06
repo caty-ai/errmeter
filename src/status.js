@@ -190,7 +190,7 @@ async function status(argv, env = process.env, io = {}) {
       last_successful_flush: last.last_successful_flush || (!flushFailed ? last.ts : null) || null,
       last_error: Array.isArray(last.errors) ? last.errors.at(-1) || null : null,
       last_flush_failed: flushFailed, last_flush_stale: flushStale, watcher, watcher_heartbeats: null, gaps: null,
-      warnings: resolved.warning ? [resolved.warning] : [] };
+      warnings: [...(resolved.warning ? [resolved.warning] : []), ...(registration.warnings || [])] };
     if (registration.registrationRecord && registration.installedRole !== config.watch.role) {
       result.warnings.push('installed role ' + registration.installedRole + ' differs from config watch.role ' + config.watch.role);
     }

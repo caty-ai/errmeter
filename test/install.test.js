@@ -297,15 +297,98 @@ test('Windows system scope checks injected elevation before filesystem or task r
   assert.equal(f.calls.length, 0);
 });
 
-test('systemd rejects control whitespace and guards trailing path whitespace in every setting', () => {
+test('systemd rejects control whitespace and guards trailing whitespace only in WorkingDirectory', () => {
   for (const key of ['home', 'configPath', 'nodePath', 'binPath', 'homedir']) for (const char of ['\t', '\v', '\f', '\r', '\n']) {
     assert.throws(() => systemd.plan({ ...context('watcher', 'user'), [key]: '/tmp/a' + char + 'b' }), /unsupported systemd path whitespace/);
   }
   const rendered = systemd.render({ ...context('watcher', 'user'), home: '/tmp/a b ', systemdVersion: 240 });
-  assert.match(rendered, /Environment="ERRMETER_HOME=\/tmp\/a b \/\."/);
+  assert.match(rendered, /Environment="ERRMETER_HOME=\/tmp\/a b "\n/);
   assert.match(rendered, /WorkingDirectory=\/tmp\/a b \/\./);
   assert.match(rendered, /StandardOutput=append:\/tmp\/a b \/logs\/watch\.out\.log/);
+  assert.match(rendered, /StandardError=append:\/tmp\/a b \/logs\/watch\.err\.log/);
+  const trailingBackslash = systemd.render({ ...context('watcher', 'user'), home: '/tmp/trailing\\', systemdVersion: 240 });
+  assert.ok(trailingBackslash.includes('Environment="ERRMETER_HOME=/tmp/trailing\\\\"\n'));
+  assert.ok(trailingBackslash.includes('WorkingDirectory=/tmp/trailing\\/.\n'));
+  assert.ok(trailingBackslash.includes('StandardOutput=append:/tmp/trailing\\/logs/watch.out.log\n'));
   assert.doesNotMatch(rendered, /[ \t]+$/m);
+});
+
+test('watcher configuration errors preserve dispatch.command guidance in text and JSON', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify({ schema: 1, sink: { type: 'file' }, watch: { role: 'watcher' } }));
+  assert.equal(await install([], f.env, f.io), 3);
+  assert.match(f.output.pop(), /dispatch\.command/);
+  assert.match(f.errors.pop(), /dispatch\.command/);
+  assert.equal(await install(['--json'], f.env, f.io), 3);
+  assert.match(JSON.parse(f.output.pop()).reason, /dispatch\.command/);
+  assert.equal(f.calls.length, 0);
+});
+
+for (const recordState of ['schema-2', 'malformed', 'invalid', 'other-platform']) test(recordState + ' record warns and falls back for status and uninstall, but blocks install', async t => {
+  const f = fixture(t);
+  assert.equal(await install(['--json'], f.env, f.io), 0);
+  const installed = JSON.parse(f.output.pop());
+  const recordPath = path.join(f.home, 'state/install.json');
+  const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+  const bytes = recordState === 'malformed' ? '{' : JSON.stringify({ ...record, role: 'watcher',
+    ...(recordState === 'schema-2' ? { schema: 2 } : recordState === 'other-platform' ? { platform: 'linux' } : { label: null }) });
+  fs.writeFileSync(recordPath, bytes);
+  let registered = true;
+  f.io.runner.exec = async (command, args) => {
+    f.calls.push({ command, args });
+    if (args[0] === 'print') {
+      assert.equal(args[1], 'gui/501/' + installed.label);
+      return { code: registered ? 0 : 113, stdout: 'pid = 123' };
+    }
+    if (args[0] === 'bootout') {
+      assert.equal(args[1], 'gui/501/' + installed.label);
+      registered = false;
+    }
+    return { code: 0 };
+  };
+  const warning = 'install record unreadable or unsupported at ' + recordPath + ' — ignored';
+  for (const healthy of [false, true]) {
+    if (healthy) {
+      for (const name of ['last_flush', 'last_watch']) fs.writeFileSync(path.join(f.home, 'state', name + '.json'), JSON.stringify({ ts: new Date().toISOString() }));
+    }
+    for (const args of [[], ['--json']]) {
+      f.errors.length = 0;
+      assert.equal(await require('../src/status').status(args, f.env, f.io), healthy ? 0 : 1);
+      assert.ok(f.errors.includes(warning + '\n'));
+      const output = f.output.pop();
+      if (args.length) {
+        const result = JSON.parse(output);
+        assert.equal(result.role, 'agent-host');
+        assert.equal(result.registration_record, null);
+        assert.equal(result.watcher.registered, true);
+        assert.ok(result.warnings.includes(warning));
+      } else assert.match(output, /role=agent-host.*registration record: none/);
+    }
+  }
+  const message = 'stale install record at ' + recordPath + '; run uninstall to clean up';
+  assert.equal(await install([], f.env, f.io), 4);
+  assert.equal(f.output.pop(), message + '\n');
+  assert.equal(await install(['--json'], f.env, f.io), 4);
+  assert.equal(JSON.parse(f.output.pop()).message, message);
+  const configPath = path.join(f.home, 'config.json');
+  const configBytes = fs.readFileSync(configPath, 'utf8');
+  fs.writeFileSync(configPath, JSON.stringify({ schema: 1, sink: { type: 'file' }, watch: { role: 'watcher' } }));
+  for (const args of [[], ['--json']]) {
+    assert.equal(await install(args, f.env, { ...f.io, resolveConfig: () => assert.fail('stale record must precede config validation') }), 4);
+    const output = f.output.pop();
+    assert.equal(args.length ? JSON.parse(output).message : output.trim(), message);
+  }
+  fs.writeFileSync(configPath, configBytes);
+  assert.equal(fs.readFileSync(recordPath, 'utf8'), bytes);
+  assert.equal(await uninstall(['--dry-run', '--json'], f.env, f.io), 0);
+  assert.ok(JSON.parse(f.output.pop()).notes.includes(warning));
+  assert.equal(fs.readFileSync(recordPath, 'utf8'), bytes);
+  assert.equal(registered, true);
+  assert.equal(await uninstall(['--json'], f.env, f.io), 0);
+  assert.ok(JSON.parse(f.output.pop()).notes.includes(warning));
+  assert.equal(registered, false);
+  assert.equal(fs.existsSync(installed.artefactPath), false);
+  assert.equal(fs.existsSync(recordPath), false);
 });
 
 test('recorded role and label survive config and suffix changes through status and uninstall', async t => {

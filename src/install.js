@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { execFile } = require('node:child_process');
-const { resolveConfig } = require('./config');
+const { resolveConfig, ConfigError } = require('./config');
 const { UsageError, USAGE } = require('./cli');
 const platforms = { darwin: require('./platform/launchd'), linux: require('./platform/systemd'), win32: require('./platform/schtasks') };
 const runner = { exec(command, args) {
@@ -15,6 +15,7 @@ const runner = { exec(command, args) {
 } };
 function output(target, text) { try { if (typeof target === 'function') target(text); else target.write(text); } catch (_) {} }
 function safeReason(error) {
+  if (error instanceof ConfigError) return error.message;
   // Never echo tool output, command arguments, or filesystem paths in errors.
   const message = String(error?.message || '');
   if (/^(?:unsupported platform|invalid role|invalid registration path|invalid install label suffix|unsupported Windows path|unsupported scheduled task path|unsupported systemd path whitespace|system registration requires (?:root|administrator)|system registration privilege could not be determined|(?:launchctl|systemctl|schtasks) [A-Za-z/-]+(?: [A-Za-z/-]+)? failed|registration command failed: (?:systemctl (?:daemon-reload|enable --now|disable --now)|schtasks \/(?:Create|Delete)))$/.test(message)) return message;
@@ -36,13 +37,21 @@ function buildSpec(flags, env = process.env, io = {}) {
   }
   return { ...ctx, ...adapter.plan(ctx), adapter };
 }
-function readInstallRecord(home, disk = fs) {
+function readInstallRecord(home, disk = fs, warnings = [], platform = process.platform) {
+  const recordPath = path.join(home, 'state/install.json');
   let record;
-  try { record = JSON.parse(disk.readFileSync(path.join(home, 'state/install.json'), 'utf8')); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  if (!record || record.schema !== 1 || !platforms[record.platform] || !['watcher', 'agent-host'].includes(record.role) ||
+  try { record = JSON.parse(disk.readFileSync(recordPath, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    warnings.push('install record unreadable or unsupported at ' + recordPath + ' — ignored');
+    return null;
+  }
+  if (!record || record.schema !== 1 || record.platform !== platform || !platforms[record.platform] || !['watcher', 'agent-host'].includes(record.role) ||
       !['user', 'system'].includes(record.scope) || ['label', 'artefactPath', 'nodePath', 'binPath', 'installedAt'].some(key =>
-        typeof record[key] !== 'string' || !record[key] || /[\0\r\n]/.test(record[key]))) throw new Error('invalid install record');
+        typeof record[key] !== 'string' || !record[key] || /[\0\r\n]/.test(record[key]))) {
+    warnings.push('install record unreadable or unsupported at ' + recordPath + ' — ignored');
+    return null;
+  }
   return record;
 }
 function recordedSpec(spec, record, flags = {}) {
@@ -71,7 +80,8 @@ function writeInstallRecord(spec, disk) {
 }
 async function registrationStatus(flags = {}, env = process.env, io = {}) {
   let spec = io.spec || buildSpec(flags, env, io);
-  const record = io.spec ? null : readInstallRecord(spec.home, io.fs || fs);
+  const warnings = [];
+  const record = io.spec ? null : readInstallRecord(spec.home, io.fs || fs, warnings, spec.platform);
   if (record) spec = recordedSpec(spec, record, flags);
   const state = await spec.adapter.status(spec, io.runner || runner);
   if (spec.platform === 'linux' && spec.scope === 'user') {
@@ -82,7 +92,7 @@ async function registrationStatus(flags = {}, env = process.env, io = {}) {
       if (result.code === 0 && match) state.linger = match[1];
     } catch (_) { /* Linger is advisory when loginctl is unavailable. */ }
   }
-  return { ...state, registrationRecord: record ? path.join(spec.home, 'state/install.json') : null, installedRole: record?.role, label: spec.label, artefactPath: spec.artefactPath, role: spec.role, scope: spec.scope, platform: spec.platform };
+  return { ...state, warnings, registrationRecord: record ? path.join(spec.home, 'state/install.json') : null, installedRole: record?.role, label: spec.label, artefactPath: spec.artefactPath, role: spec.role, scope: spec.scope, platform: spec.platform };
 }
 async function command(action, argv, env, io) {
   const stdout = io.stdout || process.stdout; const stderr = io.stderr || process.stderr;
@@ -100,30 +110,30 @@ async function command(action, argv, env, io) {
   if (flags.help || flags.version) { output(stdout, flags.help ? USAGE : require('../package.json').version + '\n'); return 0; }
   try {
     const files = io.fs || fs;
-    let spec, record;
-    if (action === 'uninstall') {
-      const platform = io.platform || process.platform;
-      const adapter = platforms[platform];
-      if (!adapter) throw new Error('unsupported platform');
-      // Reject explicitly privileged operations before touching the filesystem.
-      if (flags.system && adapter.assertPrivilege) await adapter.assertPrivilege({
-        scope: 'system', uid: io.uid ?? (process.getuid ? process.getuid() : 0), isElevated: io.isElevated
-      }, io.runner || runner);
-      const home = io.resolved?.home || path.resolve(flags.home ?? env.ERRMETER_HOME ?? path.join(os.homedir(), '.errmeter'));
-      record = readInstallRecord(home, files);
-      if (record) {
-        // Removal needs registration identity, not a runnable watch config. A
-        // changed, missing or invalid config must not strand an installed job.
-        const configPath = path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json'));
-        spec = buildSpec(flags, env, { ...io, nodePath: record.nodePath, binPath: record.binPath,
-          resolved: { home, configPath, config: { watch: { role: record.role } } } });
-      }
+    const warnings = [];
+    const platform = io.platform || process.platform;
+    const adapter = platforms[platform];
+    if (!adapter) throw new Error('unsupported platform');
+    // Reject explicitly privileged operations before touching the filesystem.
+    if (flags.system && adapter.assertPrivilege) await adapter.assertPrivilege({
+      scope: 'system', uid: io.uid ?? (process.getuid ? process.getuid() : 0), isElevated: io.isElevated
+    }, io.runner || runner);
+    const home = io.resolved?.home || path.resolve(flags.home ?? env.ERRMETER_HOME ?? path.join(os.homedir(), '.errmeter'));
+    const recordPath = path.join(home, 'state/install.json');
+    const record = readInstallRecord(home, files, warnings, platform);
+    const ignoredRecord = warnings.length > 0;
+    if (action === 'install' && ignoredRecord) return report({ command: action, status: 'stale-install-record',
+      message: 'stale install record at ' + recordPath + '; run uninstall to clean up' }, 4);
+    let spec;
+    if (action === 'uninstall' && record) {
+      // Removal needs registration identity, not a runnable watch config. A
+      // changed, missing or invalid config must not strand an installed job.
+      const configPath = path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json'));
+      spec = buildSpec(flags, env, { ...io, nodePath: record.nodePath, binPath: record.binPath,
+        resolved: { home, configPath, config: { watch: { role: record.role } } } });
     }
     spec ||= buildSpec(flags, env, io);
     if (spec.adapter.assertPrivilege) await spec.adapter.assertPrivilege(spec, io.runner || runner);
-    const recordPath = path.join(spec.home, 'state/install.json');
-    if (action === 'install') record = readInstallRecord(spec.home, files);
-    const warnings = [];
     if (record && action === 'uninstall') {
       if (flags.role && flags.role !== record.role) warnings.push('explicit role ' + flags.role + ' differs from installed role ' + record.role);
       if ((flags.user || flags.system) && spec.scope !== record.scope) warnings.push('explicit scope ' + spec.scope + ' differs from installed scope ' + record.scope);
@@ -154,7 +164,7 @@ async function command(action, argv, env, io) {
       status: state.registered ? 'already-installed; uninstall first' : 'artefact-exists-unregistered',
       ...(!state.registered ? { message: 'install: artefact exists at ' + spec.artefactPath + ' but the service is not registered — run uninstall to clean up, then install' } : {}) }, 4);
     if (action === 'install' && state.registered) return report({ ...summary, status: 'already-installed; uninstall first' }, 4);
-    const ownsRecord = record && spec.label === record.label && spec.scope === record.scope;
+    const ownsRecord = ignoredRecord || record && spec.label === record.label && spec.scope === record.scope;
     if (action === 'uninstall' && !exists && !state.registered) {
       if (ownsRecord) files.unlinkSync(recordPath);
       return report({ ...summary, status: 'not-installed' }, 0);

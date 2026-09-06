@@ -25,10 +25,9 @@ function plan(ctx) {
   // These settings consume the entire value as a path, not an argv word. Quotes
   // would become literal path characters; only systemd specifiers need escaping.
   const trailingSafe = value => /[\\\s]$/.test(value) ? value + '/.' : value;
-  const settingPath = value => String(trailingSafe(value)).replace(/%/g, '%%');
-  const environmentHome = trailingSafe(ctx.home);
+  const settingPath = value => String(value).replace(/%/g, '%%');
   const content = '[Unit]\nDescription=errmeter ' + ctx.role + '\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=' + args.map(quote).join(' ') +
-    '\nRestart=always\nRestartSec=5\nEnvironment=' + setting('ERRMETER_HOME=' + environmentHome) + '\nWorkingDirectory=' + settingPath(ctx.home) +
+    '\nRestart=always\nRestartSec=5\nEnvironment=' + setting('ERRMETER_HOME=' + ctx.home) + '\nWorkingDirectory=' + settingPath(trailingSafe(ctx.home)) +
     '\nStandardOutput=' + (ctx.systemdVersion >= 240 ? 'append:' + settingPath(path.posix.join(ctx.home, 'logs/watch.out.log')) : 'journal') +
     '\nStandardError=' + (ctx.systemdVersion >= 240 ? 'append:' + settingPath(path.posix.join(ctx.home, 'logs/watch.err.log')) : 'journal') +
     '\n\n[Install]\nWantedBy=' + (ctx.scope === 'system' ? 'multi-user.target' : 'default.target') + '\n';
