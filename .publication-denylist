@@ -4,4 +4,4 @@ personal-home-path	/Users/[a-z]+/
 personal-hostname	jikumarushouno
 owner-handle	@shojikumaru\b
 private-inbox-name	shojikumaru/errmeter-inbox
-internal-runbook-wording	(owner stage 1|issue #8\b|connection table on issue|family connection table|the owner installer)
+internal-runbook-wording	(owner stage 1|issue #8\b|connection table on issue|family connection table|the owner installer|stage-1 patch|owner (host-hook )?installer)

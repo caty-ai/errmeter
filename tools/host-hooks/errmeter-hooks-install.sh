@@ -115,7 +115,16 @@ function desired(target) {
   } else {
     const rel=rels.codex[0],text=read(rel,true), {lines,index,prior}=codexNotify(text);
     const hook=path.join(home,rels.codex[1]);
-    if(!hasCodexWrapper(prior,hook))lines[index]="notify = "+JSON.stringify(["bash",hook,"--previous-notify",JSON.stringify(prior)]);
+    if(!hasCodexWrapper(prior,hook)) {
+      let previous=prior;
+      if(prior[0]==="bash"&&prior[1]===hook) {
+        previous=[];
+        if(prior[2]==="--previous-notify") {
+          try {const inner=JSON.parse(prior[3]);if(Array.isArray(inner)&&inner.every(value=>typeof value==="string"))previous=inner;} catch (_) {}
+        }
+      }
+      lines[index]="notify = "+JSON.stringify(["bash",hook,"--previous-notify",JSON.stringify(previous)]);
+    }
     files.set(rel,lines.join("\n"));files.set(rels.codex[1],fs.readFileSync(path.join(root,"examples/codex-notify-emit.sh"),"utf8"));
   }return files;
 }
@@ -178,6 +187,7 @@ function targetStatus(target,history) {
   const hookExample=fs.readFileSync(path.join(root,"examples/codex-notify-emit.sh"),"utf8");
   if(points&&hook===hookExample){
     const installed=lastInstalledAfter(history,rel);
+    if(installed!==undefined&&codexNotify(installed).prior[3]!==parsed.prior[3])return {state:"drifted",note:false};
     return {state:"installed",note:installed!==undefined&&installed!==actual};
   }
   return {state:points||hook!==null?"drifted":"not installed",note:false};
@@ -193,8 +203,14 @@ function minimalRedact(line) {
 }
 function previewLine(line) {
   const escapedHome=JSON.stringify(home).slice(1,-1);
-  const homeCollapsed=line.split(home).join("~").split(escapedHome).join("~");
-  console.log(previewRedact?previewRedact(homeCollapsed,[]):minimalRedact(homeCollapsed));
+  const collapse=(text,prefix)=>text.split(prefix).map((part,index)=>index===0?part:(/^(?:\/|["\x27]|$)/.test(part)?"~":prefix)+part).join("");
+  const homeCollapsed=collapse(collapse(line,escapedHome),home);
+  // The shared redactor also collapses HOME without checking path boundaries.
+  // Protect remaining non-path occurrences while it redacts sensitive values.
+  let homeToken="\u0000ERRMETER_HOME\u0000";
+  while(homeCollapsed.includes(homeToken))homeToken+="\u0000";
+  const protectedLine=homeCollapsed.split(home).join(homeToken);
+  console.log((previewRedact?previewRedact(protectedLine,[]):minimalRedact(protectedLine)).split(homeToken).join(home));
 }
 function boundedDiff(rel,before,after) {
   const a=before.split("\n"),b=after.split("\n");let start=0;
@@ -221,7 +237,7 @@ function previewChange(change) {
     previewLine("--- ~/"+change.rel);previewLine("+++ ~/"+change.rel);previewLine("@@ top-level notify @@");
     const prefix=JSON.stringify(["bash","~/"+rels.codex[1],"--previous-notify"]);
     previewLine("+notify = "+prefix.slice(0,-1)+", …]");
-    previewLine(" [previous notify argv, "+oldNotify.prior.length+" entries, elided]");return;
+    previewLine("+# [previous notify argv, "+oldNotify.prior.length+" entries, elided]");return;
   }
   boundedDiff(change.rel,before||"",change.after);
 }

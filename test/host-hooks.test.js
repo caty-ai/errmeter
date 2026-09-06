@@ -49,7 +49,7 @@ test('Codex dry-run elides the previous notify argv and collapses HOME', t => {
   assert.doesNotMatch(r.stdout, new RegExp(positionalSecret));
   assert.doesNotMatch(r.stdout, /-notify =/);
   assert.match(r.stdout, /\+notify = \["bash","~\/\.errmeter\/hooks\/codex-notify-emit\.sh","--previous-notify", …\]/);
-  assert.match(r.stdout, /\[previous notify argv, 3 entries, elided\]/);
+  assert.match(r.stdout, /^\+# \[previous notify argv, 3 entries, elided\]$/m);
   assert.equal(r.stdout.includes(f.dir), false);
   const applied = f.run('errmeter-hooks-install.sh', ['--codex', '--apply']);
   assert.equal(applied.status, 0, applied.stderr);
@@ -157,19 +157,19 @@ test('status reports either half of every integration as drifted', t => {
   fs.writeFileSync(codexHook, fs.readFileSync(path.join(tools, 'examples/codex-notify-emit.sh')));
   assertDrifted(codex, 'codex');
 });
-test('Codex wrapper status is content-derived and agrees with apply', t => {
+test('Codex wrapper detects changed previous argv with history and accepts content without history', t => {
   const f = fixture(t), config = path.join(f.dir, '.codex/config.toml'), hook = path.join(f.dir, '.errmeter/hooks/codex-notify-emit.sh');
-  assert.equal(f.run('errmeter-hooks-install.sh', ['--codex', '--apply']).status, 0);
+  assert.equal(f.run('errmeter-hooks-install.sh', ['--all', '--apply']).status, 0);
+  fs.appendFileSync(config, '\n# unrelated edit\n');
+  let r = f.run('errmeter-hooks-status.sh');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /codex: installed \(unrelated local edits present\)/);
   const changed = fs.readFileSync(config, 'utf8').replace('turn-ended', 'turn-finished');
   fs.writeFileSync(config, changed);
-  let r = f.run('errmeter-hooks-status.sh');
+  r = f.run('errmeter-hooks-status.sh');
   assert.equal(r.status, 1, r.stderr);
-  assert.match(r.stdout, /codex: installed \(unrelated local edits present\)/);
-  const before = snapshot(f.dir);
-  r = f.run('errmeter-hooks-install.sh', ['--codex', '--apply']);
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /Already installed; no changes/);
-  assert.deepEqual(snapshot(f.dir), before);
+  assert.match(r.stdout, /codex: drifted/);
+  t.diagnostic(`${r.stdout.split('\n').find(line => line.startsWith('codex:'))}; exit ${r.status}`);
 
   const withoutHistory = fixture(t);
   fs.writeFileSync(path.join(withoutHistory.dir, '.codex/config.toml'), changed.replace(f.dir, withoutHistory.dir));
@@ -179,6 +179,67 @@ test('Codex wrapper status is content-derived and agrees with apply', t => {
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stdout, /codex: installed/);
   assert.doesNotMatch(r.stdout, /codex: drifted/);
+});
+test('Codex repairs malformed wrappers without nesting the hook', t => {
+  for (const shape of ['invalid JSON', 'missing payload', 'extra args']) {
+    const f = fixture(t), config = path.join(f.dir, '.codex/config.toml');
+    const hook = path.join(f.dir, '.errmeter/hooks/codex-notify-emit.sh');
+    const inner = ['echo', 'recovered'];
+    const prior = ['bash', hook, '--previous-notify'];
+    if (shape === 'invalid JSON') prior.push('not JSON');
+    if (shape === 'extra args') prior.push(JSON.stringify(inner), 'extra');
+    fs.writeFileSync(config, 'notify = ' + JSON.stringify(prior) + '\n');
+    const r = f.run('errmeter-hooks-install.sh', ['--codex', '--apply']);
+    assert.equal(r.status, 0, r.stderr);
+    const line = fs.readFileSync(config, 'utf8').trim();
+    const repaired = JSON.parse(line.slice('notify = '.length));
+    assert.deepEqual(repaired, ['bash', hook, '--previous-notify', JSON.stringify(shape === 'extra args' ? inner : [])]);
+    assert.equal(line.split(hook).length - 1, 1);
+    assert.match(f.run('errmeter-hooks-status.sh').stdout, /codex: installed/);
+    t.diagnostic(`${shape}: ${line}; hook path count 1`);
+  }
+});
+test('preview collapses HOME only at path boundaries', t => {
+  const f = fixture(t), sitter = path.join(f.dir, '.claude/scripts/sitter-on-fail.sh');
+  const examples = [f.dir + '/child', f.dir, f.dir + '-suffix'];
+  fs.writeFileSync(sitter, f.original['.claude/scripts/sitter-on-fail.sh'].replace('LOG=/dev/null', 'LOG=/dev/null\n# ' + examples.map(value => JSON.stringify(value)).join(' ')));
+  const r = f.run('errmeter-hooks-install.sh', ['--sitter']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout.includes('"~/child" "~" "' + f.dir + '-suffix"'), r.stdout);
+});
+test('host fixture cycle works with system bash', t => {
+  const f = fixture(t), before = snapshot(f.dir);
+  const run = (script, args = []) => spawnSync('/bin/bash', [path.join(tools, script), ...args], { env: f.env, encoding: 'utf8' });
+  assert.equal(run('errmeter-hooks-install.sh', ['--all']).status, 0);
+  assert.deepEqual(snapshot(f.dir), before);
+  assert.equal(run('errmeter-hooks-install.sh', ['--all', '--apply']).status, 0);
+  assert.equal(run('errmeter-hooks-status.sh').status, 0);
+  assert.equal(run('errmeter-hooks-restore.sh').status, 0);
+  for (const [rel, original] of Object.entries(f.original)) assert.equal(fs.readFileSync(path.join(f.dir, rel), 'utf8'), original);
+});
+test('publication policy rejects every internal integration phrase', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-wording-gate-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.copyFileSync(path.join(root, '.publication-denylist'), path.join(dir, '.publication-denylist'));
+  const phrases = [
+    ['owner', 'stage 1'], ['issue', '#8'], ['connection', 'table on issue'],
+    ['family', 'connection table'], ['the owner', 'installer'], ['stage-1', 'patch'],
+    ['owner', 'installer'], ['owner host-hook', 'installer']
+  ].map(parts => parts.join(' '));
+  const run = () => spawnSync('python3', ['-B', path.join(root, 'tools/check_publication_gate.py'), '--root', dir, '--account-slug', 'fixture', '--no-registry'], { encoding: 'utf8' });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'Public integration guide\n');
+  let r = run();
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  for (const phrase of phrases) {
+    fs.writeFileSync(path.join(dir, 'README.md'), phrase + '\n');
+    r = run();
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout + r.stderr, /internal-runbook-wording/);
+    t.diagnostic(`gate red: ${phrase}; exit ${r.status}`);
+  }
+  fs.writeFileSync(path.join(dir, 'README.md'), 'Public integration guide\n');
+  assert.equal(run().status, 0);
+  t.diagnostic('gate green: neutral fixture; exit 0');
 });
 test('named target selection leaves other host files alone', t => {
   const f = fixture(t); const r = f.run('errmeter-hooks-install.sh', ['--claude-code', '--apply']); assert.equal(r.status, 0, r.stderr);
@@ -258,6 +319,7 @@ test('job-heartbeat patch always applies to the checked-in snapshot and live sou
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-patch-check-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     fs.mkdirSync(path.join(dir, 'scripts')); fs.copyFileSync(source, path.join(dir, 'scripts/job-heartbeat'));
+    fs.chmodSync(path.join(dir, 'scripts/job-heartbeat'), 0o755);
     assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: dir }).status, 0);
     const r = spawnSync('git', ['apply', '--check', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
     const applied = spawnSync('git', ['apply', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' }); assert.equal(applied.status, 0, applied.stderr);
@@ -278,10 +340,12 @@ test('job-heartbeat patch always applies to the checked-in snapshot and live sou
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-patch-applied-check-'));
       t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
       fs.mkdirSync(path.join(dir, 'scripts')); fs.copyFileSync(source, path.join(dir, 'scripts/job-heartbeat'));
+      fs.chmodSync(path.join(dir, 'scripts/job-heartbeat'), 0o755);
       assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: dir }).status, 0);
       const r = spawnSync('git', ['apply', '--check', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' });
       assert.notEqual(r.status, 0, 'an already-applied patch must not apply twice');
       assert.match(r.stderr, /patch does not apply/);
+      assert.doesNotMatch(r.stderr, /warning:/);
       return;
     }
     assert.fail('fma job-heartbeat drifted from the snapshot — refresh the snapshot and the patch');
@@ -298,6 +362,12 @@ test('job-heartbeat patch always applies to the checked-in snapshot and live sou
   t.after(() => fs.rmSync(driftDir, { recursive: true, force: true }));
   fs.mkdirSync(path.join(driftDir, 'scripts'));
   const driftSource = path.join(driftDir, 'scripts/job-heartbeat');
+  for (const text of [snapshotText, patchedText]) {
+    fs.writeFileSync(driftSource, text);
+    fs.chmodSync(driftSource, 0o644);
+    verifyLive(driftSource);
+    assert.equal(fs.statSync(driftSource).mode & 0o777, 0o644);
+  }
   fs.writeFileSync(driftSource, patchedText + '\n# unrelated third edit\n');
   assert.throws(() => verifyLive(driftSource), /fma job-heartbeat drifted from the snapshot/);
 });
