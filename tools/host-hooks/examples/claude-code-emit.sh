@@ -2,10 +2,19 @@
 # Claude Code hook: report a tool failure without ever failing the hook.
 set -u
 
-[ "${ERRMETER_HOOKS_DISABLE:-0}" = "1" ] && exit 0
-command -v errmeter >/dev/null 2>&1 || exit 0
+agent_user=$(printf '%s' "${USER:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9._\/-]/-/g')
+[ -n "$agent_user" ] || agent_user=unknown
+
+if [ "${ERRMETER_HOOKS_DISABLE:-0}" = "1" ]; then
+  cat >/dev/null 2>&1 || true
+  exit 0
+fi
+if ! command -v errmeter >/dev/null 2>&1; then
+  cat >/dev/null 2>&1 || true
+  exit 0
+fi
 if [ "${1:-}" = "--heartbeat" ]; then
-  errmeter emit --kind heartbeat --agent "claude-code/${USER:-unknown}" >/dev/null 2>&1 || true
+  errmeter emit --kind heartbeat --agent "claude-code/$agent_user" >/dev/null 2>&1 || true
   exit 0
 fi
 umask 077
@@ -35,7 +44,7 @@ session_id=$(node -e '
   process.stdout.write(value);
 ' "$payload_file" 2>/dev/null || true)
 
-args=(emit --agent "claude-code/${USER:-unknown}" --message "$tool_name failed" --detail -)
+args=(emit --agent "claude-code/$agent_user" --message "$tool_name failed" --detail -)
 [ -n "$session_id" ] && args+=(--meta "session=$session_id")
 errmeter "${args[@]}" <"$payload_file" >/dev/null 2>&1 || true
 exit 0

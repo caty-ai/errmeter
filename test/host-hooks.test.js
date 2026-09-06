@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..');
 const tools = path.join(root, 'tools/host-hooks');
 function fixture(t) {
@@ -27,9 +27,17 @@ function snapshot(dir) {
   function walk(p) { for (const n of fs.readdirSync(p).sort()) { const q = path.join(p, n); if (fs.statSync(q).isDirectory()) walk(q); else entries.push([path.relative(dir, q), fs.readFileSync(q).toString('base64')]); } }
   walk(dir); return entries;
 }
-test('host installer dry-run is read-only and names exact replacements', t => {
+test('host installer dry-run is read-only and previews bounded changed regions', t => {
   const f = fixture(t), before = snapshot(f.dir), r = f.run('errmeter-hooks-install.sh', ['--all']);
-  assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /Dry run/); assert.match(r.stdout, /before/); assert.deepEqual(snapshot(f.dir), before);
+  assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /Dry run/); assert.match(r.stdout, /JSON path \$\.hooks\.PostToolUseFailure/); assert.deepEqual(snapshot(f.dir), before);
+  assert.match(r.stdout, /@@ -\d+,\d+ \+\d+,\d+ @@/);
+  assert.match(r.stdout, /claude-code-emit\.sh \(\d+ bytes, from tools\/host-hooks\/examples\/claude-code-emit\.sh\)/);
+});
+test('host installer dry-run does not expose unrelated settings secrets or full files', t => {
+  const f = fixture(t), settings = path.join(f.dir, '.claude/settings.json');
+  fs.writeFileSync(settings, '{\n  "env": {"SOME_TOKEN": "secret.value.for.test"},\n  "permissions": {"allow": ["Bash(*)"]}\n}\n');
+  const r = f.run('errmeter-hooks-install.sh', ['--claude-code']);
+  assert.equal(r.status, 0, r.stderr); assert.ok(Buffer.byteLength(r.stdout) < 4096); assert.doesNotMatch(r.stdout, /secret\.value\.for\.test/); assert.doesNotMatch(r.stdout, /permissions/);
 });
 test('host install backs up bytes, inserts one hook, preserves unrelated JSON and is idempotent', t => {
   const f = fixture(t), r = f.run('errmeter-hooks-install.sh', ['--all', '--apply']); assert.equal(r.status, 0, r.stderr);
@@ -43,15 +51,19 @@ test('host install backs up bytes, inserts one hook, preserves unrelated JSON an
   assert.equal(manifest.entries.find(e => e.rel === '.errmeter/hooks/claude-code-emit.sh').before, null);
   const before = snapshot(f.dir), again = f.run('errmeter-hooks-install.sh', ['--all', '--apply']); assert.equal(again.status, 0); assert.match(again.stdout, /no changes/); assert.deepEqual(snapshot(f.dir), before);
 });
-test('host status reports installed then exact drift, restore recovers original bytes and removes new hooks', t => {
+test('host status distinguishes unrelated edits, owned drift, and a complete restore', t => {
   const f = fixture(t); assert.equal(f.run('errmeter-hooks-install.sh', ['--all', '--apply']).status, 0);
   let r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /claude-code: installed/);
   fs.appendFileSync(path.join(f.dir, '.claude/settings.json'), '\n');
+  r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /claude-code: installed \(unrelated local edits present\)/);
+  const settings = path.join(f.dir, '.claude/settings.json'); fs.writeFileSync(settings, fs.readFileSync(settings, 'utf8').replace('"matcher":"*"', '"matcher":"changed"'));
   r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 1, r.stderr); assert.match(r.stdout, /claude-code: drifted/);
   r = f.run('errmeter-hooks-restore.sh'); assert.equal(r.status, 0, r.stderr);
   for (const [rel, bytes] of Object.entries(f.original)) assert.equal(fs.readFileSync(path.join(f.dir, rel), 'utf8'), bytes);
   assert.equal(fs.existsSync(path.join(f.dir, '.errmeter/hooks/claude-code-emit.sh')), false);
   assert.equal(fs.existsSync(path.join(f.dir, '.errmeter/hooks/codex-notify-emit.sh')), false);
+  assert.equal(fs.existsSync(path.join(f.dir, '.errmeter/hooks')), false);
+  r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 1, r.stderr); assert.match(r.stdout, /sitter: not installed/); assert.match(r.stdout, /claude-code: not installed/); assert.match(r.stdout, /codex: not installed/); assert.doesNotMatch(r.stdout, /drifted/);
 });
 test('named target selection leaves other host files alone', t => {
   const f = fixture(t); const r = f.run('errmeter-hooks-install.sh', ['--claude-code', '--apply']); assert.equal(r.status, 0, r.stderr);
@@ -65,9 +77,16 @@ test('bad settings, ambiguous TOML and symlinks fail before any installation wri
   fs.unlinkSync(path.join(f.dir, '.claude/settings.json')); fs.symlinkSync(path.join(f.dir, '.codex/config.toml'), path.join(f.dir, '.claude/settings.json'));
   assert.equal(f.run('errmeter-hooks-install.sh', ['--claude-code', '--apply']).status, 3);
 });
-test('usage errors do not mutate and status parse failures return cannot', t => {
+test('usage errors do not mutate and status inspection failures are isolated', t => {
   const f = fixture(t); assert.equal(f.run('errmeter-hooks-install.sh').status, 2); assert.equal(f.run('errmeter-hooks-restore.sh', ['--from', '../bad']).status, 2);
-  fs.writeFileSync(path.join(f.dir, '.claude/settings.json'), 'bad'); assert.equal(f.run('errmeter-hooks-status.sh').status, 3);
+  fs.unlinkSync(path.join(f.dir, '.codex/config.toml')); let r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 1); assert.match(r.stderr, /codex: cannot inspect \(missing file\)/);
+  fs.unlinkSync(path.join(f.dir, '.claude/scripts/sitter-on-fail.sh')); fs.writeFileSync(path.join(f.dir, '.claude/settings.json'), 'bad');
+  r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 3); assert.match(r.stderr, /claude-code: cannot inspect/);
+});
+test('status reports a present modified hook file as drifted without a config entry', t => {
+  const f = fixture(t), hook = path.join(f.dir, '.errmeter/hooks/claude-code-emit.sh');
+  fs.mkdirSync(path.dirname(hook), { recursive: true }); fs.writeFileSync(hook, '# modified hook\n');
+  const r = f.run('errmeter-hooks-status.sh'); assert.equal(r.status, 1); assert.match(r.stdout, /claude-code: drifted/);
 });
 test('plain wrapper preserves successful and failed command codes and emits bounded stderr detail', t => {
   const f = fixture(t);
@@ -75,6 +94,19 @@ test('plain wrapper preserves successful and failed command codes and emits boun
   r = f.run('examples/with-errmeter.sh', ['Nightly', '--', 'bash', '-c', 'echo problem >&2; exit 7'], { env: { ...f.env, FAKE_RC: '2' } }); assert.equal(r.status, 7); assert.match(r.stderr, /problem/);
   const records = fs.readFileSync(f.record, 'utf8').trim().split('\n').map(JSON.parse); assert.equal(records.length, 2);
   assert.ok(records[0].args.includes('heartbeat')); assert.ok(records[0].args.includes('--agent=nightly')); assert.ok(records[1].args.includes('--message=exit 7')); assert.ok(records[1].args.some(a => a.startsWith('--detail-file=')));
+});
+test('plain wrapper forwards TERM, waits for the child, and exits 143', async t => {
+  const f = fixture(t), forwarded = path.join(f.dir, 'term-forwarded'), pidFile = path.join(f.dir, 'signal-child.pid');
+  const child = "trap 'printf term >\"$1\"; exit 0' TERM; printf '%s' \"$$\" >\"$2\"; while :; do sleep 1; done";
+  const proc = spawn('bash', [path.join(tools, 'examples/with-errmeter.sh'), 'SignalJob', '--', 'bash', '-c', child, 'bash', forwarded, pidFile], { env: f.env, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = ''; proc.stderr.on('data', chunk => { stderr += chunk; });
+  t.after(() => { if (proc.exitCode === null && fs.existsSync(pidFile)) { try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch (_) {} } });
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error('signal forwarding test timed out')); }, 5000);
+    const poll = setInterval(() => { if (fs.existsSync(pidFile)) { clearInterval(poll); proc.kill('SIGTERM'); } }, 10);
+    proc.once('error', error => { clearTimeout(timeout); clearInterval(poll); reject(error); });
+    proc.once('exit', (code, signal) => { clearTimeout(timeout); clearInterval(poll); try { assert.equal(signal, null); assert.equal(code, 143, stderr); assert.equal(fs.readFileSync(forwarded, 'utf8'), 'term'); resolve(); } catch (error) { reject(error); } });
+  });
 });
 test('Claude adapter handles JSON and garbage, limits message promotion, and never fails', t => {
   const f = fixture(t);
@@ -86,22 +118,43 @@ test('Claude adapter handles JSON and garbage, limits message promotion, and nev
   assert.equal(f.run('examples/claude-code-emit.sh', [], { input: '{}', env: { ...f.env, ERRMETER_HOOKS_DISABLE: '1' } }).status, 0);
   assert.equal(fs.readFileSync(f.record, 'utf8').trim().split('\n').length, 3);
 });
+test('hook adapters sanitize USER for valid agent names', t => {
+  const f = fixture(t), env = { ...f.env, USER: 'Mixed Case!' };
+  assert.equal(f.run('examples/claude-code-emit.sh', [], { input: '{}', env }).status, 0);
+  assert.equal(f.run('examples/codex-notify-emit.sh', [JSON.stringify({ type: 'turn-complete' })], { env }).status, 0);
+  const records = fs.readFileSync(f.record, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(records[0].args.includes('claude-code/mixed-case-')); assert.ok(records[1].args.includes('codex/mixed-case-'));
+});
+test('Claude adapter drains stdin when disabled or errmeter is unavailable', t => {
+  const f = fixture(t), script = path.join(tools, 'examples/claude-code-emit.sh');
+  const command = '"$NODE" -e \'process.stdout.write("x".repeat(1024*1024))\' | bash "$SCRIPT"';
+  let r = spawnSync('bash', ['-o', 'pipefail', '-c', command], { env: { ...f.env, SCRIPT: script, NODE: process.execPath, ERRMETER_HOOKS_DISABLE: '1' }, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr);
+  r = spawnSync('bash', ['-o', 'pipefail', '-c', command], { env: { ...f.env, SCRIPT: script, NODE: process.execPath, PATH: path.dirname(process.execPath) + path.delimiter + '/bin' }, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr);
+});
 test('Codex notify chains previous argv without evaluation and emits heartbeat plus fixed failure', t => {
   const f = fixture(t), event = JSON.stringify({ type: 'turn-failed', 'last-assistant-message': 'Failure detail' });
   const previous = [path.join(f.dir, 'fake-bin/errmeter'), 'previous'];
   const r = f.run('examples/codex-notify-emit.sh', ['--previous-notify', JSON.stringify(previous), event]); assert.equal(r.status, 0);
   const records = fs.readFileSync(f.record, 'utf8').trim().split('\n').map(JSON.parse); assert.equal(records.length, 3); assert.deepEqual(records[0].args, ['previous', event]); assert.ok(records[1].args.includes('heartbeat')); assert.ok(records[2].args.includes('Codex turn reported failure')); assert.equal(records[2].detail, event);
 });
-test('job-heartbeat patch applies cleanly against the current host source', t => {
+test('job-heartbeat patch always applies to the checked-in snapshot and live source when present', t => {
+  const snapshotSource = path.join(tools, 'examples/job-heartbeat.snapshot.py');
+  function checkPatch(source) {
+    const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'errmeter-patch-check-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(dir, 'scripts')); fs.copyFileSync(source, path.join(dir, 'scripts/job-heartbeat'));
+    assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: dir }).status, 0);
+    const r = spawnSync('git', ['apply', '--check', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr);
+    const applied = spawnSync('git', ['apply', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' }); assert.equal(applied.status, 0, applied.stderr);
+    assert.match(fs.readFileSync(path.join(dir, 'scripts/job-heartbeat'), 'utf8'), /subprocess.run\(command, check=False, timeout=10/);
+  }
+  checkPatch(snapshotSource);
   const source = path.join(require('node:os').homedir(), 'claude-workspace/family-memory-architecture/scripts/job-heartbeat');
-  if (!fs.existsSync(source)) { t.skip('Current fma scripts/job-heartbeat is absent on this host'); return; }
-  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'errmeter-patch-check-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  fs.mkdirSync(path.join(dir, 'scripts')); fs.copyFileSync(source, path.join(dir, 'scripts/job-heartbeat'));
-  assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: dir }).status, 0);
-  const r = spawnSync('git', ['apply', '--check', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr);
-  const applied = spawnSync('git', ['apply', path.join(tools, 'examples/job-heartbeat.patch')], { cwd: dir, encoding: 'utf8' }); assert.equal(applied.status, 0, applied.stderr);
-  assert.match(fs.readFileSync(path.join(dir, 'scripts/job-heartbeat'), 'utf8'), /subprocess.run\(command, check=False, timeout=10/);
+  if (fs.existsSync(source)) {
+    const snapshotText = fs.readFileSync(snapshotSource, 'utf8').replace(/^# Snapshot of family-memory-architecture scripts\/job-heartbeat at commit d80b0ae\.\n/m, '');
+    assert.equal(fs.readFileSync(source, 'utf8'), snapshotText, 'fma job-heartbeat drifted from the snapshot — refresh the snapshot and the patch');
+    checkPatch(source);
+  }
 });
 test('HOME normalization, dangling symlinks, and invalid UTF-8 are rejected safely', t => {
   const f = fixture(t);

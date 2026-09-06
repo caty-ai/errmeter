@@ -69,6 +69,28 @@ function jsonHook(text,event,entry) {
   const existing=text.slice(span.start+1,end).trim();
   const out=text.slice(0,end)+(existing?",":"")+addition+text.slice(end);JSON.parse(out);return out;
 }
+const claudeCommand="bash \"$HOME/.errmeter/hooks/claude-code-emit.sh\"";
+const claudeEntry={matcher:"*",hooks:[{type:"command",command:claudeCommand}]};
+function codexNotify(text,required=true) {
+  const lines=text.split("\n");let section=false,index=-1,multi=null;
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i],startedInString=multi!==null;
+    if(!startedInString){if(/^\s*\[/.test(line))section=true;if(!section&&/^\s*notify\s*=/.test(line)){if(index>=0)fail("Duplicate notify setting");index=i;}}
+    let quote=null;
+    for(let j=0;j<line.length;j++){
+      if(multi){if(line.slice(j,j+3)===multi){j+=2;multi=null;}else if(multi.charCodeAt(0)===34&&line[j]==="\\")j++;continue;}
+      if(quote){if(quote.charCodeAt(0)===34&&line[j]==="\\")j++;else if(line[j]===quote)quote=null;continue;}
+      if(line[j]==="#")break;
+      if(line.charCodeAt(j)===34||line.charCodeAt(j)===39){if(line[j+1]===line[j]&&line[j+2]===line[j]){multi=line.slice(j,j+3);j+=2;}else quote=line[j];}
+    }
+  }
+  if(multi)fail("Unterminated TOML multiline string");
+  if(index<0){if(required)fail("Missing top-level notify array; add notify = [] first");return {lines,index,prior:null};}
+  const raw=lines[index].replace(/^\s*notify\s*=\s*/,"");let prior;
+  try{prior=JSON.parse(raw);}catch{fail("Cannot safely parse notify: use a single-line JSON-compatible TOML string array without inline comments");}
+  if(!Array.isArray(prior)||!prior.every(v=>typeof v==="string"))fail("Invalid notify array");
+  return {lines,index,prior};
+}
 function desired(target) {
   const files=new Map();
   if(target==="sitter") {
@@ -77,27 +99,10 @@ function desired(target) {
     else {const lines=text.split("\n"), indexes=lines.flatMap((l,i)=>l.includes("$payload")&&l.includes(">>")&&l.includes("$LOG")?[i]:[]);if(indexes.length!==1)fail("Cannot locate unique sitter JSONL append");lines.splice(indexes[0]+1,0,"# errmeter host hook",snippet);files.set(rel,lines.join("\n"));}
   } else if(target==="claude-code") {
     let text=read(rels[target][0],true);
-    const command="bash \"$HOME/.errmeter/hooks/claude-code-emit.sh\"";
-    text=jsonHook(text,"PostToolUseFailure",{matcher:"*",hooks:[{type:"command",command}]});
+    text=jsonHook(text,"PostToolUseFailure",claudeEntry);
     files.set(rels[target][0],text);files.set(rels[target][1],fs.readFileSync(path.join(root,"examples/claude-code-emit.sh"),"utf8"));
   } else {
-    const rel=rels.codex[0],text=read(rel,true), lines=text.split("\n");let section=false,index=-1,multi=null;
-    for(let i=0;i<lines.length;i++){
-      const line=lines[i],startedInString=multi!==null;
-      if(!startedInString){if(/^\s*\[/.test(line))section=true;if(!section&&/^\s*notify\s*=/.test(line)){if(index>=0)fail("Duplicate notify setting");index=i;}}
-      let quote=null;
-      for(let j=0;j<line.length;j++){
-        if(multi){if(line.slice(j,j+3)===multi){j+=2;multi=null;}else if(multi.charCodeAt(0)===34&&line[j]==="\\")j++;continue;}
-        if(quote){if(quote.charCodeAt(0)===34&&line[j]==="\\")j++;else if(line[j]===quote)quote=null;continue;}
-        if(line[j]==="#")break;
-        if(line.charCodeAt(j)===34||line.charCodeAt(j)===39){if(line[j+1]===line[j]&&line[j+2]===line[j]){multi=line.slice(j,j+3);j+=2;}else quote=line[j];}
-      }
-    }
-    if(multi)fail("Unterminated TOML multiline string");
-    if(index<0)fail("Missing top-level notify array; add notify = [] first");
-    const raw=lines[index].replace(/^\s*notify\s*=\s*/,"");let prior;
-    try{prior=JSON.parse(raw);}catch{fail("Cannot safely parse notify: use a single-line JSON-compatible TOML string array without inline comments");}
-    if(!Array.isArray(prior)||!prior.every(v=>typeof v==="string"))fail("Invalid notify array");
+    const rel=rels.codex[0],text=read(rel,true), {lines,index,prior}=codexNotify(text);
     const hook=path.join(home,rels.codex[1]);
     if(!(prior[0]==="bash"&&prior[1]===hook))lines[index]="notify = "+JSON.stringify(["bash",hook,"--previous-notify",JSON.stringify(prior)]);
     files.set(rel,lines.join("\n"));files.set(rels.codex[1],fs.readFileSync(path.join(root,"examples/codex-notify-emit.sh"),"utf8"));
@@ -116,6 +121,104 @@ function saveBackup(changes,kind) {
 function write(entries) {
   for(const c of entries){const p=safe(c.rel);if(c.after===null){if(fs.existsSync(p))fs.unlinkSync(p);continue;}fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o700});const tmp=p+".errmeter-"+process.pid;fs.writeFileSync(tmp,c.after,{mode:c.mode,flag:"wx"});fs.renameSync(tmp,p);}
 }
+function removeEmptyHooksDir() {
+  const dir=path.join(home,".errmeter/hooks"), s=stat(dir);
+  if(!s)return;
+  if(s.isSymbolicLink())fail("Refusing symlink hooks directory");
+  if(!s.isDirectory())fail("Hooks path is not a directory");
+  if(fs.readdirSync(dir).length===0)fs.rmdirSync(dir);
+}
+function lastInstalledAfter(history,rel) {
+  const manifest=history.find(m=>m.kind==="install"&&Array.isArray(m.entries)&&m.entries.some(e=>e.rel===rel));
+  return manifest?.entries.find(e=>e.rel===rel)?.after;
+}
+function restoredAfterInstall(history,target) {
+  const latest=history.find(m=>Array.isArray(m.entries)&&m.entries.some(e=>rels[target].includes(e.rel)));
+  return latest?.kind==="restore";
+}
+function hasClaudeCommand(value) {
+  return Boolean(value&&Array.isArray(value.hooks)&&value.hooks.some(h=>h&&h.command===claudeCommand));
+}
+function targetStatus(target,history) {
+  const restored=restoredAfterInstall(history,target);
+  if(target==="sitter") {
+    const rel=rels.sitter[0], actual=read(rel,true);
+    const snippet=fs.readFileSync(path.join(root,"examples/sitter-on-fail.snippet.sh"),"utf8").trimEnd();
+    const exactMarker="# errmeter host hook\n"+snippet;
+    if(restored)return {state:"not installed",note:false};
+    if(actual.includes(exactMarker))return {state:"installed",note:lastInstalledAfter(history,rel)!==undefined&&lastInstalledAfter(history,rel)!==actual};
+    return {state:actual.includes("# errmeter host hook")||actual.includes(snippet)?"drifted":"not installed",note:false};
+  }
+  if(target==="claude-code") {
+    const rel=rels[target][0], actual=read(rel,true), hook=read(rels[target][1]);
+    const obj=JSON.parse(actual);
+    if(!obj||Array.isArray(obj)||typeof obj!=="object")fail("Settings must be a JSON object");
+    if(Object.hasOwn(obj,"hooks")&&(!obj.hooks||Array.isArray(obj.hooks)||typeof obj.hooks!=="object"))fail("Invalid hooks object");
+    const events=obj.hooks?.PostToolUseFailure;
+    if(events!==undefined&&!Array.isArray(events))fail("Invalid hook event list");
+    if(restored||hook===null)return {state:"not installed",note:false};
+    const markedEntries=events?.filter(hasClaudeCommand)||[], marked=markedEntries.length>0;
+    const exact=markedEntries.length===1&&JSON.stringify(markedEntries[0])===JSON.stringify(claudeEntry);
+    const hookExample=fs.readFileSync(path.join(root,"examples/claude-code-emit.sh"),"utf8");
+    if(hook!==hookExample)return {state:"drifted",note:false};
+    if(exact)return {state:"installed",note:lastInstalledAfter(history,rel)!==undefined&&lastInstalledAfter(history,rel)!==actual};
+    return {state:marked?"drifted":"not installed",note:false};
+  }
+  const rel=rels.codex[0], actual=read(rel,true), parsed=codexNotify(actual,false), hook=read(rels.codex[1]);
+  if(restored||hook===null)return {state:"not installed",note:false};
+  const hookPath=path.join(home,rels.codex[1]);
+  const points=parsed.prior!==null&&parsed.prior[0]==="bash"&&parsed.prior[1]===hookPath;
+  const hookExample=fs.readFileSync(path.join(root,"examples/codex-notify-emit.sh"),"utf8");
+  if(hook!==hookExample)return {state:"drifted",note:false};
+  if(points&&hook===hookExample){
+    const installed=lastInstalledAfter(history,rel);
+    if(installed!==undefined){
+      const prior=codexNotify(installed,false).prior;
+      const sameNotify=JSON.stringify(prior)===JSON.stringify(parsed.prior);
+      return sameNotify?{state:"installed",note:installed!==actual}:{state:"drifted",note:false};
+    }
+    return {state:"installed",note:false};
+  }
+  return {state:points?"drifted":"not installed",note:false};
+}
+let previewRedact;
+try {
+  if(fs.existsSync(path.join(root,"../../bin/errmeter.js")))previewRedact=require(path.join(root,"../../src/redact.js")).redact;
+} catch (_) {}
+function minimalRedact(line) {
+  return line
+    .replace(/(["\x27]?[A-Za-z0-9_.-]*(?:token|secret|password|api[_-]?key)[A-Za-z0-9_.-]*["\x27]?\s*[:=]\s*)(["\x27])(?:\\.|(?!\2).)*\2/ig,"$1$2[REDACTED]$2")
+    .replace(/([A-Za-z0-9_.-]*(?:token|secret|password|api[_-]?key)[A-Za-z0-9_.-]*\s*[:=]\s*)[^,;\s}]+/ig,"$1[REDACTED]");
+}
+function previewLine(line) {console.log(previewRedact?previewRedact(line,[]):minimalRedact(line));}
+function boundedDiff(rel,before,after) {
+  const a=before.split("\n"),b=after.split("\n");let start=0;
+  while(start<a.length&&start<b.length&&a[start]===b[start])start++;
+  let ae=a.length-1,be=b.length-1;
+  while(ae>=start&&be>=start&&a[ae]===b[be]){ae--;be--;}
+  const from=Math.max(0,start-3),aTo=Math.min(a.length-1,ae+3),bTo=Math.min(b.length-1,be+3);
+  previewLine("--- ~/"+rel);previewLine("+++ ~/"+rel);previewLine("@@ -"+(from+1)+","+(aTo-from+1)+" +"+(from+1)+","+(bTo-from+1)+" @@");
+  for(let i=from;i<start;i++)previewLine(" "+a[i]);
+  for(let i=start;i<=ae;i++)previewLine("-"+a[i]);
+  for(let i=start;i<=be;i++)previewLine("+"+b[i]);
+  for(let i=be+1;i<=bTo;i++)previewLine(" "+b[i]);
+}
+function previewChange(change) {
+  const before=read(change.rel);
+  if(change.rel.startsWith(".errmeter/hooks/")&&before===null){
+    previewLine("+ ~/"+change.rel+" ("+Buffer.byteLength(change.after)+" bytes, from tools/host-hooks/examples/"+path.basename(change.rel)+")");return;
+  }
+  if(change.rel===".claude/settings.json"){
+    previewLine("--- ~/"+change.rel);previewLine("+++ ~/"+change.rel);previewLine("@@ JSON path $.hooks.PostToolUseFailure @@");previewLine("+ "+JSON.stringify(claudeEntry));return;
+  }
+  if(change.rel===".codex/config.toml"){
+    const oldNotify=codexNotify(before,false),newNotify=codexNotify(change.after);
+    previewLine("--- ~/"+change.rel);previewLine("+++ ~/"+change.rel);previewLine("@@ top-level notify @@");
+    if(oldNotify.index>=0)previewLine("-"+oldNotify.lines[oldNotify.index]);
+    previewLine("+"+newNotify.lines[newNotify.index]);return;
+  }
+  boundedDiff(change.rel,before||"",change.after);
+}
 try {
   if(!home||!path.isAbsolute(home))fail("HOME must be an absolute path");
   if(mode==="restore") {
@@ -123,24 +226,22 @@ try {
     const m=manifests().find(m=>m.kind==="install"&&(!from||m.id===from));if(!m)fail("No installation backup found");
     if(!Array.isArray(m.entries))fail("Invalid backup manifest");
     const changes=m.entries.map(c=>{safe(c.rel);if(c.before!==null&&typeof c.before!=="string")fail("Invalid backup content");const after=c.before===null?null:Buffer.from(c.before,m.beforeEncoding==="base64"?"base64":"utf8");if(after!==null&&m.beforeEncoding==="base64"&&after.toString("base64")!==c.before)fail("Invalid base64 backup");return {rel:c.rel,after,mode:c.mode};}).filter(c=>{const b=bytes(c.rel);return b===null?c.after!==null:c.after===null||!b.equals(c.after);});
-    if(!changes.length){console.log("Already restored; no changes.");process.exit(0);}
-    const backup=saveBackup(changes,"restore");write(changes);console.log("Restored original bytes from "+m.id+". Replaced files saved in "+backup.id+"; files originally absent removed.");
+    if(!changes.length){removeEmptyHooksDir();console.log("Already restored; no changes.");process.exit(0);}
+    const backup=saveBackup(changes,"restore");write(changes);removeEmptyHooksDir();console.log("Restored original bytes from "+m.id+". Replaced files saved in "+backup.id+"; files originally absent removed.");
   } else if(mode==="status") {
-    let bad=false;const history=manifests().filter(m=>m.kind==="install");
+    let bad=false,inspected=0,failed=0;const history=manifests();
     for(const t of Object.keys(rels)) {
-      let state="installed";
-      try{const want=desired(t);for(const [rel,content] of want){const actual=read(rel);const saved=history.flatMap(m=>m.entries).find(c=>c.rel===rel);if(actual!==content || (saved&&actual!==saved.after))state=saved?"drifted":"not installed";}}
-      catch(error){console.error(t+": cannot inspect: "+error.message);process.exitCode=3;continue;}
-      console.log(t+": "+state);bad ||=state!=="installed";
+      try{const result=targetStatus(t,history);inspected++;console.log(t+": "+result.state+(result.note?" (unrelated local edits present)":""));bad ||=result.state!=="installed";}
+      catch(error){failed++;console.error(t+": cannot inspect"+(/^Missing file:/.test(error.message)?" (missing file)":": "+error.message));}
     }
     const check=cp.spawnSync("errmeter",["status"],{encoding:"utf8",timeout:10000});
     console.log("errmeter on PATH: "+(check.error&&check.error.code==="ENOENT"?"no":"yes"));
-    console.log("errmeter status: "+(check.stdout||check.stderr||"unavailable").trim().split("\n")[0]);if(process.exitCode!==3)process.exitCode=bad?1:0;
+    console.log("errmeter status: "+(check.stdout||check.stderr||"unavailable").trim().split("\n")[0]);process.exitCode=inspected===0?3:(bad||failed?1:0);
   } else {
     const changes=[];
     for(const t of targets)for(const [rel,after] of desired(t)){const before=read(rel);if(before!==after)changes.push({rel,after});}
     if(!changes.length){console.log("Already installed; no changes.");process.exit(0);}
-    if(!apply){console.log("Dry run: no files written. Planned exact replacements (original bytes otherwise retained):");for(const c of changes){const before=read(c.rel)||"";console.log("--- ~/"+c.rel+"\n+++ ~/"+c.rel);console.log(JSON.stringify({before,after:c.after},null,2));}console.log("Run again with --apply to install selected targets.");}
+    if(!apply){previewLine("Dry run: no files written. Planned changes (at most 3 context lines):");for(const c of changes)previewChange(c);previewLine("Run again with --apply to install selected targets.");}
     else {const backup=saveBackup(changes,"install");write(backup.entries);console.log("Installed "+targets.join(", ")+". Backup: ~/.errmeter/backups/"+backup.id+"/");}
   }
 }catch(error){console.error("Cannot continue: "+error.message);process.exitCode=3;}

@@ -20,12 +20,26 @@ esac
 
 stderr_file=$(mktemp "${TMPDIR:-/tmp}/errmeter-stderr.XXXXXX") || exit 3
 trap 'rm -f "$stderr_file"' EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+caught_signal=''
+forward_signal() {
+  caught_signal=$2
+  kill -s "$1" "$child" 2>/dev/null || true
+}
 
-"$@" 2>"$stderr_file"
+exec 3<&0
+"$@" <&3 2>"$stderr_file" &
+child=$!
+exec 3<&-
+trap 'forward_signal HUP 129' HUP
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
+wait "$child"
 rc=$?
+if [ -n "$caught_signal" ]; then
+  trap '' HUP INT TERM
+  wait "$child" 2>/dev/null || true
+  rc=$caught_signal
+fi
 cat "$stderr_file" >&2
 
 if command -v errmeter >/dev/null 2>&1; then

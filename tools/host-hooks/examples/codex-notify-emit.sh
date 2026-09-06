@@ -35,7 +35,10 @@ fi
 [ "${ERRMETER_HOOKS_DISABLE:-0}" = "1" ] && exit 0
 command -v errmeter >/dev/null 2>&1 || exit 0
 
-errmeter emit --kind heartbeat --agent "codex/${USER:-unknown}" >/dev/null 2>&1 || true
+agent_user=$(printf '%s' "${USER:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9._\/-]/-/g')
+[ -n "$agent_user" ] || agent_user=unknown
+
+errmeter emit --kind heartbeat --agent "codex/$agent_user" >/dev/null 2>&1 || true
 is_failure=$(node -e '
   let failed = false;
   try {
@@ -48,7 +51,7 @@ is_failure=$(node -e '
 ' "$event" 2>/dev/null || printf '0')
 
 if [ "$is_failure" = "1" ]; then
-  printf '%s' "$event" | errmeter emit --agent "codex/${USER:-unknown}" \
+  printf '%s' "$event" | errmeter emit --agent "codex/$agent_user" \
     --message "Codex turn reported failure" --detail - >/dev/null 2>&1 || true
 fi
 exit 0
