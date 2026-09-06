@@ -14,15 +14,22 @@ function output(target, text) {
   try { if (typeof target === 'function') target(text); else target.write(text); } catch (_) { /* closed output */ }
 }
 function commandFlags(ctx) { return ['--home', ctx.home, '--config', ctx.configPath]; }
-function reportError(ctx, error, errors = ctx.errors) {
+function recordError(ctx, error, errors = ctx.errors) {
   const message = cleanValue(String(error.message || error.code || 'watch operation failed'), ctx.maskList);
   errors.push(message);
+  return message;
+}
+function emitError(ctx, message) {
   ctx.log(message);
   try {
     ctx.emit([...commandFlags(ctx), '--agent', 'watcher/' + ctx.config.watch.watcher_id,
       '--kind', 'error', '--message=' + message, '--no-flush', '--quiet'], ctx.env,
     { stderr: ctx.log, stdout: () => {} });
   } catch (_) { /* Reporting a loop error must not recurse. */ }
+}
+function reportError(ctx, error, errors = ctx.errors) {
+  const message = recordError(ctx, error, errors);
+  emitError(ctx, message);
 }
 async function upsertNeedsHuman(ctx, issue, summary, failures = ctx.config.watch.escalate_after) {
   const url = issue.url || (ctx.config.sink?.repo ? 'https://github.com/' + ctx.config.sink.repo + '/issues/' + issue.ref : 'issue ' + issue.ref);
@@ -57,40 +64,6 @@ async function removeStaleClaimedLabel(ctx, issue) {
   try {
     await ctx.sink.removeLabels(ctx, issue.ref, ['errmeter:claimed']);
   } catch (_) { ctx.log?.('watch: stale claimed label cleanup failed'); }
-}
-function trackDispatchLabels(sink, tracker) {
-  if (typeof sink.writeOutcome !== 'function') return sink;
-  const wrapped = Object.create(sink);
-  Object.defineProperties(wrapped, {
-    writeOutcome: { value: async (ctx, ref, outcome) => {
-      tracker.outcome = outcome;
-      tracker.written = await sink.writeOutcome(ctx, ref, outcome);
-      return tracker.written;
-    } },
-    getFailure: { value: async (ctx, ref) => {
-      const detail = await sink.getFailure(ctx, ref);
-      if (tracker.written) tracker.refreshed = detail;
-      return detail;
-    } },
-    addLabels: { value: async (ctx, ref, labels) => {
-      const result = await sink.addLabels(ctx, ref, labels);
-      if (tracker.written && labels.includes('errmeter:needs-human')) tracker.needsHumanRepaired = true;
-      return result;
-    } },
-    releaseClaim: { value: async (ctx, ref, options) => {
-      const result = await sink.releaseClaim(ctx, ref, options);
-      if (tracker.written) tracker.releaseLabelsFailed = Boolean(result?.labelsFailed);
-      return result;
-    } }
-  });
-  return wrapped;
-}
-function clearRepairedLabelFailure(result, tracker) {
-  if (!result?.labelsFailed || !tracker.written?.labelsFailed || !tracker.needsHumanRepaired || tracker.releaseLabelsFailed || !tracker.refreshed) return;
-  const labels = new Set((tracker.refreshed.labels || []).map(label => typeof label === 'string' ? label : label.name));
-  const status = tracker.outcome?.status;
-  const other = status === 'repaired' ? 'errmeter:dispatch-failed' : 'errmeter:repaired';
-  if (labels.has('errmeter:dispatched') && labels.has('errmeter:' + status) && !labels.has('errmeter:claimed') && !labels.has(other)) delete result.labelsFailed;
 }
 function scanCursor(ctx, value) {
   const file = path.join(ctx.home, 'state', 'scan_cursor.json');
@@ -178,6 +151,7 @@ async function tick(ctx, options = {}) {
     scanned: 0, unscanned: 0, lookup_incomplete: false, errors: ctx.errors };
   const escalation = { used: false };
   let scanWindow, scanPredecessor;
+  let detailReadFailures = 0;
   const confirmedRefs = new Set(), pendingClaims = new Set();
   const sink = ctx.sink;
   try {
@@ -225,7 +199,10 @@ async function tick(ctx, options = {}) {
         summary.unscanned--;
         confirmedRefs.add(record.ref);
         if (budgetError(error) || ctx.lookup_incomplete) { ctx.lookup_incomplete = true; break; }
-        throw error;
+        detailReadFailures++;
+        if (detailReadFailures === 1) reportError(ctx, new Error('watch: detail read failed (ref=' + record.ref + '): ' +
+          (error.message || 'detail read failed') + (error.code ? ' [' + error.code + ']' : '')));
+        continue;
       }
       if (ctx.lookup_incomplete) break;
       summary.scanned++;
@@ -272,12 +249,9 @@ async function tick(ctx, options = {}) {
       // Dispatch contexts retain their own observation clock and API budget;
       // a future tick must not reset an active lease's response state.
       const dispatchCtx = { ...ctx, apiCalls: 0, lookup_incomplete: false, errors: summary.errors };
-      const labelTracker = {};
-      dispatchCtx.sink = trackDispatchLabels(sink, labelTracker);
       dispatchCtx.now = () => dispatchCtx.boardTime || new Date(ctx.clock()).toISOString();
       const promise = Promise.resolve().then(() => ctx.dispatch(dispatchCtx, detail, claim, { env: ctx.env, signal: ctx.signal }))
         .then(async result => {
-          clearRepairedLabelFailure(result, labelTracker);
           if (result?.status === 'dispatch-failed') summary.dispatch_failed = (summary.dispatch_failed || 0) + 1;
           if (result?.needsHuman) await upsertNeedsHuman(dispatchCtx, detail, summary, result.consecutiveFailures);
         })
@@ -297,6 +271,23 @@ async function tick(ctx, options = {}) {
     await reconcileNeedsHuman(ctx, failures, summary);
   } catch (error) { reportError(ctx, error); }
   finally {
+    if (detailReadFailures > 1) reportError(ctx, new Error('watch: ' + (detailReadFailures - 1) + ' further detail reads failed this tick'));
+    // Contract §5.4: listing (1), detail (2), claim preflight (2), then
+    // claim POST + confirmation pages + claimed-label write (max_pages + 2).
+    // This is a lower bound; extra listing/detail pages require more calls.
+    const maximum = ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60;
+    const minimum = (ctx.config.max_pages_per_list ?? ctx.config.sink?.max_pages_per_list ?? 10) + 7;
+    // lookup_incomplete can also reflect non-budget incompleteness; below the
+    // minimum, the advice to increase the budget is still independently true.
+    if (maximum < minimum && pendingClaims.size && !summary.dispatched && ctx.lookup_incomplete) {
+      const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + maximum + ', minimum=' + minimum +
+        ', lower bound for single-page listings)';
+      const recorded = recordError(ctx, new Error(message), summary.errors);
+      if (!ctx.reportedBudgetStall) {
+        ctx.reportedBudgetStall = true;
+        emitError(ctx, recorded);
+      }
+    }
     if (confirmedRefs.size) {
       // Retry a confirmed eligible row before spending another tick elsewhere.
       const claimIndex = scanWindow.findIndex(record => pendingClaims.has(record.ref));
@@ -355,7 +346,8 @@ async function watch(argv, env = process.env, io = {}) {
       const summary = await tick(ctx, { ...io, once: flags.once });
       code = summary.flush === 3 ? 3 : summary.flush || summary.pending_remaining || summary.lookup_incomplete || summary.errors.length || summary.dispatch_failed ? 1 : 0;
       if (!flags.quiet) output(stdout, flags.json ? JSON.stringify(cleanValue(summary, masks)) + '\n'
-        : 'watch: role=' + summary.role + ' flush=' + summary.flush + ' eligible=' + summary.eligible + ' claimed=' + summary.claimed + ' dispatched=' + summary.dispatched + ' gaps=' + summary.gaps + ' scanned=' + summary.scanned + ' unscanned=' + summary.unscanned + '\n');
+        : 'watch: role=' + summary.role + ' flush=' + summary.flush + ' eligible=' + summary.eligible + ' claimed=' + summary.claimed + ' dispatched=' + summary.dispatched + ' gaps=' + summary.gaps + ' scanned=' + summary.scanned + ' unscanned=' + summary.unscanned +
+          (summary.errors.length ? ' errors=' + summary.errors.join('; ').replace(/[\r\n]+/g, ' ') : '') + '\n');
       if (flags.once || ctx.signal.aborted) break;
       await new Promise(resolve => { wake = resolve; timer = setTimeout(resolve, config.watch.interval_sec * 1000); });
       timer = undefined; wake = undefined;

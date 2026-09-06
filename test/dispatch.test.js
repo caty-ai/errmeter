@@ -353,6 +353,39 @@ test('outcome and escalation label failures remain visible and never skip releas
   assert.equal(fs.existsSync(h.file), false);
 });
 
+for (const scenario of [
+  { name: 'successful in-dispatch needs-human retry clears the repaired outcome label failure', labels: ['errmeter:dispatched', 'errmeter:dispatch-failed'], failed: false },
+  { name: 'successful needs-human add retains unrelated outcome status label failure', labels: ['errmeter:dispatched', 'errmeter:dispatch-failed', 'errmeter:repaired'], failed: true },
+  { name: 'successful needs-human add retains missing outcome status label failure', labels: ['errmeter:dispatched'], failed: true },
+  { name: 'successful needs-human add retains missing dispatched label failure', labels: ['errmeter:dispatch-failed'], failed: true },
+  { name: 'successful needs-human add retains stale claimed label failure', labels: ['errmeter:dispatched', 'errmeter:dispatch-failed', 'errmeter:claimed'], failed: true },
+  { name: 'successful needs-human add retains incomplete outcome label lookup failure', labels: ['errmeter:dispatched', 'errmeter:dispatch-failed'], incomplete: true, failed: true },
+  { name: 'successful needs-human retry retains release label failure', labels: ['errmeter:dispatched', 'errmeter:dispatch-failed'], releaseFailed: true, failed: true },
+  { name: 'failed needs-human retry retains outcome label failure despite healthy related labels', labels: ['errmeter:dispatched', 'errmeter:dispatch-failed'], retryFailed: true, failed: true }
+]) test(scenario.name, async t => {
+  const order = [];
+  const h = harness(t, {
+    async writeOutcome() { order.push('outcome'); return { ref: 42, labelsFailed: true }; },
+    async getFailure(ctx) {
+      order.push('refresh');
+      ctx.lookup_incomplete = Boolean(scenario.incomplete);
+      return { outcomes: [{ status: 'dispatch-failed' }, { status: 'dispatch-failed' }], labels: scenario.labels };
+    },
+    async addLabels(ctx, ref, labels) {
+      order.push('label'); assert.deepEqual(labels, ['errmeter:needs-human']);
+      if (scenario.retryFailed) throw new Error('label unavailable');
+    },
+    async releaseClaim() { order.push('release'); return { labelsFailed: scenario.releaseFailed }; }
+  });
+  h.issue.outcomes = [{ status: 'dispatch-failed' }];
+  const pending = dispatch(h.ctx, h.issue, h.claim, h.options);
+  h.child.emit('close', 1, null);
+  const result = await pending;
+  assert.equal(result.labelsFailed, scenario.failed ? true : undefined);
+  assert.equal(result.needsHuman, true);
+  assert.deepEqual(order, ['outcome', 'refresh', 'label', 'release']);
+});
+
 test('failed outcome and failed release both log while preserving the original error and recovery state', async t => {
   const original = new Error('outcome unavailable');
   let releases = 0;

@@ -97,6 +97,14 @@ One `setTimeout` loop, one tick every `interval_sec`. Two roles, same process, s
 
 `watch` is the **only** long-running process in the system; `install` (#6) registers this one process (in one role) with launchd / systemd / Task Scheduler.
 
+#### Tick summaries
+
+The JSON summary contains `ts`, `role`, `flush`, `eligible`, `claimed`, `pending_remaining`, `dispatched`, `gaps`, `scanned`, `unscanned`, `lookup_incomplete`, and `errors`, plus `dispatch_failed` when a dispatch fails. The text summary reports `role`, `flush`, `eligible`, `claimed`, `dispatched`, `gaps`, `scanned`, and `unscanned`; when errors exist it appends `errors=` with their messages on the same line.
+
+If an eligible claim remains pinned for retry because the API budget cannot elect even one claim, the tick reports `watch: api budget too small to elect one claim (max_api_calls_per_pass=<n>, minimum=<m>, lower bound for single-page listings)`. The parseable `minimum=<m>` is the lower bound `max_pages_per_list + 7` (17 by default) for single-page listings: one listing call, two detail calls, two claim preflight calls, and the claim completion reserve required by contract §5.4. Multipage listing or detail reads may require more, so a budget equal to this lower bound is not guaranteed to suffice for every board. The error is recorded in every stalled tick's JSON summary, `last_watch.json`, and text line, so `--once` exits nonzero; logging and the watcher's self-`emit` happen only once per process context. A new process reports those side effects again. Budgets whose scan bound is zero are not detected at runtime; see #28 (deferred startup validation). Configuration remains valid because that validation requires a contract note and is not added here.
+
+A non-budget detail-read failure records the first concrete error with its issue reference and continues scanning. Additional failures produce one `watch: N further detail reads failed this tick` diagnostic, bounding detail-read reporting to two errors per tick while retaining cursor progress and gap checks.
+
 ## 3. Identity and secrets
 
 - **Agent identity** = `agent` (lower-cased logical name) + `host`. Displayed `agent@host`.
@@ -124,6 +132,8 @@ One `setTimeout` loop, one tick every `interval_sec`. Two roles, same process, s
 | **Clock drift between hosts** | Expiry is judged by board time (`Date` header), not local clocks. | Premature takeover. |
 | **Token missing / wrong scope** | `init --check` / `status --check` fail loudly naming the failing probe; over-scope is a warning; least privilege is confirmed by the human checkpoint #2. emit unaffected. | A silent system: `status` shows "last successful flush: never / N pending". |
 | **Config missing** | emit works with defaults. flush/watch refuse to start with a one-line message pointing at `errmeter init`. | emit failing because of config. |
+
+`removeStaleClaimedLabel` treats `errmeter:claimed` as advisory: marker/comment claim state is authoritative. Its read followed by label removal has an intentional time-of-check/time-of-use race. A delayed label write after claim expiry or release can leave a stale advisory label, which a later eligible tick removes. A claimant that adds the label before cleanup can have its current advisory label removed; the next tick does not necessarily restore it. Both outcomes are harmless to claim safety because marker/comment claim state is authoritative and labels never govern dispatch.
 
 ## 5. Where things live on disk
 
