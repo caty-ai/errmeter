@@ -169,19 +169,25 @@ for (const [name, mutate] of [
   assert.equal(f.calls.length, 0);
 });
 
-test('install preview accepts an unspecified credential file with the exact advisory', async t => {
+test('install preview rejects an unconfigured credential file', async t => {
   const f = fixture(t);
-  fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify({ schema: 1, sink: { type: 'github-issue', repo: 'test/inbox' }, watch: { role: 'agent-host' } }));
-  assert.equal(await install(['--dry-run', '--json'], f.env, f.io), 0);
-  assert.deepEqual(JSON.parse(f.output.pop()).notes, ['credential file not found; install will need it']);
-  assert.equal(await install(['--json'], f.env, f.io), 3);
+  for (const config of [
+    { schema: 1, sink: { type: 'github-issue', repo: 'test/inbox' }, watch: { role: 'agent-host' } },
+    { schema: 1, sink: { type: 'file' }, watch: { role: 'agent-host' }, notify: [{ type: 'telegram', chat_id: '1' }] }
+  ]) {
+    fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify(config));
+    for (const args of [['--dry-run', '--json'], ['--json']]) {
+      assert.equal(await install(args, f.env, f.io), 3);
+      assert.equal(JSON.parse(f.output.pop()).reason, 'watch: credential file is required');
+    }
+  }
 });
 
-test('install preview credential fallback matches only the two approved errors', async t => {
+test('install preview credential fallback matches only a missing credential file', async t => {
   const f = fixture(t); const { ConfigError, resolveConfig } = require('../src/config');
   for (const [message, code, expected] of [
     ['watch: cannot read credential file', undefined, 0],
-    ['watch: credential file is required', undefined, 0],
+    ['watch: credential file is required', undefined, 3],
     ['watch: cannot read credential file', 'EPERM_TOKEN_FILE_MODE', 3],
     ['watch: credential must be a regular file', undefined, 3],
     ['watch: missing or invalid GitHub credential', undefined, 3],
@@ -218,15 +224,15 @@ test('registered record refuses dry-run before config resolution', async t => {
   assert.equal(JSON.parse(f.output.pop()).status, 'already-installed; uninstall first');
 });
 
-for (const code of ['ENOENT', 'EPERM', 'EACCES']) test('uninstall artefact cleanup tolerates ' + code, async t => {
+test('uninstall artefact cleanup tolerates ENOENT', async t => {
   const f = fixture(t);
   assert.equal(await install(['--json'], f.env, f.io), 0);
   const installed = JSON.parse(f.output.pop()); const calls = [];
   const io = { ...f.io, fs: new Proxy(fs, { get(target, key) {
     if (key === 'unlinkSync') return file => {
       if (file === installed.artefactPath) {
-        if (code === 'ENOENT') fs.unlinkSync(file);
-        throw Object.assign(new Error('private-failure'), { code });
+        fs.unlinkSync(file);
+        throw Object.assign(new Error('private-failure'), { code: 'ENOENT' });
       }
       return fs.unlinkSync(file);
     };
@@ -236,9 +242,40 @@ for (const code of ['ENOENT', 'EPERM', 'EACCES']) test('uninstall artefact clean
   const result = JSON.parse(f.output.pop());
   assert.equal(result.status, 'uninstalled');
   assert.ok(calls.some(args => args[0] === 'bootout'));
-  assert.equal(Boolean(result.notes?.some(note => note.includes('could not remove artefact'))), code !== 'ENOENT');
   assert.ok(!JSON.stringify(result).includes('private-failure'));
+  assert.equal(fs.existsSync(installed.artefactPath), false);
   assert.equal(fs.existsSync(path.join(f.home, 'state/install.json')), false);
+});
+
+for (const code of ['EPERM', 'EACCES']) test('uninstall artefact cleanup fails while ' + code + ' leaves it present', async t => {
+  const f = fixture(t);
+  assert.equal(await install(['--json'], f.env, f.io), 0);
+  const installed = JSON.parse(f.output.pop()); const calls = [];
+  const recordPath = path.join(f.home, 'state/install.json');
+  let registered = true;
+  const io = { ...f.io, fs: new Proxy(fs, { get(target, key) {
+    if (key === 'unlinkSync') return file => {
+      if (file === installed.artefactPath) throw Object.assign(new Error('private-failure'), { code });
+      return fs.unlinkSync(file);
+    };
+    return target[key];
+  } }), runner: { async exec(command, args) {
+    calls.push(args);
+    if (args[0] === 'print') return { code: registered ? 0 : 113 };
+    if (args[0] === 'bootout') registered = false;
+    return { code: 0 };
+  } } };
+  const reason = 'artefact still present at ' + installed.artefactPath + ': platform or filesystem operation failed (' + code + '); the service returns at next login — remove it by hand';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    assert.equal(await uninstall(['--json'], f.env, io), 3);
+    const result = JSON.parse(f.output.pop());
+    assert.equal(result.status, 'failed');
+    assert.equal(result.reason, reason);
+    assert.equal(fs.existsSync(installed.artefactPath), true);
+    assert.equal(fs.existsSync(recordPath), true);
+    assert.ok(!JSON.stringify(result).includes('private-failure'));
+  }
+  assert.equal(calls.filter(args => args[0] === 'bootout').length, 1);
 });
 
 test('uninstall recovery guidance has a single command prefix per text line', async t => {

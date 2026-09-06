@@ -143,7 +143,7 @@ async function command(action, argv, env, io) {
       try { spec = buildSpec(flags, env, io); }
       catch (error) {
         if (!(error instanceof ConfigError) || error.code === 'EPERM_TOKEN_FILE_MODE' ||
-            !['watch: cannot read credential file', 'watch: credential file is required'].includes(error.message)) throw error;
+            error.message !== 'watch: cannot read credential file') throw error;
         const resolved = (io.resolveConfig || resolveConfig)(flags, env, { command: 'status' });
         require('./status').localConfig(flags, env, io);
         warnings.push('credential file not found; install will need it');
@@ -238,8 +238,10 @@ async function command(action, argv, env, io) {
         try { files.unlinkSync(spec.artefactPath); }
         catch (error) {
           if (error.code !== 'ENOENT') {
-            notes.push('warning: could not remove artefact at ' + spec.artefactPath + '; ' + safeReason(error));
-            summary.notes = notes;
+            let stillExists = false;
+            try { files.lstatSync(spec.artefactPath); stillExists = true; }
+            catch (statError) { if (statError.code !== 'ENOENT') throw statError; }
+            if (stillExists) return report({ ...summary, status: 'failed', reason: 'artefact still present at ' + spec.artefactPath + ': ' + safeReason(error) + '; the service returns at next login — remove it by hand' }, 3);
           }
         }
       }
