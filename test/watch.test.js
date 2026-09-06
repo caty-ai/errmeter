@@ -189,6 +189,25 @@ test('watch --once at the minimum with an empty board stays silent and exits 0',
   assert.equal(stderr, '');
 });
 
+test('watch --once text summary includes scan coverage and the recorded error', async t => {
+  const message = 'api budget too small to elect one claim';
+  const f = fixture(t, { max_api_calls_per_pass: 17,
+    watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
+  let stdout = '';
+  const code = await watch(['--once'], f.env, {
+    cleanup: () => {}, emit: () => 0, flush: async () => 0,
+    sink: { listOpenFailures: async () => [{ ref: 1, labels: [] }],
+      getFailure: async () => { throw new Error(message); } },
+    checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: () => {}
+  });
+  const line = stdout.trimEnd();
+  assert.equal(code, 1);
+  assert.match(line, /\bscanned=1\b/);
+  assert.match(line, /\bunscanned=0\b/);
+  assert.match(line, new RegExp('errors=.*' + message));
+  assert.equal(line.includes('\n'), false);
+});
+
 test('every stalled tick records the error while one context logs and emits the stall once', async t => {
   const f = fixture(t), logs = [], emits = [];
   let flushes = 0;
