@@ -71,6 +71,7 @@ function jsonHook(text,event,entry) {
 }
 const claudeCommand="bash \"$HOME/.errmeter/hooks/claude-code-emit.sh\"";
 const claudeEntry={matcher:"*",hooks:[{type:"command",command:claudeCommand}]};
+let droppedCodexPreviousNotify=false;
 function codexNotify(text,required=true) {
   const lines=text.split("\n");let section=false,index=-1,multi=null;
   for(let i=0;i<lines.length;i++){
@@ -117,11 +118,13 @@ function desired(target) {
     const hook=path.join(home,rels.codex[1]);
     if(!hasCodexWrapper(prior,hook)) {
       let previous=prior;
-      if(prior[0]==="bash"&&prior[1]===hook) {
-        previous=[];
-        if(prior[2]==="--previous-notify") {
-          try {const inner=JSON.parse(prior[3]);if(Array.isArray(inner)&&inner.every(value=>typeof value==="string"))previous=inner;} catch (_) {}
+      if(prior.includes(hook)) {
+        previous=[];let recovered=false;
+        const hookIndex=prior.indexOf(hook), previousIndex=prior.indexOf("--previous-notify",hookIndex+1);
+        if(previousIndex!==-1) {
+          try {const inner=JSON.parse(prior[previousIndex+1]);if(Array.isArray(inner)&&inner.every(value=>typeof value==="string")){previous=inner;recovered=true;}} catch (_) {}
         }
+        if(!recovered) droppedCodexPreviousNotify=true;
       }
       lines[index]="notify = "+JSON.stringify(["bash",hook,"--previous-notify",JSON.stringify(previous)]);
     }
@@ -149,7 +152,8 @@ function removeEmptyHooksDir() {
   if(fs.readdirSync(dir).length===0)fs.rmdirSync(dir);
 }
 function lastInstalledAfter(history,rel) {
-  const manifest=history.find(m=>m.kind==="install"&&Array.isArray(m.entries)&&m.entries.some(e=>e.rel===rel));
+  const manifest=history.find(m=>Array.isArray(m.entries)&&m.entries.some(e=>e.rel===rel));
+  if(manifest?.kind!=="install")return undefined;
   return manifest?.entries.find(e=>e.rel===rel)?.after;
 }
 function hasClaudeCommand(value) {
@@ -237,7 +241,7 @@ function previewChange(change) {
     previewLine("--- ~/"+change.rel);previewLine("+++ ~/"+change.rel);previewLine("@@ top-level notify @@");
     const prefix=JSON.stringify(["bash","~/"+rels.codex[1],"--previous-notify"]);
     previewLine("+notify = "+prefix.slice(0,-1)+", …]");
-    previewLine("+# [previous notify argv, "+oldNotify.prior.length+" entries, elided]");return;
+    previewLine("@@ previous notify argv: "+oldNotify.prior.length+" entries, elided @@");return;
   }
   boundedDiff(change.rel,before||"",change.after);
 }
@@ -264,7 +268,7 @@ try {
     for(const t of targets)for(const [rel,after] of desired(t)){const before=read(rel);if(before!==after)changes.push({rel,after});}
     if(!changes.length){console.log("Already installed; no changes.");process.exit(0);}
     if(!apply){previewLine("Dry run: no files written. Planned changes (at most 3 context lines):");for(const c of changes)previewChange(c);previewLine("Run again with --apply to install selected targets.");}
-    else {const backup=saveBackup(changes,"install");write(backup.entries);console.log("Installed "+targets.join(", ")+". Backup: ~/.errmeter/backups/"+backup.id+"/");}
+    else {if(droppedCodexPreviousNotify)console.error("Note: previous notify payload was not a JSON string array and will be dropped ([]).");const backup=saveBackup(changes,"install");write(backup.entries);console.log("Installed "+targets.join(", ")+". Backup: ~/.errmeter/backups/"+backup.id+"/");}
   }
 }catch(error){console.error("Cannot continue: "+error.message);process.exitCode=3;}
 ' "$ROOT" "$@"

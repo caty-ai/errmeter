@@ -49,7 +49,7 @@ test('Codex dry-run elides the previous notify argv and collapses HOME', t => {
   assert.doesNotMatch(r.stdout, new RegExp(positionalSecret));
   assert.doesNotMatch(r.stdout, /-notify =/);
   assert.match(r.stdout, /\+notify = \["bash","~\/\.errmeter\/hooks\/codex-notify-emit\.sh","--previous-notify", …\]/);
-  assert.match(r.stdout, /^\+# \[previous notify argv, 3 entries, elided\]$/m);
+  assert.match(r.stdout, /^@@ previous notify argv: 3 entries, elided @@$/m);
   assert.equal(r.stdout.includes(f.dir), false);
   const applied = f.run('errmeter-hooks-install.sh', ['--codex', '--apply']);
   assert.equal(applied.status, 0, applied.stderr);
@@ -179,22 +179,48 @@ test('Codex wrapper detects changed previous argv with history and accepts conte
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stdout, /codex: installed/);
   assert.doesNotMatch(r.stdout, /codex: drifted/);
+
+  const afterRestore = fixture(t), afterRestoreConfig = path.join(afterRestore.dir, '.codex/config.toml');
+  assert.equal(afterRestore.run('errmeter-hooks-install.sh', ['--codex', '--apply']).status, 0);
+  assert.equal(afterRestore.run('errmeter-hooks-restore.sh').status, 0);
+  const afterRestoreHook = path.join(afterRestore.dir, '.errmeter/hooks/codex-notify-emit.sh');
+  fs.mkdirSync(path.dirname(afterRestoreHook), { recursive: true });
+  fs.copyFileSync(path.join(tools, 'examples/codex-notify-emit.sh'), afterRestoreHook);
+  const handWritten = ['bash', afterRestoreHook, '--previous-notify', JSON.stringify(['echo', 'different'])];
+  fs.writeFileSync(afterRestoreConfig, 'notify = ' + JSON.stringify(handWritten) + '\n');
+  r = afterRestore.run('errmeter-hooks-status.sh');
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stdout, /codex: installed/);
+  assert.doesNotMatch(r.stdout, /codex: drifted/);
+  t.diagnostic(`${r.stdout.split('\n').find(line => line.startsWith('codex:'))}; apply -> restore -> hand re-add`);
 });
 test('Codex repairs malformed wrappers without nesting the hook', t => {
-  for (const shape of ['invalid JSON', 'missing payload', 'extra args']) {
+  for (const shape of ['invalid JSON', 'missing payload', 'extra args', '/bin/bash', 'sh', 'hook at non-second position', 'empty inner argv']) {
     const f = fixture(t), config = path.join(f.dir, '.codex/config.toml');
     const hook = path.join(f.dir, '.errmeter/hooks/codex-notify-emit.sh');
     const inner = ['echo', 'recovered'];
     const prior = ['bash', hook, '--previous-notify'];
     if (shape === 'invalid JSON') prior.push('not JSON');
-    if (shape === 'extra args') prior.push(JSON.stringify(inner), 'extra');
+    if (shape === 'extra args' || shape === '/bin/bash' || shape === 'sh') prior.push(JSON.stringify(inner));
+    if (shape === 'extra args') prior.push('extra');
+    if (shape === '/bin/bash') prior[0] = '/bin/bash';
+    if (shape === 'sh') prior[0] = 'sh';
+    if (shape === 'hook at non-second position') prior.splice(0, prior.length, 'env', 'bash', hook, '--previous-notify', JSON.stringify(inner));
+    if (shape === 'empty inner argv') prior.push(JSON.stringify([]));
     fs.writeFileSync(config, 'notify = ' + JSON.stringify(prior) + '\n');
     const r = f.run('errmeter-hooks-install.sh', ['--codex', '--apply']);
     assert.equal(r.status, 0, r.stderr);
     const line = fs.readFileSync(config, 'utf8').trim();
     const repaired = JSON.parse(line.slice('notify = '.length));
-    assert.deepEqual(repaired, ['bash', hook, '--previous-notify', JSON.stringify(shape === 'extra args' ? inner : [])]);
+    const recoverable = !['invalid JSON', 'missing payload'].includes(shape);
+    const expectedInner = shape === 'empty inner argv' ? [] : recoverable ? inner : [];
+    assert.deepEqual(repaired, ['bash', hook, '--previous-notify', JSON.stringify(expectedInner)]);
     assert.equal(line.split(hook).length - 1, 1);
+    if (recoverable) assert.doesNotMatch(r.stderr, /will be dropped/);
+    else {
+      assert.match(r.stderr, /previous notify payload was not a JSON string array and will be dropped \(\[\]\)/);
+      assert.equal(r.stderr.match(/will be dropped/g)?.length, 1);
+    }
     assert.match(f.run('errmeter-hooks-status.sh').stdout, /codex: installed/);
     t.diagnostic(`${shape}: ${line}; hook path count 1`);
   }
