@@ -387,6 +387,7 @@ async function dispatch(ctx, issue, claim, options = {}) {
       // The aggregate outcome failure is repaired only if the refreshed state
       // proves all other outcome label operations already succeeded.
       const labels = new Set((refreshed?.labels || []).map(label => typeof label === 'string' ? label : label.name));
+      // The "other" label is repaired: this path is only reachable for dispatch-failed because escalate_after is > 0 and repaired resets consecutiveFailures to 0.
       if (!ctx.lookup_incomplete && labels.has('errmeter:dispatched') && labels.has('errmeter:' + status) &&
           !labels.has('errmeter:repaired') && !labels.has('errmeter:claimed')) labelsFailed = false;
     }

@@ -7,7 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { spawn } = require('node:child_process');
-const { watch, tick, watchExitCode } = require('../src/watch');
+const { watch, tick } = require('../src/watch');
 const { flush } = require('../src/flush');
 const { checkGaps } = require('../src/heartbeat');
 const { parseWatch, parseRun } = require('../src/cli');
@@ -120,7 +120,7 @@ test('last watch snapshot write failure is reported without rejecting the tick',
   assert.equal(fs.readFileSync(path.join(f.home, 'state'), 'utf8'), 'blocked');
 });
 
-for (const budget of [1, 10, 11, 16, 17, 60]) test('GitHub claim budget ' + (budget <= 11 ? budget + ' reports a zero-scan stall' : budget === 16 ? 'minimum-1 reports the pinned stall' : budget === 17 ? 'minimum elects one claim' : 'default retains healthy text'), async t => {
+for (const budget of [1, 10, 11, 16, 17, 60]) test('GitHub claim budget ' + (budget <= 11 ? budget + ' leaves the zero-scan band silent' : budget === 16 ? 'minimum-1 reports the pinned stall' : budget === 17 ? 'minimum elects one claim' : 'default retains healthy text'), async t => {
   const stamp = '2026-09-06T00:00:00.000Z';
   const fake = await createGithubFake({ now: new Date(stamp) });
   t.after(() => fake.close());
@@ -139,9 +139,9 @@ for (const budget of [1, 10, 11, 16, 17, 60]) test('GitHub claim budget ' + (bud
     checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
   });
   const summary = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
-  const stalled = budget < 17;
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + budget + ', minimum=17); require max_api_calls_per_pass>=minimum; multi-page listings may need more';
-  assert.equal(dispatches, stalled ? 0 : 1);
+  const stalled = budget === 16;
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + budget + ', minimum=17, lower bound for single-page listings)';
+  assert.equal(dispatches, budget >= 17 ? 1 : 0);
   assert.equal(summary.dispatched, dispatches);
   assert.equal(summary.claimed, dispatches);
   assert.equal(code, stalled ? 1 : 0);
@@ -168,58 +168,85 @@ test('watch --once budget 10 with an empty board stays silent and exits 0', asyn
   assert.equal(stderr, '');
 });
 
-for (const budget of [10, 16]) test('budget ' + budget + ' reports once per context while every stalled tick retains its private failure flag', async t => {
+test('watch --once text distinguishes a claimed zero-scan board from one eligible stalled row', async t => {
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17, lower bound for single-page listings)';
+  const scenarios = [
+    { budget: 10, row: { ref: 1, labels: ['errmeter:claimed'] }, code: 0,
+      line: 'watch: role=watcher flush=0 eligible=0 claimed=0 dispatched=0 gaps=0 scanned=0 unscanned=1\n', error: '' },
+    { budget: 16, row: { ref: 1, labels: [] }, code: 1,
+      line: 'watch: role=watcher flush=0 eligible=1 claimed=0 dispatched=0 gaps=0 scanned=1 unscanned=0 errors=' + message + '\n',
+      error: message + '\n' }
+  ];
+  for (const scenario of scenarios) {
+    const f = fixture(t, { max_api_calls_per_pass: scenario.budget,
+      watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
+    let stdout = '', stderr = '';
+    const code = await watch(['--once'], f.env, {
+      cleanup: () => {}, emit: () => 0, flush: async () => 0,
+      sink: { listOpenFailures: async () => [scenario.row], getFailure: async () => scenario.row,
+        claim: async () => { throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); } },
+      checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
+    });
+    assert.equal(code, scenario.code); assert.equal(stdout, scenario.line); assert.equal(stderr, scenario.error);
+  }
+});
+
+test('every stalled tick records the error while one context logs and emits the stall once', async t => {
   const f = fixture(t), logs = [], emits = [];
+  let flushes = 0;
   const makeContext = () => {
     const { ctx } = context({ home: f.home, log: message => logs.push(message),
       emit: args => { if (args.includes('error')) emits.push(args); return 0; }, sink: {
         listOpenFailures: async () => [{ ref: 1 }], getFailure: async () => ({ ref: 1 }),
         claim: async () => { throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); }
+      }, flush: async (args, env, io) => {
+        flushes++;
+        if (flushes === 2) io.onResult({ pending_remaining: 0, errors: ['watch: unrelated tick error'] });
+        return 0;
       } });
-    ctx.config.max_api_calls_per_pass = budget;
+    ctx.config.max_api_calls_per_pass = 16;
     return ctx;
   };
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17, lower bound for single-page listings)';
   const ctx = makeContext();
   const first = await tick(ctx);
-  assert.equal(watchExitCode(first, ctx), 1);
-  assert.equal(ctx.claimBudgetStalled, true);
+  const firstSaved = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
   const second = await tick(ctx);
-  assert.equal(watchExitCode(second, ctx), 1);
-  assert.equal(first.errors.length, 1);
-  assert.deepEqual(second.errors, []);
-  assert.equal(ctx.claimBudgetStalled, true);
-  assert.equal(first.lookup_incomplete, budget === 16);
-  assert.equal(second.lookup_incomplete, budget === 16);
-  assert.equal(logs.length, 1); assert.equal(emits.length, 1);
-  ctx.config.max_api_calls_per_pass = budget - 1;
-  assert.deepEqual((await tick(ctx)).errors, []);
-  assert.equal(ctx.claimBudgetStalled, true);
-  const restarted = makeContext();
-  restarted.config.max_api_calls_per_pass = budget - 1;
-  assert.equal((await tick(restarted)).errors.length, 1);
-  assert.equal(logs.length, 2); assert.equal(emits.length, 2);
-  ctx.sink.listOpenFailures = async () => [];
-  await tick(ctx);
-  assert.equal(ctx.claimBudgetStalled, false);
+  const secondSaved = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
+  assert.deepEqual(first.errors, [message]);
+  assert.deepEqual(second.errors, ['watch: unrelated tick error', message]);
+  assert.deepEqual(firstSaved.errors, first.errors);
+  assert.deepEqual(secondSaved.errors, second.errors);
+  assert.equal(first.lookup_incomplete, true); assert.equal(second.lookup_incomplete, true);
+  assert.deepEqual(logs, [message, 'watch: unrelated tick error']);
+  assert.deepEqual(emits.map(args => args.find(arg => arg.startsWith('--message='))),
+    ['--message=' + message, '--message=watch: unrelated tick error']);
+  assert.deepEqual((await tick(makeContext())).errors, [message]);
+  assert.equal(logs.filter(line => line === message).length, 2);
+  assert.equal(emits.filter(args => args.includes('--message=' + message)).length, 2);
 });
 
-for (const board of ['empty', 'claimed', 'ineligible']) test('tiny GitHub claim budget does not report a stall for ' + board + ' board', async t => {
+for (const board of ['empty', 'claimed-only', 'repaired-only']) test('budgets 10 and 16 stay silent for ' +
+  (board === 'empty' ? 'an ' : 'a ') + board + ' board', async t => {
   const stamp = '2026-09-06T00:00:00.000Z';
   const fake = await createGithubFake({ now: new Date(stamp) });
   t.after(() => fake.close());
   if (board !== 'empty') {
     fake.seedIssue({ body: '<!-- errmeter:failure fp=0123456789abcdef fpv=1 count=1 last=' + stamp + ' -->', labels: ['errmeter:failure'] });
-    fake.seedComment(1, { body: board === 'claimed'
+    fake.seedComment(1, { body: board === 'claimed-only'
       ? '<!-- errmeter:claim watcher=other expires=2026-09-06T01:00:00.000Z ref=new -->'
       : '<!-- errmeter:outcome status=repaired watcher=other ts=' + stamp + ' -->' });
   }
-  const f = fixture(t);
-  const { ctx } = context({ home: f.home, sink: githubSink, http: request });
-  ctx.config.sink = { repo: 'test/inbox', token: 'short', api_base: fake.url };
-  ctx.config.max_api_calls_per_pass = 16;
-  const summary = await tick(ctx, { once: true });
-  assert.equal(summary.dispatched, 0);
-  assert.deepEqual(summary.errors, []);
+  for (const budget of [10, 16]) {
+    const f = fixture(t);
+    const { ctx } = context({ home: f.home, sink: githubSink, http: request });
+    ctx.config.sink = { repo: 'test/inbox', token: 'short', api_base: fake.url };
+    ctx.config.max_api_calls_per_pass = budget;
+    const summary = await tick(ctx, { once: true });
+    assert.equal(summary.dispatched, 0);
+    assert.equal(summary.lookup_incomplete, false);
+    assert.deepEqual(summary.errors, []);
+  }
 });
 
 test('budget exhaustion after a successful dispatch does not report a one-claim stall', async t => {
@@ -405,14 +432,17 @@ test('a failed first detail read still dispatches the second eligible row in the
   let gaps = 0;
   const { ctx } = context({ home: f.home, checkGaps: async () => { gaps++; return { gaps: 0 }; }, sink: {
     listOpenFailures: async () => [{ ref: 1 }, { ref: 2 }],
-    getFailure: async (ctx, ref) => { if (ref === 1) throw new Error('detail unavailable'); return { ref }; },
+    getFailure: async (ctx, ref) => {
+      if (ref === 1) throw Object.assign(new Error('detail unavailable'), { code: 'EDETAIL' });
+      return { ref };
+    },
     claim: async (ctx, ref) => { claims.push(ref); return { won: true }; }
   }, dispatch: async (ctx, detail) => { dispatches.push(detail.ref); return { status: 'repaired' }; } });
   const summary = await tick(ctx, { once: true });
   assert.equal(summary.scanned, 2); assert.equal(summary.unscanned, 0);
   assert.equal(summary.claimed, 1); assert.equal(summary.dispatched, 1);
   assert.equal(summary.lookup_incomplete, false);
-  assert.deepEqual(summary.errors, ['watch: detail read failed (ref=1): detail unavailable']);
+  assert.deepEqual(summary.errors, ['watch: detail read failed (ref=1): detail unavailable [EDETAIL]']);
   assert.deepEqual(claims, [2]); assert.deepEqual(dispatches, [2]); assert.equal(gaps, 1);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: 2 });
 });
