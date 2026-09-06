@@ -27,9 +27,9 @@ One event = one JSON object, UTF-8, no BOM, newline-terminated when written to a
   "id": "6f1c2a3e-9b0d-4c7a-8e21-0f4b9d2c1a55",
   "ts": "2026-09-05T13:07:41.213Z",
   "kind": "error",
-  "agent": "nora",
+  "agent": "nightly",
   "host": "vps-1",
-  "family": "kumaru",
+  "family": "example",
   "task": "x-collector nightly publish",
   "message": "TypeError: Cannot read properties of undefined (reading 'id')",
   "detail": "... last 40 lines, redacted ...",
@@ -47,7 +47,7 @@ One event = one JSON object, UTF-8, no BOM, newline-terminated when written to a
 | `id` | string | yes | emit | UUID v4 (`crypto.randomUUID()`). Globally unique; the idempotency key for the sink. |
 | `ts` | string | yes | emit | ISO 8601 UTC with milliseconds, `Z` suffix. Time of emit. |
 | `kind` | `"error"` \| `"heartbeat"` | yes | emit | Closed enum. Anything else is a usage error at emit and a `dead/` event at flush. |
-| `agent` | string | yes | emit | `[a-z0-9._/-]{1,64}` **after lower-casing** (emit lower-cases; `Nora` and `nora` are one agent). Source: `--agent` > `ERRMETER_AGENT` > config `agent` > `"unknown"`. Watchers use `watcher/<watcher_id>`. |
+| `agent` | string | yes | emit | `[a-z0-9._/-]{1,64}` **after lower-casing** (emit lower-cases; `Nightly` and `nightly` are one agent). Source: `--agent` > `ERRMETER_AGENT` > config `agent` > `"unknown"`. Watchers use `watcher/<watcher_id>`. |
 | `host` | string | yes | emit | `[a-z0-9._-]{1,64}` after lower-casing. Source: config `host` > `os.hostname()` (domain stripped). |
 | `family` | string | no | emit | From config. ≤ 64 chars. Informational only (X-5). |
 | `task` | string | no | emit | ≤ 200 chars after redaction. |
@@ -80,7 +80,7 @@ n = message
 fingerprint = sha256(agent + "\n" + n).hex.slice(0, 16)
 ```
 
-Rules of the algorithm: numbers of 1–3 digits are **kept** (HTTP status, exit codes, errno); quoted strings are **kept** (`reading 'userId'` and `reading 'orgId'` are two problems); paths, URLs, UUIDs, long hex, IPs, ports and line:col positions are wiped. `host` and `task` are not part of the fingerprint. Families that want per-host records put the host in `agent` (`nora@vps-1`).
+Rules of the algorithm: numbers of 1–3 digits are **kept** (HTTP status, exit codes, errno); quoted strings are **kept** (`reading 'userId'` and `reading 'orgId'` are two problems); paths, URLs, UUIDs, long hex, IPs, ports and line:col positions are wiped. `host` and `task` are not part of the fingerprint. Families that want per-host records put the host in `agent` (`nightly@vps-1`).
 
 Normative vectors (tests MUST pin these; `agent = "a"` for all):
 
@@ -308,7 +308,7 @@ File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, no comments. **Secr
 ```json
 {
   "schema": 1,
-  "family": "kumaru",
+  "family": "example",
   "host": "vps-1",
   "agent": "unknown",
   "sink": {
@@ -329,7 +329,7 @@ File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, no comments. **Secr
     "heartbeat_gap_sec": 900,
     "watcher_gap_sec": 600,
     "renotify_sec": 21600,
-    "gaps": { "nora@vps-1": 3600 },
+    "gaps": { "nightly@vps-1": 3600 },
     "dispatch": { "command": ["node", "/opt/family/repair.js"], "timeout_sec": 840, "cwd": "/opt/family", "pass_env": ["PATH", "HOME", "LANG", "TMPDIR", "TEMP", "SYSTEMROOT", "USERPROFILE"] }
   },
   "notify": [
@@ -337,7 +337,7 @@ File: `ERRMETER_CONFIG` → else `<home>/config.json`. JSON, no comments. **Secr
     { "type": "slack", "webhook_url_file": "~/.errmeter/slack-webhook" },
     { "type": "webhook", "url": "https://example.invalid/hook", "headers_file": "~/.errmeter/hook-headers" }
   ],
-  "owner": { "mention": "@shojikumaru" }
+  "owner": { "mention": "@owner" }
 }
 ```
 

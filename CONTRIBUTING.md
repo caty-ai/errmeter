@@ -58,3 +58,7 @@ the matrix cannot catch on its own.
 The `.ps1` path is unverified on Windows from this macOS worktree; treat its
 table as evidence only once someone has actually run it on a real Windows
 host.
+
+## Publication gate
+
+Run `python3 -B tools/check_publication_gate.py --root . --account-slug <maintainer-github-username> --no-registry` before publication. `npm test` runs the same local gate with the maintainer's account slug (Python 3.9+; clearly skipped only when `python3` is absent).
