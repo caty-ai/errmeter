@@ -12,6 +12,9 @@ const DEFAULTS = Object.freeze({
 });
 class ConfigError extends Error {}
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
+function minimumWatchClaimBudget(config) {
+  return (config.max_pages_per_list ?? config.sink?.max_pages_per_list ?? 10) + 7;
+}
 let warnedWindows = false;
 function secretFile(file, options = {}) {
   const command = options.command || 'flush';
@@ -138,6 +141,16 @@ function flushConfig(result, env, options, flags) {
   for (const [section, keys] of [[config, Object.keys(limits)], [config.watch, ['watcher_gap_sec', 'heartbeat_gap_sec', 'renotify_sec', 'notify_confirm_sec']], [config.file, ['scan_max_lines']]]) {
     for (const key of keys) if (!Number.isSafeInteger(section[key]) || section[key] < 0) throw invalid('invalid numeric config');
   }
+  if (command === 'watch' && config.watch.role === 'watcher') {
+    const minimum = minimumWatchClaimBudget(config);
+    if (config.max_api_calls_per_pass < minimum) {
+      const message = 'max_api_calls_per_pass=' + config.max_api_calls_per_pass + ' is below the minimum ' + minimum +
+        ' (max_pages_per_list + 7) needed to elect one claim';
+      const error = invalid(message);
+      error.code = message;
+      throw error;
+    }
+  }
   // Inline credentials are never accepted as sources.
   delete config.sink.token;
   delete config.sink.headers;
@@ -187,4 +200,4 @@ function flushConfig(result, env, options, flags) {
   result.maskList = Array.from(new Set([...require('./redact').buildMaskList(config, env), ...secrets])).sort((a, b) => b.length - a.length);
   return result;
 }
-module.exports = { DEFAULTS, resolveConfig, ConfigError, secretFile };
+module.exports = { DEFAULTS, resolveConfig, ConfigError, secretFile, minimumWatchClaimBudget };

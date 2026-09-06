@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { parseWatch, USAGE } = require('./cli');
-const { resolveConfig } = require('./config');
+const { resolveConfig, minimumWatchClaimBudget } = require('./config');
 const { buildMaskList } = require('./redact');
 const { cleanValue } = require('./sinks/clean');
 const { isEligible, consecutiveFailureCount } = require('./claim');
@@ -276,7 +276,7 @@ async function tick(ctx, options = {}) {
     // claim POST + confirmation pages + claimed-label write (max_pages + 2).
     // This is a lower bound; extra listing/detail pages require more calls.
     const maximum = ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60;
-    const minimum = (ctx.config.max_pages_per_list ?? ctx.config.sink?.max_pages_per_list ?? 10) + 7;
+    const minimum = minimumWatchClaimBudget(ctx.config);
     // lookup_incomplete can also reflect non-budget incompleteness; below the
     // minimum, the advice to increase the budget is still independently true.
     if (maximum < minimum && pendingClaims.size && !summary.dispatched && ctx.lookup_incomplete) {
