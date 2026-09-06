@@ -411,12 +411,16 @@ Allowed and expected: `node:fs` (incl. `promises`, `rmSync`, `mkdirSync({recursi
 | `emit` | `--agent`, `--kind error\|heartbeat` (default `error`), `--message <text>`, `--detail-file <path>` \| `--detail -` (stdin), `--tail <n>`, `--task`, `--meta k=v` (repeatable), `--no-flush` | `0` after the spool write succeeded (incl. fallback and counter mode); `2` usage error only |
 | `flush` | `--dry-run` (list the board writes it would make — groups, counts, target refs — and touch nothing: no lock, no network write, no spool move; reads are allowed) | `0` nothing pending remains; `1` some remain (transient/busy/lookup incomplete); `2` usage error only; `3` config/token error |
 | `watch` | `--role watcher\|agent-host` (default from config), `--once` (single tick), `--interval <sec>` | runs until signal; `--once` returns `0`/`1`/`3` like flush |
-| `init` | `--repo`, `--family`, `--host`, `--role`, `--force`, `--check` | `0` ok (warnings printed for over-scope); `3` token/permission problem (names the failing probe); `4` refused to overwrite |
-| `status` | `--check` (network), `--notify-test` | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present, zero watcher heartbeats known); `3` cannot check |
+| `init` | `--repo`, `--family`, `--host`, `--role`, `--force`, `--check` | `0` ok (warnings printed for over-scope); `2` usage error only; `3` token/permission problem (names the failing probe); `4` refused to overwrite |
+| `status` | `--check` (network), `--notify-test`, `--role watcher\|agent-host` (explicit role to query) | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present, zero watcher heartbeats known); `2` usage error only; `3` cannot check |
 | `install` / `uninstall` | `--role`, `--dry-run`, `--user\|--system` | defined in #6 within these exit-code meanings |
 | `_run` (internal) | `--deadline-ms <ms>`, `--deadline-mono-ms <ms>`, `--timeout <sec>`, `--state <file>`, `-- <command...>` | exit code of the hook; `124` on timeout/deadline kill; `125` spawn error. Not part of the public surface; may change without a version bump. |
 
 Output: without `--json`, one summary line on stdout, diagnostics on stderr. With `--json`, one JSON object on stdout.
+
+Successful install atomically writes `<home>/state/install.json` by temporary file and rename (mode `0600`), with `schema: 1`, `platform`, `role`, `scope`, `label`, `artefactPath`, `nodePath`, `binPath`, and `installedAt`. Dry-run writes no record. An existing record refuses install with exit `4`: if registered, uninstall first; otherwise `stale install record at <path>; run uninstall to clean up`. Status defaults to the recorded role, label and scope before config defaults, warning `installed role <r1> differs from config watch.role <r2>` on mismatch. Explicit `status --role` selects that role in the recorded scope. Without a record it uses `--role` or config and reports `registration record: none`. Uninstall defaults to the recorded target; explicit role/scope flags win with a warning when different. It deletes the record after removing that registration (or cleaning a stale record); targeting another registration preserves the original record.
+
+Windows system wrappers live under `${ProgramData || 'C:\\ProgramData'}\\errmeter\\`; user wrappers remain under the configured home. Both keep `ERRMETER_HOME` pointing to that home. Linux user installs and dry-runs print `note: user services start at login; run 'loginctl enable-linger <user>' to start at boot`. Linux user status runs `loginctl show-user <user> -p Linger` and reports `yes`, `no`, or `unknown` when unavailable.
 
 `watch --once` returns 0 when nothing actionable remains. An unexamined quiescent backlog is not pending; `scanned` and `unscanned` report the bounded scan coverage.
 
@@ -431,6 +435,10 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- v1.7 note (2026-09-06, #6 round-2): persist registration identity for role-safe status/uninstall; add explicit `status --role`, Windows system wrapper location, and Linux user linger diagnostics. No existing config or exit-code change.
+
+- v1.7 note (2026-09-06): #6: exit codes for install/uninstall defined; usage 2 made explicit. No field or format change; no version bump.
 
 - v1.7 note (2026-09-06, #5 round-2): §5.4 describes the watcher's bounded per-tick candidate scan (internal bound, round-robin cursor file, two-call cleanup exemption, `renewClaim` reasons) and §9 the best-effort label writes around the outcome comment. No frozen field or format changed; the watch JSON summary gains advisory `scanned` / `unscanned` (additive), dispatch results gain `labelsFailed`. No config key, marker or exit-code change; no version bump.
 

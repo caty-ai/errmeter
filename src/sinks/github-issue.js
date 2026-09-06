@@ -17,7 +17,7 @@ function unknown(ctx) {
   error.code = 'ELOOKUP_INCOMPLETE';
   return error;
 }
-async function api(ctx, method, target, body, cleanupCall = false) {
+async function api(ctx, method, target, body, cleanupCall = false, returnHttpErrors = false) {
   if (!cleanupCall && (ctx.apiCalls || 0) >= limit(ctx, 'max_api_calls_per_pass', 60)) { const error = unknown(ctx); error.code = 'EAPI_BUDGET'; throw error; }
   const base = ctx.config.sink.api_base || 'https://api.github.com';
   const url = new URL(target, base);
@@ -31,6 +31,7 @@ async function api(ctx, method, target, body, cleanupCall = false) {
     // would consume JSON delimiters and corrupt markers and fenced event JSON.
     body });
   if (response.status < 200 || response.status >= 300) {
+    if (returnHttpErrors) return response;
     const error = new Error('GitHub HTTP ' + response.status);
     error.status = response.status; error.headers = response.headers; throw error;
   }
@@ -38,6 +39,7 @@ async function api(ctx, method, target, body, cleanupCall = false) {
   if (date && Number.isFinite(new Date(date).getTime())) ctx.boardTime = new Date(date).toISOString();
   return response;
 }
+async function request(ctx, method, target, body) { return api(ctx, method, target, body, false, true); }
 function root(ctx) { return '/repos/' + ctx.config.sink.repo; }
 async function list(ctx, target, requireBoardTime = false) {
   let next = target + (target.includes('?') ? '&' : '?') + 'per_page=100';
@@ -367,3 +369,4 @@ async function upsertAlert(ctx, alert) {
 module.exports = { deliverHeartbeat, deliverFailureGroup, listOpenFailures, getFailure, claim, renewClaim, releaseClaim, writeOutcome, listHeartbeats, upsertAlert };
 Object.defineProperty(module.exports, 'addLabels', { value: addLabels });
 Object.defineProperty(module.exports, 'removeLabels', { value: removeLabels });
+Object.defineProperty(module.exports, 'request', { value: request });

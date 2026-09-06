@@ -1,8 +1,11 @@
 'use strict';
 
-const USAGE = 'Usage: errmeter <emit|flush|watch> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
+const USAGE = 'Usage: errmeter <emit|flush|watch|init|status|install|uninstall> [--home DIR] [--config FILE] [--json] [--quiet]\n' +
   'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n' +
   'watch: [--role watcher|agent-host] [--once] [--interval SEC]\n' +
+  'init: [--repo OWNER/REPO] [--family NAME] [--host NAME] [--role watcher|agent-host] [--force] [--check]\n' +
+  'status: [--check] [--notify-test] [--role watcher|agent-host]\n' +
+  'install/uninstall: [--role watcher|agent-host] [--dry-run] [--user|--system]\n' +
   'Values starting with -- must be passed as --flag=value.\n';
 class UsageError extends Error {}
 function parse(argv) {
@@ -108,4 +111,67 @@ function parseRun(argv) {
   }
   return result;
 }
-module.exports = { parse, parseFlush, parseWatch, parseRun, UsageError, USAGE };
+function parseInstall(argv, command = 'install') {
+  const result = {};
+  const boolean = new Set(['json', 'quiet', 'dry-run', 'user', 'system', 'help', 'version']);
+  const values = new Set(['home', 'config', 'role']);
+  for (let i = 0; i < argv.length; i++) {
+    const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
+    if (!match) throw new UsageError(command + ': expected a flag');
+    const key = match[1];
+    if (boolean.has(key)) {
+      if (match[2] !== undefined) throw new UsageError(command + ': boolean flags take no value');
+      result[key] = true;
+    } else {
+      if (!values.has(key)) throw new UsageError(command + ': unknown flag');
+      const value = match[2] === undefined ? argv[++i] : match[2];
+      if (!value || (match[2] === undefined && value.startsWith('--'))) throw new UsageError(command + ': missing flag value');
+      result[key] = value;
+    }
+  }
+  if (result.role !== undefined && !['watcher', 'agent-host'].includes(result.role)) throw new UsageError(command + ': invalid role');
+  if (result.user && result.system) throw new UsageError(command + ': conflicting registration scopes');
+  return result;
+}
+function parseStatus(argv) {
+  const result = {};
+  const boolean = new Set(['json', 'quiet', 'check', 'notify-test', 'help', 'version']);
+  for (let i = 0; i < argv.length; i++) {
+    const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
+    if (!match) throw new UsageError('status: expected a flag');
+    const key = match[1];
+    if (boolean.has(key)) {
+      if (match[2] !== undefined) throw new UsageError('status: boolean flags take no value');
+      result[key] = true;
+    } else {
+      if (key !== 'home' && key !== 'config' && key !== 'role') throw new UsageError('status: unknown flag');
+      const value = match[2] === undefined ? argv[++i] : match[2];
+      if (!value || (match[2] === undefined && value.startsWith('--'))) throw new UsageError('status: missing flag value');
+      if (key === 'role' && !['watcher', 'agent-host'].includes(value)) throw new UsageError('status: invalid role');
+      result[key] = value;
+    }
+  }
+  return result;
+}
+function parseInit(argv) {
+  const result = {};
+  const boolean = new Set(['json', 'quiet', 'force', 'check', 'help', 'version']);
+  const values = new Set(['home', 'config', 'repo', 'family', 'host', 'role']);
+  for (let i = 0; i < argv.length; i++) {
+    const match = /^--([^=]+)(?:=([\s\S]*))?$/.exec(argv[i]);
+    if (!match) throw new UsageError('init: expected a flag');
+    const key = match[1];
+    if (boolean.has(key)) {
+      if (match[2] !== undefined) throw new UsageError('init: boolean flags take no value');
+      result[key] = true;
+    } else {
+      if (!values.has(key)) throw new UsageError('init: unknown flag');
+      const value = match[2] === undefined ? argv[++i] : match[2];
+      if (!value || (match[2] === undefined && value.startsWith('--'))) throw new UsageError('init: missing flag value');
+      result[key] = value;
+    }
+  }
+  if (result.role !== undefined && !['watcher', 'agent-host'].includes(result.role)) throw new UsageError('init: invalid role');
+  return result;
+}
+module.exports = { parse, parseFlush, parseWatch, parseRun, parseInstall, parseStatus, parseInit, UsageError, USAGE };

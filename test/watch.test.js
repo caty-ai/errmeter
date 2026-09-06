@@ -74,6 +74,52 @@ function failingDetailProcess(home, phase, code) {
   });
 }
 
+test('last watch snapshot records each completed tick including early returns and errors', async t => {
+  const f = fixture(t);
+  const { ctx, controller } = context({ home: f.home });
+  const file = path.join(f.home, 'state', 'last_watch.json');
+  const scenarios = [
+    () => {},
+    () => { ctx.config.watch.role = 'agent-host'; },
+    () => {
+      ctx.config.watch.role = 'watcher';
+      ctx.flush = async (args, env, io) => {
+        io.onResult({ backoff_until: '2026-09-07T00:00:00.000Z', pending_remaining: 1 });
+        return 1;
+      };
+    },
+    () => {
+      ctx.flush = async () => 0;
+      ctx.sink.listOpenFailures = async () => { ctx.lookup_incomplete = true; return []; };
+    },
+    () => {
+      ctx.maskList = ['private-token'];
+      ctx.emit = () => { throw new Error('failed private-token'); };
+    },
+    () => { ctx.emit = () => 0; controller.abort(); }
+  ];
+  for (let index = 0; index < scenarios.length; index++) {
+    scenarios[index]();
+    ctx.clock = () => Date.parse('2026-09-06T00:00:00Z') + index * 1000;
+    const summary = await tick(ctx, { once: true });
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(saved, { ...summary, pid: process.pid });
+    assert.equal(saved.ts, new Date(ctx.clock()).toISOString());
+    assert.ok(!fs.readFileSync(file, 'utf8').includes('private-token'));
+    assert.deepEqual(fs.readdirSync(path.dirname(file)), ['last_watch.json']);
+  }
+});
+
+test('last watch snapshot write failure is reported without rejecting the tick', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.home, 'state'), 'blocked');
+  const { ctx } = context({ home: f.home });
+  ctx.config.watch.role = 'agent-host';
+  const summary = await tick(ctx, { once: true });
+  assert.equal(summary.errors.length, 1);
+  assert.equal(fs.readFileSync(path.join(f.home, 'state'), 'utf8'), 'blocked');
+});
+
 test('thirty open failures leave budget for the last candidate and its complete dispatch', async t => {
   const f = fixture(t);
   const stamp = '2026-09-06T00:00:00.000Z';
@@ -164,7 +210,7 @@ for (const scenario of [{ blocked: 30, kind: 'once-failed' }, { blocked: 29, kin
     assert.equal(second.lookup_incomplete, false);
     assert.deepEqual(completed, [scenario.blocked + 1]);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: scenario.blocked + 1 });
-    assert.deepEqual(fs.readdirSync(path.join(f.home, 'state')), ['scan_cursor.json']);
+    assert.deepEqual(fs.readdirSync(path.join(f.home, 'state')).sort(), ['last_watch.json', 'scan_cursor.json']);
   });
 }
 
@@ -402,7 +448,7 @@ test('corrupt heartbeat timestamps fail closed as gaps', async () => {
 });
 
 test('watch and internal runner parsers validate flags without changing emit/flush parsing', () => {
-  assert.match(require('../src/cli').USAGE.split('\n')[0], /<emit\|flush\|watch>/);
+  assert.match(require('../src/cli').USAGE.split('\n')[0], /<emit\|flush\|watch\|init\|status\|install\|uninstall>/);
   assert.deepEqual(parseWatch(['--once', '--interval=2', '--role', 'agent-host']), { once: true, interval: 2, role: 'agent-host' });
   for (const args of [['--interval', '0'], ['--role', 'bad'], ['--once=true'], ['--no-flush']]) assert.throws(() => parseWatch(args));
   const run = parseRun(['--deadline-ms', '100', '--deadline-mono-ms=50', '--timeout', '1', '--state', '/tmp/state', '--', 'node', '-e', '']);
