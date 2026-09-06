@@ -1,0 +1,1 @@
+literal.$secret repeated literal.$secret
