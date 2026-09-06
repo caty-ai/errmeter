@@ -151,6 +151,29 @@ for (const budget of [17, 60]) test('GitHub claim budget ' + (budget === 17 ? 'm
   assert.equal(stderr, '');
 });
 
+test('GitHub claim budget minimum-1 reports the pinned stall through the real sink', async t => {
+  const stamp = '2026-09-06T00:00:00.000Z';
+  const fake = await createGithubFake({ now: new Date(stamp) });
+  t.after(() => fake.close());
+  for (let ref = 1; ref <= 2; ref++) fake.seedIssue({
+    body: '<!-- errmeter:failure fp=0123456789abcdef fpv=1 count=1 last=' + stamp + ' -->', labels: ['errmeter:failure']
+  });
+  const f = fixture(t), logs = [], errorEmits = [];
+  const { ctx } = context({ home: f.home, sink: githubSink, http: request,
+    log: message => logs.push(message),
+    emit: args => { if (args.includes('error')) errorEmits.push(args); return 0; } });
+  ctx.config = { ...ctx.config, max_api_calls_per_pass: 16,
+    sink: { repo: 'test/inbox', token: 'short', api_base: fake.url } };
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17, lower bound for single-page listings)';
+  const first = await tick(ctx, { once: true });
+  const second = await tick(ctx, { once: true });
+  assert.equal(first.dispatched, 0); assert.equal(first.claimed, 0);
+  assert.equal(first.lookup_incomplete, true); assert.deepEqual(first.errors, [message]);
+  assert.equal(second.lookup_incomplete, true); assert.deepEqual(second.errors, [message]);
+  assert.deepEqual(logs, [message]);
+  assert.deepEqual(errorEmits.map(args => args.find(arg => arg.startsWith('--message='))), ['--message=' + message]);
+});
+
 test('watch --once at the minimum with an empty board stays silent and exits 0', async t => {
   const f = fixture(t, { max_api_calls_per_pass: 17,
     watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
@@ -166,23 +189,6 @@ test('watch --once at the minimum with an empty board stays silent and exits 0',
   assert.equal(stderr, '');
 });
 
-test('watch --once at the minimum reports a multipage election stall', async t => {
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=17, minimum=17, lower bound for single-page listings)';
-  const row = { ref: 1, labels: [] };
-  const f = fixture(t, { max_api_calls_per_pass: 17,
-    watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
-  let stdout = '', stderr = '';
-  const code = await watch(['--once'], f.env, {
-    cleanup: () => {}, emit: () => 0, flush: async () => 0,
-    sink: { listOpenFailures: async () => [row], getFailure: async () => row,
-      claim: async () => { throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); } },
-    checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
-  });
-  assert.equal(code, 1);
-  assert.equal(stdout, 'watch: role=watcher flush=0 eligible=1 claimed=0 dispatched=0 gaps=0 scanned=1 unscanned=0 errors=' + message + '\n');
-  assert.equal(stderr, message + '\n');
-});
-
 test('every stalled tick records the error while one context logs and emits the stall once', async t => {
   const f = fixture(t), logs = [], emits = [];
   let flushes = 0;
@@ -196,10 +202,10 @@ test('every stalled tick records the error while one context logs and emits the 
         if (flushes === 2) io.onResult({ pending_remaining: 0, errors: ['watch: unrelated tick error'] });
         return 0;
       } });
-    ctx.config.max_api_calls_per_pass = 17;
+    ctx.config.max_api_calls_per_pass = 16;
     return ctx;
   };
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=17, minimum=17, lower bound for single-page listings)';
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17, lower bound for single-page listings)';
   const ctx = makeContext();
   const first = await tick(ctx);
   const firstSaved = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));

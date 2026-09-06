@@ -152,7 +152,6 @@ async function tick(ctx, options = {}) {
   const escalation = { used: false };
   let scanWindow, scanPredecessor;
   let detailReadFailures = 0;
-  let claimBudgetStalled = false;
   const confirmedRefs = new Set(), pendingClaims = new Set();
   const sink = ctx.sink;
   try {
@@ -233,7 +232,6 @@ async function tick(ctx, options = {}) {
       try { claim = await sink.claim(ctx, detail.ref, { watcherId: ctx.config.watch.watcher_id, ttlSec: ctx.config.watch.claim_ttl_sec }); }
       catch (error) {
         if (budgetError(error) || ctx.lookup_incomplete) {
-          claimBudgetStalled = error?.code === 'EAPI_BUDGET';
           ctx.lookup_incomplete = true;
           break;
         }
@@ -279,7 +277,9 @@ async function tick(ctx, options = {}) {
     // This is a lower bound; extra listing/detail pages require more calls.
     const maximum = ctx.config.max_api_calls_per_pass ?? ctx.config.sink?.max_api_calls_per_pass ?? 60;
     const minimum = minimumWatchClaimBudget(ctx.config);
-    if (claimBudgetStalled && pendingClaims.size && !summary.dispatched) {
+    // lookup_incomplete can also reflect non-budget incompleteness; below the
+    // minimum, the advice to increase the budget is still independently true.
+    if (maximum < minimum && pendingClaims.size && !summary.dispatched && ctx.lookup_incomplete) {
       const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + maximum + ', minimum=' + minimum +
         ', lower bound for single-page listings)';
       const recorded = recordError(ctx, new Error(message), summary.errors);

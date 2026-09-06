@@ -258,8 +258,8 @@ Order: `state/fingerprints.json` cache (`fp → { ref, state }`) → list open I
 - Every list call uses `per_page=100` and follows `Link: rel="next"` until exhausted or `max_pages_per_list` (10) is hit. An exhausted page budget is **incomplete** and MUST be treated as unknown (no create, no dispatch, no alert).
 - `max_api_calls_per_pass` (60) per flush pass and per watch tick. Backoff on 403/429 honours `Retry-After` / `X-RateLimit-Reset`; on 5xx exponential from 5 s. Backoff longer than `lock_refresh_sec` is stored in `state/last_flush.json` and the process exits/skips the tick.
 - Comment reads for a claim decision (§6) MUST be complete (all pages); if not, the watcher does not dispatch.
-- Watch confirms at most `scan_max_confirms = max(0, floor((max_api_calls_per_pass - 10) / 2))` candidates per tick (25 at the default budget). This is an internal bound, not a new config key. Candidates are considered fairly in ascending reference order, with round-robin wrap between ticks. The advisory `errmeter:claimed` label does not affect scan order; an eligible detail carrying a stale label has that label removed best effort. JSON summaries include numeric `scanned` and `unscanned`; `unscanned` is reported in the summary and does not affect the exit code.
-- Scan cursor persistence and window-advance mechanics are described in architecture §2.4.
+- Watch confirms at most `scan_max_confirms = max(0, floor((max_api_calls_per_pass - 10) / 2))` candidates per tick (25 at the default budget). This is an internal bound, not a new config key. It selects a round-robin window in ascending reference order, wrapping at the end. The advisory `errmeter:claimed` label does not affect scan order; an eligible detail carrying a stale label has that label removed best effort. JSON summaries include numeric `scanned` and `unscanned`; `unscanned` is reported in the summary and does not affect the exit code.
+- Scan cursor persistence and window-advance mechanics are specified in architecture §2.4 "Scan window mechanics"; that subsection is **normative for this section** and is changed only with a dated note in this Changelog (§1).
 - `watch --role watcher` refuses at startup a `max_api_calls_per_pass` budget below `max_pages_per_list + 7` (§7).
 - The in-scan needs-human label/alert reconciliation runs at most once per tick; additional threshold failures remain pending. An API/page-budget error during that branch sets `lookup_incomplete` and stops the scan. Actual incomplete detail reads still fail closed. Independent post-dispatch and existing-label alert recovery retain their existing behavior.
 - Cleanup of a just-posted losing or unconfirmed claim may use at most two calls beyond an exhausted budget: DELETE its own returned comment id, then a release POST for that same id if deletion fails. No unrelated claim, ordinary release, outcome, or alert has this exemption.
@@ -384,7 +384,7 @@ Invocation by `watch --role watcher` after `claim` returned `won: true`:
 
 - **Exit code** `0` = repair attempted; the **last non-empty stdout line** (redacted, ≤ 500 chars) is the outcome summary (a PR URL by convention). Any other exit, a timeout (`timeout_sec`; kill = `SIGTERM` to the group, `SIGKILL` after 10 s; Windows `taskkill /T /F`), a fence kill (§6.2), or a spawn error = `dispatch-failed`; the last 20 lines of stderr are recorded **after redaction**.
 - After `escalate_after` consecutive failures: label `errmeter:needs-human`, owner notified once via `upsertAlert` key `needs-human:<issue>`.
-- Outcome label writes before and after the outcome comment are best effort: retry 5xx once, then continue. An unrepaired label failure at return sets `{ ref, labelsFailed: true }` and never suppresses the outcome POST or claim release; a successful in-dispatch retry is the only path that clears that failure state, and the watcher does not infer clearing from a refreshed label set. A refreshed failure count crossing the threshold adds a missing needs-human label during that same dispatch. The dispatcher attempts release even if the outcome POST throws, logs both failures if release also fails, and preserves its recovery state until an outcome is durable.
+- Outcome label writes before and after the outcome comment are best effort: retry 5xx once, then continue. An unrepaired label failure at return sets `{ ref, labelsFailed: true }` and never suppresses the outcome POST or claim release; a successful in-dispatch retry — which re-reads the label set inside the dispatch — is the only path that clears that failure state; the watcher loop performs no clearing of its own. A refreshed failure count crossing the threshold adds a missing needs-human label during that same dispatch. The dispatcher attempts release even if the outcome POST throws, logs both failures if release also fails, and preserves its recovery state until an outcome is durable.
 - **Boundary (D-6)**: the hook MAY open pull requests and comment in target repos with its own credentials. It MUST NOT merge, push to protected branches, or close the inbox Issue; `repaired` means "a fix was proposed". errmeter cannot police the hook's credentials; this rule is restated in `docs/integrations/` for hook authors. errmeter's own token structurally cannot do any of these (§8). **Process boundary, stated honestly**: the hook runs as the watcher's OS user and can read whatever that user can, including `<home>/github-token`. errmeter does not hand the token over, but it cannot hide it from a same-user process; families that need that isolation run `watch --role watcher` under a dedicated OS user with its own home (documented in `docs/integrations/`).
 
 ---
@@ -425,7 +425,7 @@ Windows system wrappers live under `${ProgramData || 'C:\\ProgramData'}\\errmete
 
 `watch --once` returns 0 when nothing actionable remains. An unexamined quiescent backlog is not pending; `scanned` and `unscanned` report the bounded scan coverage.
 
-The watch text summary line carries `scanned=` / `unscanned=` and, when a tick recorded errors, an `errors=<n>` suffix. This text line is non-normative (the JSON summary is the contract), so suffix additions are not a CLI-surface change.
+The watch text summary line carries `scanned=` / `unscanned=` and, when a tick recorded errors, an `errors=` suffix carrying the tick's error messages. This text line is non-normative (the JSON summary is the contract), so suffix additions are not a CLI-surface change.
 
 ---
 
@@ -439,7 +439,7 @@ The watch text summary line carries `scanned=` / `unscanned=` and, when a tick r
 
 ## Changelog
 
-- v1.7 note (2026-09-06, #28): #22 text-line suffix `errors=` and the §5.4/§9/§11 rewordings are clarifications; the only behavioural addition is the watcher startup rejection (existing exit code 3); no field, format, config key or default changes; no version bump.
+- v1.7 note (2026-09-06, #28): #22 text-line suffix `errors=` and the §5.4/§9/§11 rewordings are clarifications; the only behavioural addition is the watcher startup rejection (existing exit code 3) (runtime behaviour unchanged); no field, format, config key or default changes; no version bump.
 
 - v1.7 note (2026-09-06, #6 round-2): persist registration identity for role-safe status/uninstall; add explicit `status --role`, Windows system wrapper location, and Linux user linger diagnostics. No existing config or exit-code change.
 
