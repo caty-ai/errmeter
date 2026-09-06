@@ -29,12 +29,27 @@ function runPython(t, args) {
 // The gate scans the tree that gets published: the tracked files, with their working-copy
 // content. A snapshot keeps the scan deterministic while other test files create and remove
 // temporary fixtures under the repository in parallel.
+function walk(base, rel) {
+  const out = [];
+  for (const entry of fs.readdirSync(path.join(base, rel), { withFileTypes: true })) {
+    if (['.git', 'node_modules', '.omx', '.omc', '.readme-work'].includes(entry.name)) continue;
+    const child = rel ? rel + '/' + entry.name : entry.name;
+    if (entry.isDirectory()) out.push(...walk(base, child));
+    else if (entry.isFile()) out.push(child);
+  }
+  return out;
+}
+
 function trackedSnapshot(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-gate-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const list = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
-  assert.equal(list.status, 0, list.stderr);
-  for (const rel of list.stdout.split('\0').filter(Boolean)) {
+  // Exported source trees (git archive, npm tarball, zip download) have no .git: walk the tree instead,
+  // skipping only the directories that never hold published content.
+  const files = list.status === 0
+    ? list.stdout.split('\0').filter(Boolean)
+    : walk(root, '');
+  for (const rel of files) {
     let data;
     try { data = readFileSync(path.join(root, rel)); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     const dest = path.join(dir, rel);

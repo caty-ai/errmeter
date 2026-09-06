@@ -12,13 +12,13 @@ are down, nobody sees anything and nobody knows where things stopped.
 ## Goal
 
 Every error from every agent lands somewhere durable with its content, so that
-repair agents (nora / doc in our family) get notified and fix it automatically,
+the family's repair agents get notified and fix it automatically,
 and a human is told when nobody is alive to fix it.
 
 ## Owner constraints (fixed)
 
 1. As simple and straight as `sitter`. Generic from day one (other families can use it).
-2. **No GitHub Actions / paid CI dependency.** Our Actions bill is already above 1200 USD/month.
+2. **No GitHub Actions / paid CI dependency.** Hosted CI minutes are a recurring cost that a monitoring tool must not require.
    Monitoring, notification and dispatch run on our own machines (VPS or any always-on box).
 3. Node.js, floor **Node 18** (Claude Code's own minimum). Zero external dependencies,
    no TypeScript build, no language/runtime features newer than 18. Verified on 18/20/22/24 without Actions.
