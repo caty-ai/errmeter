@@ -39,10 +39,10 @@ for (const role of ['watcher', 'agent-host']) for (const scope of ['user', 'syst
   });
   test('schtasks deterministic snapshot: ' + role + '/' + scope, () => {
     const spec = schtasks.plan({ ...context(role, scope), home: 'C:\\Users\\test\\.errmeter', configPath: 'C:\\Users\\test\\.errmeter\\config.json', nodePath: 'C:\\Program Files\\nodejs\\node.exe', binPath: 'C:\\errmeter\\bin\\errmeter.js' });
-    assert.equal(spec.content, '@echo off\r\nsetlocal DisableDelayedExpansion\r\nset "ERRMETER_HOME=C:\\Users\\test\\.errmeter"\r\n"C:\\Program Files\\nodejs\\node.exe" "C:\\errmeter\\bin\\errmeter.js" "watch" "--role" "' + role + '" "--home" "C:\\Users\\test\\.errmeter" "--config" "C:\\Users\\test\\.errmeter\\config.json"\r\nexit /b %errorlevel%\r\n');
+    assert.equal(spec.content, '@echo off\r\nrem Task Scheduler default execution limit is 72 hours; adjust it for continuous operation.\r\nsetlocal DisableDelayedExpansion\r\nset "ERRMETER_HOME=C:\\Users\\test\\.errmeter"\r\n:retry\r\n"C:\\Program Files\\nodejs\\node.exe" "C:\\errmeter\\bin\\errmeter.js" "watch" "--role" "' + role + '" "--home" "C:\\Users\\test\\.errmeter" "--config" "C:\\Users\\test\\.errmeter\\config.json"\r\ntimeout /t 5 /nobreak >nul 2>&1\r\nif errorlevel 1 ping -n 6 127.0.0.1 >nul 2>&1\r\ngoto retry\r\n');
     assert.equal(spec.artefactPath, 'C:\\Users\\test\\.errmeter\\errmeter-' + role + '.cmd');
     assert.equal(spec.install[0].args[4], 'cmd.exe /d /v:off /s /c ""' + spec.artefactPath + '""');
-    assert.deepEqual(spec.install[0].args.slice(5), ['/SC', scope === 'system' ? 'ONSTART' : 'ONLOGON', ...(scope === 'system' ? ['/RU', 'SYSTEM'] : ['/RL', 'LIMITED']), '/F']);
+    assert.deepEqual(spec.install[0].args.slice(5), ['/SC', scope === 'system' ? 'ONSTART' : 'ONLOGON', ...(scope === 'system' ? ['/RU', 'SYSTEM'] : []), '/RL', 'LIMITED', '/F']);
   });
 }
 function fixture(t) {
@@ -65,13 +65,14 @@ test('dry-run previews commands and artefact without any filesystem writes or ru
   assert.ok(!f.output.join('').includes('secret.token.never.render'));
   assert.ok(!fs.existsSync(path.join(f.root, 'Library')));
 });
-test('Linux dry-run renders the conservative journal unit without invoking systemctl', async t => {
+test('Linux dry-run reports an unknown version when the read-only probe is unavailable', async t => {
   const f = fixture(t);
   const denyWrites = new Proxy(fs, { get(target, name) { if (/write|mkdir|unlink|rename|open/i.test(name)) return () => { throw new Error('write attempted'); }; return target[name]; } });
   const io = { ...f.io, platform: 'linux', fs: denyWrites, runner: { exec: () => { throw new Error('runner invoked'); } } };
   assert.equal(await install(['--dry-run', '--json'], f.env, io), 0);
   const result = JSON.parse(f.output.join(''));
   assert.match(result.artefact.content, /StandardOutput=journal/);
+  assert.equal(result.notes[0], '# systemd version unknown — StandardOutput shown as journal');
   assert.equal(result.commands[0].args.at(-1), 'daemon-reload');
 });
 test('install refuses overwrite; uninstall removes exact suffixed registration and is idempotent', async t => {
@@ -152,12 +153,13 @@ test('Windows registers only the task, deletes only that task, and distinguishes
   assert.equal((await schtasks.status(spec, { exec: async () => ({ code: 1, stderr: 'The system cannot find the file specified.' }) })).registered, false);
   await assert.rejects(schtasks.status(spec, { exec: async () => ({ code: 1, stderr: 'Access is denied.' }) }));
 });
-test('registration failure retains its artefact for explicit uninstall and dry-uninstall writes nothing', async t => {
+test('registration failure removes its artefact and dry-uninstall writes nothing', async t => {
   const f = fixture(t);
   f.io.runner.exec = async (command, args) => args[0] === 'print' ? { code: 113 } : { code: 5 };
   assert.equal(await install([], f.env, f.io), 3);
-  assert.equal(await install([], f.env, f.io), 4);
+  assert.equal(await install([], f.env, f.io), 3);
   const before = fs.readdirSync(path.join(f.root, 'Library/LaunchAgents'));
+  assert.deepEqual(before, []);
   assert.equal(await uninstall(['--dry-run', '--json'], f.env, f.io), 0);
   assert.deepEqual(fs.readdirSync(path.join(f.root, 'Library/LaunchAgents')), before);
 });
@@ -168,4 +170,135 @@ test('POSIX system registration refuses missing privileges before filesystem and
       fs: new Proxy({}, { get() { throw new Error('filesystem action before privilege check'); } }) }), 3);
   }
   assert.equal(f.calls.length, 0);
+});
+
+for (const version of [239, 240, 256]) test('Linux dry-run matches installed unit on systemd ' + version, async t => {
+  const f = fixture(t); const calls = [];
+  const io = { ...f.io, platform: 'linux', runner: { async exec(command, args) {
+    calls.push(args);
+    if (args[0] === '--version') return { code: 0, stdout: 'systemd ' + version };
+    if (args.includes('is-enabled')) return { code: 4, stdout: 'not-found' };
+    if (args.includes('is-active')) return { code: 4 };
+    return { code: 0 };
+  } } };
+  assert.equal(await install(['--dry-run', '--json'], f.env, io), 0);
+  assert.deepEqual(calls, [['--version']]);
+  const preview = JSON.parse(f.output.pop());
+  assert.equal(fs.existsSync(preview.artefactPath), false);
+  assert.match(preview.artefact.content, version >= 240 ? /StandardOutput=append:/ : /StandardOutput=journal/);
+  assert.equal(await install(['--json'], f.env, io), 0);
+  assert.equal(fs.readFileSync(preview.artefactPath, 'utf8'), preview.artefact.content);
+});
+
+test('unknown systemd version notes appear in text and JSON without leaking probe failures', async t => {
+  const f = fixture(t);
+  for (const result of [{ code: 0, stdout: 'unknown version' }, { code: 1, stderr: 'private-probe-output' }, null]) {
+    const io = { ...f.io, platform: 'linux', runner: { async exec() {
+      if (result) return result;
+      throw Object.assign(new Error('private-probe-output'), { code: 'ENOENT' });
+    } } };
+    for (const args of [['--dry-run'], ['--dry-run', '--json']]) {
+      f.output.length = 0;
+      assert.equal(await install(args, f.env, io), 0);
+      assert.match(f.output.join(''), /# systemd version unknown — StandardOutput shown as journal/);
+      assert.ok(!f.output.join('').includes('private-probe-output'));
+    }
+  }
+});
+
+for (const platform of ['darwin', 'linux', 'win32']) test(platform + ' registration failure cleans artefact and permits retry', async t => {
+  const f = fixture(t); const artifacts = new Map(); const calls = []; let fail = true;
+  const fakeFs = {
+    lstatSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return {}; },
+    mkdirSync() {},
+    writeFileSync(file, content, options) { assert.equal(options.flag, 'wx'); artifacts.set(file, content); },
+    unlinkSync(file) { assert.ok(artifacts.has(file)); artifacts.delete(file); }
+  };
+  const io = { ...f.io, platform, fs: fakeFs, systemdVersion: 240, runner: { async exec(command, args) {
+    calls.push(args);
+    if (args[0] === 'print') return { code: 113 };
+    if (args[0] === '/Query') return { code: 1, stderr: 'not found' };
+    if (args.includes('is-enabled')) return { code: 4, stdout: 'not-found' };
+    if (args.includes('is-active')) return { code: 4 };
+    if (fail && (args[0] === 'bootstrap' || args[0] === '/Create' || args.includes('enable'))) return { code: 5, stderr: 'private-command-output' };
+    return { code: 0 };
+  } } };
+  assert.equal(await install(['--json'], f.env, io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.rollback, 'removed-created-artefact');
+  assert.equal(result.reason, platform === 'darwin' ? 'launchctl bootstrap failed' : platform === 'linux' ?
+    'registration command failed: systemctl enable --now' : 'registration command failed: schtasks /Create');
+  assert.equal(artifacts.size, 0);
+  assert.ok(!JSON.stringify(result).includes('private-command-output'));
+  if (platform === 'linux') assert.equal(calls.filter(args => args.includes('daemon-reload')).length, 2);
+  fail = false;
+  assert.equal(await install(['--json'], f.env, io), 0);
+  assert.equal(artifacts.size, 1);
+});
+
+test('existing artefacts distinguish absent and present registrations without overwriting', async t => {
+  const f = fixture(t);
+  assert.equal(await install(['--json'], f.env, f.io), 0);
+  const result = JSON.parse(f.output.pop()); const original = fs.readFileSync(result.artefactPath, 'utf8');
+  assert.equal(await install(['--json'], f.env, f.io), 4);
+  const orphan = JSON.parse(f.output.pop());
+  assert.equal(orphan.status, 'artefact-exists-unregistered');
+  assert.equal(orphan.message, 'install: artefact exists at ' + result.artefactPath + ' but the service is not registered — run uninstall to clean up, then install');
+  assert.equal(await install([], f.env, f.io), 4);
+  assert.equal(f.output.pop(), orphan.message + '\n');
+  f.io.runner.exec = async () => ({ code: 0 });
+  assert.equal(await install(['--json'], f.env, f.io), 4);
+  assert.equal(JSON.parse(f.output.pop()).status, 'already-installed; uninstall first');
+  assert.equal(fs.readFileSync(result.artefactPath, 'utf8'), original);
+});
+
+test('failure causes are useful but never echo arbitrary tool errors in text or JSON', async t => {
+  const f = fixture(t);
+  f.io.runner.exec = async () => { throw Object.assign(new Error('private-command-output'), { code: 'ENOENT' }); };
+  for (const args of [[], ['--json']]) {
+    f.output.length = 0; f.errors.length = 0;
+    assert.equal(await install(args, f.env, f.io), 3);
+    assert.match(f.output.join(''), /ENOENT/);
+    assert.ok(![...f.output, ...f.errors].join('').includes('private-command-output'));
+  }
+});
+
+test('rollback errors are reported without masking the registration failure or leaking paths', async t => {
+  const f = fixture(t);
+  f.io.runner.exec = async (command, args) => args[0] === 'print' ? { code: 113 } : { code: 5 };
+  const io = { ...f.io, fs: new Proxy(fs, { get(target, name) {
+    if (name === 'unlinkSync') return () => { throw Object.assign(new Error('private-failure-path'), { code: 'EACCES' }); };
+    return target[name];
+  } }) };
+  assert.equal(await install(['--json'], f.env, io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.reason, 'launchctl bootstrap failed');
+  assert.equal(result.rollback, 'failed');
+  assert.match(result.rollbackReason, /EACCES/);
+  assert.ok(fs.existsSync(result.artefactPath));
+  assert.ok(!JSON.stringify(result).includes('private-failure-path'));
+});
+
+test('Windows system scope checks injected elevation before filesystem or task registration', async t => {
+  const f = fixture(t);
+  for (const action of [install, uninstall]) {
+    assert.equal(await action(['--system', '--json'], f.env, { ...f.io, platform: 'win32', isElevated: false,
+      fs: new Proxy({}, { get() { throw new Error('filesystem access'); } }) }), 3);
+    assert.match(JSON.parse(f.output.pop()).reason, /requires administrator/);
+  }
+  assert.equal(f.calls.length, 0);
+  await schtasks.assertPrivilege({ scope: 'system', isElevated: async () => true }, f.io.runner);
+  await schtasks.assertPrivilege({ scope: 'user', isElevated: false }, f.io.runner);
+  assert.equal(f.calls.length, 0);
+});
+
+test('systemd rejects control whitespace and guards trailing path whitespace in every setting', () => {
+  for (const key of ['home', 'configPath', 'nodePath', 'binPath', 'homedir']) for (const char of ['\t', '\v', '\f', '\r', '\n']) {
+    assert.throws(() => systemd.plan({ ...context('watcher', 'user'), [key]: '/tmp/a' + char + 'b' }), /unsupported systemd path whitespace/);
+  }
+  const rendered = systemd.render({ ...context('watcher', 'user'), home: '/tmp/a b ', systemdVersion: 240 });
+  assert.match(rendered, /Environment="ERRMETER_HOME=\/tmp\/a b \/\."/);
+  assert.match(rendered, /WorkingDirectory=\/tmp\/a b \/\./);
+  assert.match(rendered, /StandardOutput=append:\/tmp\/a b \/logs\/watch\.out\.log/);
+  assert.doesNotMatch(rendered, /[ \t]+$/m);
 });

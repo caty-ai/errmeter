@@ -45,8 +45,10 @@ async function init(argv, env = process.env, io = {}) {
     data = cleaned;
     if (!flags?.quiet) {
       output(stdout, flags?.json ? JSON.stringify(cleaned) + '\n' : 'init: ' +
-        (code === 4 ? 'refused to overwrite config' : code ? 'failed' : 'config created: ' + data.config_path +
-          '; token file: ' + data.token_file + ' (mode 0600)') + '\n');
+        (code === 4 ? 'refused to overwrite config' : code ? 'failed' :
+          (data.config_created ? 'config created: ' : 'config checked: ') + data.config_path +
+          (data.config_created ? data.token_file_exists ? '; token file: ' + data.token_file :
+            '; put the token in ' + data.token_file + ' (mode 0600); it does not exist yet' : '')) + '\n');
       for (const message of [...(data.warnings || []), ...(data.error ? [data.error] : []), ...(data.permission_note ? [data.permission_note] : [])]) output(stderr, cleanValue(message, masks) + '\n');
     }
     return code;
@@ -56,22 +58,30 @@ async function init(argv, env = process.env, io = {}) {
     if (flags.help || flags.version) {
       output(stdout, flags.version ? require('../package.json').version + '\n' : require('./cli').USAGE); return 0;
     }
-    if (!flags.repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(flags.repo)) throw new (require('./cli').UsageError)('init: --repo owner/repo is required');
     const home = path.resolve(flags.home ?? env.ERRMETER_HOME ?? path.join(os.homedir(), '.errmeter'));
     const configPath = path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json'));
+    let existing = false;
     if (!flags.force) {
-      try { disk.lstatSync(configPath); return report(4, { error: 'init: config exists; use --force to overwrite' }); }
+      try { disk.lstatSync(configPath); existing = true; }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
-    for (const directory of [home, path.dirname(configPath), 'spool/pending', 'state', 'logs']) {
-      disk.mkdirSync(path.isAbsolute(directory) ? directory : path.join(home, directory), { recursive: true, mode: 0o700 });
+    if (existing && !flags.check) return report(4, { error: 'init: config exists; use --force to overwrite' });
+    if (!existing) {
+      if (!flags.repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(flags.repo)) throw new (require('./cli').UsageError)('init: --repo owner/repo is required');
+      for (const directory of [home, path.dirname(configPath), 'spool/pending', 'state', 'logs']) {
+        disk.mkdirSync(path.isAbsolute(directory) ? directory : path.join(home, directory), { recursive: true, mode: 0o700 });
+      }
+      try { writeConfig(disk, configPath, template(flags), flags.force); }
+      catch (error) { if (!flags.force && error.code === 'EEXIST') return report(4, { error: 'init: config exists; use --force to overwrite' }); throw error; }
     }
-    try { writeConfig(disk, configPath, template(flags), flags.force); }
-    catch (error) { if (!flags.force && error.code === 'EEXIST') return report(4, { error: 'init: config exists; use --force to overwrite' }); throw error; }
-    result = { home, config_path: configPath, token_file: '~/.errmeter/github-token', token_file_mode: '0600', checked: false, warnings: [] };
+    result = { home, config_path: configPath, config_created: !existing,
+      token_file: '~/.errmeter/github-token', token_file_mode: '0600',
+      token_file_exists: disk.existsSync(path.join(os.homedir(), '.errmeter', 'github-token')), checked: false, warnings: [] };
     if (flags.check) {
       const resolved = resolveConfig({ ...flags, home, config: configPath }, env, { command: 'flush', platform: io.platform });
       masks = [...masks, ...(resolved.maskList || [])];
+      result.token_file = resolved.config.sink.token_file;
+      if (existing) delete result.token_file_exists;
       if (resolved.warning) result.warnings.push(resolved.warning);
       const checked = await probePermissions({ ...resolved, http: io.http });
       Object.assign(result, checked, { warnings: [...result.warnings, ...checked.warnings], checked: true });
@@ -80,7 +90,9 @@ async function init(argv, env = process.env, io = {}) {
   } catch (error) {
     const usage = error instanceof require('./cli').UsageError;
     const message = error instanceof ConfigError || usage || error.probe ? error.message : 'init: cannot create config';
-    return report(usage ? 2 : 3, { ...result, error: message, ...(error.probe ? { failing_probe: error.probe } : {}) });
+    return report(usage ? 2 : 3, { ...result, error: message,
+      warnings: [...(result?.warnings || []), ...(error.warnings || [])],
+      ...(error.probe ? { failing_probe: error.probe } : {}) });
   }
 }
 async function main(argv) {

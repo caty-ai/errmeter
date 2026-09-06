@@ -411,8 +411,8 @@ Allowed and expected: `node:fs` (incl. `promises`, `rmSync`, `mkdirSync({recursi
 | `emit` | `--agent`, `--kind error\|heartbeat` (default `error`), `--message <text>`, `--detail-file <path>` \| `--detail -` (stdin), `--tail <n>`, `--task`, `--meta k=v` (repeatable), `--no-flush` | `0` after the spool write succeeded (incl. fallback and counter mode); `2` usage error only |
 | `flush` | `--dry-run` (list the board writes it would make — groups, counts, target refs — and touch nothing: no lock, no network write, no spool move; reads are allowed) | `0` nothing pending remains; `1` some remain (transient/busy/lookup incomplete); `2` usage error only; `3` config/token error |
 | `watch` | `--role watcher\|agent-host` (default from config), `--once` (single tick), `--interval <sec>` | runs until signal; `--once` returns `0`/`1`/`3` like flush |
-| `init` | `--repo`, `--family`, `--host`, `--role`, `--force`, `--check` | `0` ok (warnings printed for over-scope); `3` token/permission problem (names the failing probe); `4` refused to overwrite |
-| `status` | `--check` (network), `--notify-test` | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present, zero watcher heartbeats known); `3` cannot check |
+| `init` | `--repo`, `--family`, `--host`, `--role`, `--force`, `--check` | `0` ok (warnings printed for over-scope); `2` usage error only; `3` token/permission problem (names the failing probe); `4` refused to overwrite |
+| `status` | `--check` (network), `--notify-test` | `0` healthy; `1` degraded (pending > soft limit, last flush failed, gap present, zero watcher heartbeats known); `2` usage error only; `3` cannot check |
 | `install` / `uninstall` | `--role`, `--dry-run`, `--user\|--system` | defined in #6 within these exit-code meanings |
 | `_run` (internal) | `--deadline-ms <ms>`, `--deadline-mono-ms <ms>`, `--timeout <sec>`, `--state <file>`, `-- <command...>` | exit code of the hook; `124` on timeout/deadline kill; `125` spawn error. Not part of the public surface; may change without a version bump. |
 
@@ -431,6 +431,8 @@ Output: without `--json`, one summary line on stdout, diagnostics on stderr. Wit
 ---
 
 ## Changelog
+
+- v1.7 note (2026-09-06): #6: exit codes for install/uninstall defined; usage 2 made explicit. No field or format change; no version bump.
 
 - v1.7 note (2026-09-06, #5 round-2): §5.4 describes the watcher's bounded per-tick candidate scan (internal bound, round-robin cursor file, two-call cleanup exemption, `renewClaim` reasons) and §9 the best-effort label writes around the outcome comment. No frozen field or format changed; the watch JSON summary gains advisory `scanned` / `unscanned` (additive), dispatch results gain `labelsFailed`. No config key, marker or exit-code change; no version bump.
 

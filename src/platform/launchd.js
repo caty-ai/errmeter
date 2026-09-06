@@ -40,8 +40,12 @@ const unavailable = result => /(?:unknown|unrecognized|unsupported|not supported
 async function execute(spec, runner, action) {
   const item = plan(spec)[action][0];
   let result = await runner.exec(item.command, item.args);
-  if (result.code !== 0 && unavailable(result)) result = await runner.exec('launchctl', [action === 'install' ? 'load' : 'unload', '-w', artefactPath(spec.role, spec.scope, spec)]);
-  if (result.code !== 0) throw new Error('launchctl ' + action + ' failed');
+  let subcommand = item.args[0];
+  if (result.code !== 0 && unavailable(result)) {
+    subcommand = action === 'install' ? 'load' : 'unload';
+    result = await runner.exec('launchctl', [subcommand, '-w', artefactPath(spec.role, spec.scope, spec)]);
+  }
+  if (result.code !== 0) throw new Error('launchctl ' + subcommand + ' failed');
 }
 async function status(spec, runner) {
   const item = plan(spec).query;

@@ -36,11 +36,28 @@ test('local status needs no token, reads no board and reports successful flush a
 
 test('pending threshold is strictly greater and temporary writes are excluded', async t => {
   const f = fixture(t, { spool: { pending_soft_limit: 1 } });
+  lastFlush(f, { ts: '2026-09-05T23:59:00Z', errors: [] });
   const pending = path.join(f.home, 'spool', 'pending'); fs.mkdirSync(pending, { recursive: true });
   fs.writeFileSync(path.join(pending, 'one.json'), '{}'); fs.writeFileSync(path.join(pending, 'writing.tmp'), 'partial');
   assert.equal(await status([], f.env, f.io), 0);
   fs.writeFileSync(path.join(pending, 'counters.log'), 'record');
   assert.equal(await status([], f.env, f.io), 1); assert.equal(f.out().result.pending, 2);
+});
+
+test('status usage errors have their own summary and diagnostic', async t => {
+  const f = fixture(t);
+  assert.equal(await status(['--unknown-option'], f.env, f.io), 2);
+  assert.equal(f.out().stdout, 'status: usage error\n');
+  assert.match(f.out().stderr, /unknown/i);
+});
+
+test('configured unregistered host without a flush is degraded', async t => {
+  const f = fixture(t);
+  assert.equal(await status([], f.env, f.io), 1);
+  assert.match(f.out().stdout, /^status: degraded/);
+  assert.match(f.out().stderr, /no flush recorded yet/);
+  assert.equal(f.out().result.last_successful_flush, null);
+  assert.equal(f.out().result.watcher.registered, false);
 });
 
 test('failed last flush is degraded and exposed error is redacted', async t => {
@@ -80,6 +97,7 @@ test('check without known watchers degrades and sends no notification', async t 
 
 test('heartbeat age alone does not invent a gap alert', async t => {
   const f = fixture(t); const record = { agent: 'watcher/test', host: 'test', role: 'watcher', lastSeen: '2026-09-05T23:59:00Z' };
+  lastFlush(f, { ts: '2026-09-05T23:59:00Z', errors: [] });
   const io = { ...f.io, sink: { listHeartbeats: async () => [record] } };
   assert.equal(await status(['--check'], f.env, io), 0);
   record.lastSeen = '2026-09-05T00:00:00Z'; assert.equal(await status(['--check'], f.env, io), 0);
@@ -88,6 +106,7 @@ test('heartbeat age alone does not invent a gap alert', async t => {
 
 test('explicit notify test tries configured channels and failure degrades', async t => {
   const f = fixture(t, { notify: [{ type: 'webhook', url: 'https://example.invalid/test' }] });
+  lastFlush(f, { ts: '2026-09-05T23:59:00Z', errors: [] });
   let sends = 0;
   const io = { ...f.io, http: async request => {
     sends++; assert.equal(request.method, 'POST');
@@ -123,12 +142,27 @@ test('last flush age and missing registered watch degrade without penalizing a s
 test('GitHub check performs probes against fake and reads heartbeat and open gap alerts', async t => {
   const fake = await createGithubFake({ now: '2026-09-06T00:00:00Z' }); t.after(() => fake.close());
   const f = fixture(t, { sink: { type: 'github-issue', repo: 'test/inbox', api_base: fake.url } });
+  lastFlush(f, { ts: '2026-09-05T23:59:00Z', errors: [] });
   const env = { ...f.env, ERRMETER_GITHUB_TOKEN: ['sample', 'board'].join('.') };
   fake.seedIssue({ labels: ['errmeter:heartbeat'], body: '<!-- errmeter:heartbeat agent=watcher/test host=test role=watcher ts=2026-09-05T23:59:00Z -->' });
   assert.equal(await status(['--check'], env, f.io), 0);
   assert.equal(fake.issues.find(row => row.title === '[errmeter] probe').state, 'closed');
   fake.seedIssue({ labels: ['errmeter:alert'], body: '<!-- errmeter:alert key=all-watchers-silent -->' });
   assert.equal(await status(['--check'], env, f.io), 1);
+});
+
+test('status reports the probe Issue left open without response secrets', async t => {
+  const f = fixture(t, { sink: { type: 'github-issue', repo: 'test/inbox' } });
+  const secret = ['sample', 'board'].join('.');
+  const http = async request => {
+    if (request.method === 'POST' && new URL(request.url).pathname.endsWith('/issues')) return { status: 201, body: { number: 42 } };
+    if (request.method === 'PATCH') return { status: 403, body: { message: secret } };
+    return { status: 200, body: [] };
+  };
+  assert.equal(await status(['--check'], { ...f.env, ERRMETER_GITHUB_TOKEN: secret }, { ...f.io, http }), 3);
+  assert.match(f.out().stderr, /warning: probe Issue #42 left open — close it manually/);
+  assert.equal(f.out().stderr.includes(secret), false);
+  assert.equal(f.out().result.failing_probe, 'PATCH /repos/test/inbox/issues/42');
 });
 
 test('permission probe rejects non-existence 422 and never includes transport secrets', async () => {

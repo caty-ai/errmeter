@@ -21,10 +21,19 @@ async function probePermissions(ctx) {
   const root = '/repos/' + ctx.config.sink.repo;
   const probes = [];
   const warnings = [];
+  const requestTarget = target => {
+    const base = new URL(ctx.config.sink.api_base || 'https://api.github.com');
+    const relative = new URL(target, 'https://errmeter.invalid');
+    const prefix = base.pathname.replace(/\/+$/, '');
+    base.pathname = prefix + relative.pathname;
+    base.search = relative.search;
+    base.hash = '';
+    return base.toString();
+  };
   async function probe(method, target, body, accept = response => response.status >= 200 && response.status < 300) {
     const name = method + ' ' + target;
     let response;
-    try { response = await githubIssue.request(ctx, method, target, body); }
+    try { response = await githubIssue.request(ctx, method, requestTarget(target), body); }
     catch (_) { const error = new Error('Permission probe failed: ' + name + ' (transport)'); error.probe = name; throw error; }
     if (!response || !accept(response)) {
       const status = Number.isInteger(response?.status) ? response.status : 'invalid response';
@@ -47,7 +56,12 @@ async function probePermissions(ctx) {
     const error = new Error('Permission probe failed: POST ' + root + '/issues (missing Issue number)');
     error.probe = 'POST ' + root + '/issues'; throw error;
   }
-  await probe('PATCH', root + '/issues/' + created.body.number, { state: 'closed' });
+  try {
+    await probe('PATCH', root + '/issues/' + created.body.number, { state: 'closed' });
+  } catch (error) {
+    error.warnings = ['warning: probe Issue #' + created.body.number + ' left open — close it manually'];
+    throw error;
+  }
   for (const suffix of ['/contents/', '/pulls?per_page=1']) {
     const response = await probe('GET', root + suffix, undefined, result => [200, 403, 404].includes(result.status));
     if (response.status === 200) warnings.push('over-scoped (warning): GET ' + root + suffix + ' returned 200');
@@ -122,7 +136,7 @@ async function status(argv, env = process.env, io = {}) {
     io.onResult?.(cleaned);
     if (!flags?.quiet) {
       if (flags?.json) output(stdout, JSON.stringify(cleaned) + '\n');
-      else output(stdout, 'status: ' + (code === 3 ? 'cannot check' : code ? 'degraded' : 'healthy') +
+      else output(stdout, 'status: ' + (code === 2 ? 'usage error' : code === 3 ? 'cannot check' : code ? 'degraded' : 'healthy') +
         (data.pending === undefined ? '' : ', config=' + data.config_path + ', role=' + data.role + ', ' + data.pending +
         ' pending, last successful flush: ' + (data.last_successful_flush || 'never') +
         ', last flush: ' + (data.last_flush.ts || 'never') + ' pending=' + data.last_flush.pending_remaining + ' errors=' + data.last_flush.errors +
@@ -187,14 +201,17 @@ async function status(argv, env = process.env, io = {}) {
       result.notify = await (io.notify || require('./notify').notify)(ctx, {
         key: 'notify-test', title: '[errmeter] notify test', body: config.host + ' ' + new Date(ctx.clock()).toISOString() });
     }
+    if (!last.ts) result.warnings.push('no flush recorded yet');
     if (result.watcher_heartbeats === 0) result.warnings.push('no watcher known');
-    const degraded = result.pending > result.pending_soft_limit || flushFailed || flushStale || watcher.registered && !lastWatch.ts ||
+    const degraded = !last.ts || result.pending > result.pending_soft_limit || flushFailed || flushStale || watcher.registered && !lastWatch.ts ||
       result.gaps > 0 || result.watcher_heartbeats === 0 || result.notify?.failed?.length;
     return report(degraded ? 1 : 0, result);
   } catch (error) {
     const usage = error instanceof require('./cli').UsageError;
     const message = error instanceof ConfigError || usage || error.probe ? error.message : 'status: cannot check local or board state';
-    return report(usage ? 2 : 3, { ...result, error: message, ...(error.probe ? { failing_probe: error.probe } : {}) });
+    return report(usage ? 2 : 3, { ...result, error: message,
+      warnings: [...(result?.warnings || []), ...(error.warnings || [])],
+      ...(error.probe ? { failing_probe: error.probe } : {}) });
   }
 }
 

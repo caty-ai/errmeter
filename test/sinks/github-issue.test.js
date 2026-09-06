@@ -43,10 +43,56 @@ test('raw request returns HTTP errors while preserving sink request invariants',
   });
   assert.equal(calls, 1);
   assert.equal(ctx.apiCalls, 1);
-  assert.equal(ctx.boardTime, '2026-09-05T12:00:00.000Z');
+  assert.equal(ctx.boardTime, undefined);
   await assert.rejects(sink.request(ctx, 'GET', 'https://other.example.test/repos/test/inbox'), { code: 'ELOOKUP_INCOMPLETE' });
   assert.equal(calls, 1);
   assert.equal(ctx.apiCalls, 1);
+});
+
+test('raw 404 and ordinary HTTP errors leave established boardTime unchanged', async () => {
+  let calls = 0;
+  const response = { status: 404, headers: { date: 'Sat, 05 Sep 2026 12:00:00 GMT' }, body: { message: 'not found' } };
+  const ctx = { boardTime: '2026-09-05T11:00:00.000Z',
+    config: { sink: { repo: 'test/inbox', token: 'short' } },
+    http: async () => { calls++; return response; } };
+  assert.equal(await sink.request(ctx, 'GET', '/repos/test/inbox'), response);
+  assert.equal(calls, 1);
+  assert.equal(ctx.apiCalls, 1);
+  assert.equal(ctx.boardTime, '2026-09-05T11:00:00.000Z');
+  await assert.rejects(sink.listOpenFailures(ctx), { status: 404 });
+  assert.equal(calls, 2);
+  assert.equal(ctx.apiCalls, 2);
+  assert.equal(ctx.boardTime, '2026-09-05T11:00:00.000Z');
+});
+
+test('raw successful request preserves response, body, and API budget', async () => {
+  let calls = 0;
+  const body = { title: 'probe' };
+  const response = { status: 201, headers: { date: 'Sat, 05 Sep 2026 12:00:00 GMT' }, body: { number: 1 } };
+  const ctx = { config: { max_api_calls_per_pass: 1, sink: { repo: 'test/inbox', token: 'short' } },
+    http: async options => {
+      calls++;
+      assert.equal(options.method, 'POST');
+      assert.equal(options.url, 'https://api.github.com/repos/test/inbox/issues');
+      assert.equal(options.body, body);
+      return response;
+    } };
+  assert.equal(await sink.request(ctx, 'POST', '/repos/test/inbox/issues', body), response);
+  assert.equal(ctx.boardTime, stamp);
+  await assert.rejects(sink.request(ctx, 'POST', '/repos/test/inbox/issues', body), { code: 'EAPI_BUDGET' });
+  assert.equal(calls, 1);
+  assert.equal(ctx.apiCalls, 1);
+});
+
+test('raw request propagates transport errors without retrying', async () => {
+  let calls = 0;
+  const error = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+  const ctx = { config: { sink: { repo: 'test/inbox', token: 'short' } },
+    http: async () => { calls++; throw error; } };
+  await assert.rejects(sink.request(ctx, 'GET', '/repos/test/inbox'), caught => caught === error);
+  assert.equal(calls, 1);
+  assert.equal(ctx.apiCalls, 1);
+  assert.equal(ctx.boardTime, undefined);
 });
 
 test('cheap failure summaries cost one list and require confirmation', async t => {

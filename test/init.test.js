@@ -101,9 +101,46 @@ test('init cleans temporary file after write failure without touching original f
 
 test('init requires repo and prints config and token paths with private mode', async t => {
   const f = fixture(t);
+  const disk = Object.create(fs); disk.existsSync = () => false;
   assert.equal(await init([], f.env, f.io), 2);
-  assert.equal(await init(['--repo', 'test/inbox'], f.env, f.io), 0);
+  assert.equal(await init(['--repo', 'test/inbox'], f.env, { ...f.io, fs: disk }), 0);
   assert.ok(f.out().stdout.includes(path.join(f.home, 'config.json')));
-  assert.ok(f.out().stdout.includes('~/.errmeter/github-token (mode 0600)'));
+  assert.ok(f.out().stdout.includes('put the token in ~/.errmeter/github-token (mode 0600); it does not exist yet'));
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'config.json'))).family, '');
+});
+
+test('init check probes existing config and api_base without rewriting or requiring repo', async t => {
+  const f = fixture(t); const file = path.join(f.home, 'config.json'); const requests = [];
+  const original = JSON.stringify({ schema: 1, host: 'existing', sink: {
+    type: 'github-issue', repo: 'existing/board', api_base: 'https://board.example.invalid/api/v3',
+    token_file: '/existing/token'
+  }, watch: { role: 'agent-host' } }, null, 4) + '\n';
+  fs.writeFileSync(file, original, { mode: 0o600 });
+  const before = fs.statSync(file);
+  const env = { ...f.env, ERRMETER_GITHUB_TOKEN: ['sample', 'board'].join('.') };
+  const disk = Object.create(fs);
+  disk.mkdirSync = disk.openSync = () => assert.fail('check must not create or rewrite local files');
+  assert.equal(await init(['--check'], env, { ...f.io, fs: disk, http: transport(requests) }), 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), original);
+  assert.equal(fs.statSync(file).mtimeMs, before.mtimeMs);
+  assert.equal(fs.statSync(file).mode, before.mode);
+  assert.ok(requests.length > 0);
+  assert.ok(requests.every(request => request.url.startsWith('https://board.example.invalid/api/v3/repos/existing/board')));
+  assert.equal(f.out().result.config_created, false);
+  assert.equal(f.out().result.checked, true);
+  assert.equal(f.out().result.token_file, '/existing/token');
+  assert.match(f.out().stdout, /init: config checked:/);
+  assert.equal(await init(['--repo', 'ignored/new', '--check'], env, { ...f.io, fs: disk,
+    http: transport([], { fail: 'GET /api/v3/repos/existing/board' }) }), 3);
+  assert.equal(fs.readFileSync(file, 'utf8'), original);
+});
+
+test('init check warns when closing the created probe Issue fails', async t => {
+  const f = fixture(t); const requests = [];
+  assert.equal(await init(['--repo', 'test/inbox', '--check', '--json'],
+    { ...f.env, ERRMETER_GITHUB_TOKEN: ['sample', 'board'].join('.') },
+    { ...f.io, http: transport(requests, { fail: 'PATCH /repos/test/inbox/issues/9' }) }), 3);
+  assert.match(f.out().stderr, /warning: probe Issue #9 left open — close it manually/);
+  assert.match(JSON.parse(f.out().stdout).warnings[0], /Issue #9/);
+  assert.equal(f.out().stderr.includes('private response'), false);
 });

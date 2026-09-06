@@ -30,12 +30,13 @@ async function api(ctx, method, target, body, cleanupCall = false, returnHttpErr
     // Compose redacted text at its source. Redacting this serialized envelope
     // would consume JSON delimiters and corrupt markers and fenced event JSON.
     body });
-  const date = response.date || response.headers?.date || response.headers?.Date;
-  if (date && Number.isFinite(new Date(date).getTime())) ctx.boardTime = new Date(date).toISOString();
-  if (!returnHttpErrors && (response.status < 200 || response.status >= 300)) {
+  if (response.status < 200 || response.status >= 300) {
+    if (returnHttpErrors) return response;
     const error = new Error('GitHub HTTP ' + response.status);
     error.status = response.status; error.headers = response.headers; throw error;
   }
+  const date = response.date || response.headers?.date || response.headers?.Date;
+  if (date && Number.isFinite(new Date(date).getTime())) ctx.boardTime = new Date(date).toISOString();
   return response;
 }
 async function request(ctx, method, target, body) { return api(ctx, method, target, body, false, true); }
