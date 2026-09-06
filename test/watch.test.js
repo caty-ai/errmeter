@@ -6,10 +6,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { watch, tick } = require('../src/watch');
 const { flush } = require('../src/flush');
 const { checkGaps } = require('../src/heartbeat');
+const { resolveConfig, ConfigError } = require('../src/config');
 const { parseWatch, parseRun } = require('../src/cli');
 const { request } = require('../src/http');
 const githubSink = require('../src/sinks/github-issue');
@@ -120,11 +121,11 @@ test('last watch snapshot write failure is reported without rejecting the tick',
   assert.equal(fs.readFileSync(path.join(f.home, 'state'), 'utf8'), 'blocked');
 });
 
-for (const budget of [1, 10, 11, 16, 17, 60]) test('GitHub claim budget ' + (budget <= 11 ? budget + ' leaves the zero-scan band silent' : budget === 16 ? 'minimum-1 reports the pinned stall' : budget === 17 ? 'minimum elects one claim' : 'default retains healthy text'), async t => {
+for (const budget of [17, 60]) test('GitHub claim budget ' + (budget === 17 ? 'minimum elects one claim' : 'default retains healthy text'), async t => {
   const stamp = '2026-09-06T00:00:00.000Z';
   const fake = await createGithubFake({ now: new Date(stamp) });
   t.after(() => fake.close());
-  const candidateCount = budget <= 11 ? 1 : 2;
+  const candidateCount = 2;
   for (let ref = 1; ref <= candidateCount; ref++) fake.seedIssue({
     body: '<!-- errmeter:failure fp=0123456789abcdef fpv=1 count=1 last=' + stamp + ' -->', labels: ['errmeter:failure']
   });
@@ -139,22 +140,19 @@ for (const budget of [1, 10, 11, 16, 17, 60]) test('GitHub claim budget ' + (bud
     checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
   });
   const summary = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
-  const stalled = budget === 16;
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=' + budget + ', minimum=17, lower bound for single-page listings)';
-  assert.equal(dispatches, budget >= 17 ? 1 : 0);
+  assert.equal(dispatches, 1);
   assert.equal(summary.dispatched, dispatches);
   assert.equal(summary.claimed, dispatches);
-  assert.equal(code, stalled ? 1 : 0);
-  assert.deepEqual(summary.errors, stalled ? [message] : []);
-  assert.equal(summary.lookup_incomplete, budget === 16);
-  if (budget <= 11) assert.equal(fs.existsSync(path.join(f.home, 'state', 'scan_cursor.json')), false);
-  else assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: stalled ? 2 : 1 });
-  assert.equal(stdout, 'watch: role=watcher flush=0 eligible=' + (budget <= 11 ? 0 : 1) + ' claimed=' + dispatches + ' dispatched=' + dispatches + ' gaps=0 scanned=' + (budget <= 11 ? 0 : 1) + ' unscanned=1' + (stalled ? ' errors=' + message : '') + '\n');
-  assert.equal(stderr, stalled ? message + '\n' : '');
+  assert.equal(code, 0);
+  assert.deepEqual(summary.errors, []);
+  assert.equal(summary.lookup_incomplete, false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'scan_cursor.json'))), { ref: 1 });
+  assert.equal(stdout, 'watch: role=watcher flush=0 eligible=1 claimed=1 dispatched=1 gaps=0 scanned=1 unscanned=1\n');
+  assert.equal(stderr, '');
 });
 
-test('watch --once budget 10 with an empty board stays silent and exits 0', async t => {
-  const f = fixture(t, { max_api_calls_per_pass: 10,
+test('watch --once at the minimum with an empty board stays silent and exits 0', async t => {
+  const f = fixture(t, { max_api_calls_per_pass: 17,
     watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
   let stdout = '', stderr = '';
   const code = await watch(['--once', '--json'], f.env, {
@@ -168,27 +166,21 @@ test('watch --once budget 10 with an empty board stays silent and exits 0', asyn
   assert.equal(stderr, '');
 });
 
-test('watch --once text distinguishes a claimed zero-scan board from one eligible stalled row', async t => {
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17, lower bound for single-page listings)';
-  const scenarios = [
-    { budget: 10, row: { ref: 1, labels: ['errmeter:claimed'] }, code: 0,
-      line: 'watch: role=watcher flush=0 eligible=0 claimed=0 dispatched=0 gaps=0 scanned=0 unscanned=1\n', error: '' },
-    { budget: 16, row: { ref: 1, labels: [] }, code: 1,
-      line: 'watch: role=watcher flush=0 eligible=1 claimed=0 dispatched=0 gaps=0 scanned=1 unscanned=0 errors=' + message + '\n',
-      error: message + '\n' }
-  ];
-  for (const scenario of scenarios) {
-    const f = fixture(t, { max_api_calls_per_pass: scenario.budget,
-      watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
-    let stdout = '', stderr = '';
-    const code = await watch(['--once'], f.env, {
-      cleanup: () => {}, emit: () => 0, flush: async () => 0,
-      sink: { listOpenFailures: async () => [scenario.row], getFailure: async () => scenario.row,
-        claim: async () => { throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); } },
-      checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
-    });
-    assert.equal(code, scenario.code); assert.equal(stdout, scenario.line); assert.equal(stderr, scenario.error);
-  }
+test('watch --once at the minimum reports a multipage election stall', async t => {
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=17, minimum=17, lower bound for single-page listings)';
+  const row = { ref: 1, labels: [] };
+  const f = fixture(t, { max_api_calls_per_pass: 17,
+    watch: { watcher_id: 'test', dispatch: { command: ['node', 'repair.js'] } } });
+  let stdout = '', stderr = '';
+  const code = await watch(['--once'], f.env, {
+    cleanup: () => {}, emit: () => 0, flush: async () => 0,
+    sink: { listOpenFailures: async () => [row], getFailure: async () => row,
+      claim: async () => { throw Object.assign(new Error('budget'), { code: 'EAPI_BUDGET' }); } },
+    checkGaps: async () => ({ gaps: 0 }), stdout: line => { stdout += line; }, stderr: line => { stderr += line; }
+  });
+  assert.equal(code, 1);
+  assert.equal(stdout, 'watch: role=watcher flush=0 eligible=1 claimed=0 dispatched=0 gaps=0 scanned=1 unscanned=0 errors=' + message + '\n');
+  assert.equal(stderr, message + '\n');
 });
 
 test('every stalled tick records the error while one context logs and emits the stall once', async t => {
@@ -204,10 +196,10 @@ test('every stalled tick records the error while one context logs and emits the 
         if (flushes === 2) io.onResult({ pending_remaining: 0, errors: ['watch: unrelated tick error'] });
         return 0;
       } });
-    ctx.config.max_api_calls_per_pass = 16;
+    ctx.config.max_api_calls_per_pass = 17;
     return ctx;
   };
-  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=16, minimum=17, lower bound for single-page listings)';
+  const message = 'watch: api budget too small to elect one claim (max_api_calls_per_pass=17, minimum=17, lower bound for single-page listings)';
   const ctx = makeContext();
   const first = await tick(ctx);
   const firstSaved = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
@@ -226,7 +218,7 @@ test('every stalled tick records the error while one context logs and emits the 
   assert.equal(emits.filter(args => args.includes('--message=' + message)).length, 2);
 });
 
-for (const board of ['empty', 'claimed-only', 'repaired-only']) test('budgets 10 and 16 stay silent for ' +
+for (const board of ['empty', 'claimed-only', 'repaired-only']) test('budgets 17 and 60 stay silent for ' +
   (board === 'empty' ? 'an ' : 'a ') + board + ' board', async t => {
   const stamp = '2026-09-06T00:00:00.000Z';
   const fake = await createGithubFake({ now: new Date(stamp) });
@@ -237,7 +229,7 @@ for (const board of ['empty', 'claimed-only', 'repaired-only']) test('budgets 10
       ? '<!-- errmeter:claim watcher=other expires=2026-09-06T01:00:00.000Z ref=new -->'
       : '<!-- errmeter:outcome status=repaired watcher=other ts=' + stamp + ' -->' });
   }
-  for (const budget of [10, 16]) {
+  for (const budget of [17, 60]) {
     const f = fixture(t);
     const { ctx } = context({ home: f.home, sink: githubSink, http: request });
     ctx.config.sink = { repo: 'test/inbox', token: 'short', api_base: fake.url };
@@ -259,7 +251,7 @@ test('budget exhaustion after a successful dispatch does not report a one-claim 
       return { won: true, claimRef: 1 };
     }
   }, dispatch: async () => ({ status: 'repaired' }) });
-  ctx.config.max_api_calls_per_pass = 16;
+  ctx.config.max_api_calls_per_pass = 17;
   ctx.config.watch.max_concurrent = 2;
   const summary = await tick(ctx, { once: true });
   assert.equal(summary.dispatched, 1);
@@ -651,6 +643,38 @@ test('flush and watch configuration default host to the short OS hostname', t =>
     const result = require('../src/config').resolveConfig({}, f.env, { command });
     assert.equal(result.config.host, os.hostname().split('.')[0]);
   }
+});
+
+test('watcher startup budget follows the claim-election boundary without affecting agent-host or flush', t => {
+  const resolve = (extra = {}, flags = {}, command = 'watch') => {
+    const f = fixture(t, { watch: { role: 'watcher', watcher_id: 'test',
+      dispatch: { command: [process.execPath, '-e', ''] } }, ...extra });
+    return resolveConfig({ home: f.home, ...flags }, {}, { command });
+  };
+  const rejected = (extra, maximum, minimum) => assert.throws(() => resolve(extra), error =>
+    error instanceof ConfigError && error.message === 'watch: max_api_calls_per_pass=' + maximum +
+      ' is below the minimum ' + minimum + ' (max_pages_per_list + 7) needed to elect one claim');
+
+  rejected({ max_api_calls_per_pass: 16 }, 16, 17);
+  assert.equal(resolve({ max_api_calls_per_pass: 17 }).config.max_api_calls_per_pass, 17);
+  rejected({ max_pages_per_list: 3, max_api_calls_per_pass: 9 }, 9, 10);
+  assert.equal(resolve({ max_pages_per_list: 3, max_api_calls_per_pass: 10 }).config.max_api_calls_per_pass, 10);
+  rejected({ sink: { type: 'file', max_api_calls_per_pass: 5 } }, 5, 17);
+  assert.equal(resolve({ watch: { role: 'agent-host' }, max_api_calls_per_pass: 5 }).config.watch.role, 'agent-host');
+  assert.equal(resolve({ max_api_calls_per_pass: 5 }, {}, 'flush').config.max_api_calls_per_pass, 5);
+  assert.equal(resolve({ max_api_calls_per_pass: 5 }, { role: 'agent-host' }).config.watch.role, 'agent-host');
+  assert.throws(() => resolve({ max_api_calls_per_pass: '16' }), /watch: invalid numeric config/);
+});
+
+test('real watch CLI reports a tiny watcher budget as exit 3 before startup', t => {
+  const f = fixture(t, { watch: { role: 'watcher', watcher_id: 'test',
+    dispatch: { command: [process.execPath, '-e', ''] } }, max_api_calls_per_pass: 5 });
+  const result = spawnSync(process.execPath, [path.resolve(__dirname, '../bin/errmeter.js'), 'watch', '--once'], {
+    env: { ...process.env, ...f.env }, encoding: 'utf8'
+  });
+  assert.equal(result.status, 3, result.stderr);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'watch: max_api_calls_per_pass=5 is below the minimum 17 (max_pages_per_list + 7) needed to elect one claim\n');
 });
 
 test('agent-host emits heartbeat before flushing and never reads failures or gaps', async t => {
