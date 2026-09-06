@@ -61,4 +61,4 @@ host.
 
 ## Publication gate
 
-Run `python3 -B tools/check_publication_gate.py --root . --account-slug shojikumaru --no-registry` before publication. `npm test` runs this local gate too (Python 3.9+; clearly skipped only when `python3` is absent).
+Run `python3 -B tools/check_publication_gate.py --root . --account-slug <maintainer-github-username> --no-registry` before publication. `npm test` runs the same local gate with the maintainer's account slug (Python 3.9+; clearly skipped only when `python3` is absent).
