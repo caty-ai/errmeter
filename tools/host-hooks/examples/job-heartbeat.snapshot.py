@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Snapshot of family-memory-architecture scripts/job-heartbeat at commit d80b0ae.
+# Snapshot of the upstream `scripts/job-heartbeat` the patch was generated against.
+# The patch header records the blob hashes of the upstream file before and after the change.
 """Emit a standard automation-job heartbeat JSON file."""
 
 import argparse

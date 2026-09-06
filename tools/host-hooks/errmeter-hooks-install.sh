@@ -71,6 +71,7 @@ function jsonHook(text,event,entry) {
 }
 const claudeCommand="bash \"$HOME/.errmeter/hooks/claude-code-emit.sh\"";
 const claudeEntry={matcher:"*",hooks:[{type:"command",command:claudeCommand}]};
+let droppedCodexPreviousNotify=false;
 function codexNotify(text,required=true) {
   const lines=text.split("\n");let section=false,index=-1,multi=null;
   for(let i=0;i<lines.length;i++){
@@ -95,8 +96,19 @@ function desired(target) {
   const files=new Map();
   if(target==="sitter") {
     const rel=rels.sitter[0], text=read(rel,true), snippet=fs.readFileSync(path.join(root,"examples/sitter-on-fail.snippet.sh"),"utf8").trimEnd();
-    if(text.includes(snippet))files.set(rel,text);
-    else {const lines=text.split("\n"), indexes=lines.flatMap((l,i)=>l.includes("$payload")&&l.includes(">>")&&l.includes("$LOG")?[i]:[]);if(indexes.length!==1)fail("Cannot locate unique sitter JSONL append");lines.splice(indexes[0]+1,0,"# errmeter host hook",snippet);files.set(rel,lines.join("\n"));}
+    const exactMarker="# errmeter host hook\n"+snippet;
+    if(text.includes(exactMarker))files.set(rel,text);
+    else if(text.includes(snippet)) {
+      const first=text.indexOf(snippet), second=text.indexOf(snippet,first+snippet.length);
+      if(second!==-1)fail("Cannot locate unique sitter hook snippet");
+      files.set(rel,text.slice(0,first)+"# errmeter host hook\n"+text.slice(first));
+    } else {
+      const lines=text.split("\n"), markers=lines.flatMap((line,index)=>line==="# errmeter host hook"?[index]:[]);
+      if(markers.length>1)fail("Cannot locate unique sitter hook marker");
+      if(markers.length===1)lines.splice(markers[0]+1,0,snippet);
+      else {const indexes=lines.flatMap((l,i)=>l.includes("$payload")&&l.includes(">>")&&l.includes("$LOG")?[i]:[]);if(indexes.length!==1)fail("Cannot locate unique sitter JSONL append");lines.splice(indexes[0]+1,0,"# errmeter host hook",snippet);}
+      files.set(rel,lines.join("\n"));
+    }
   } else if(target==="claude-code") {
     let text=read(rels[target][0],true);
     text=jsonHook(text,"PostToolUseFailure",claudeEntry);
@@ -104,7 +116,18 @@ function desired(target) {
   } else {
     const rel=rels.codex[0],text=read(rel,true), {lines,index,prior}=codexNotify(text);
     const hook=path.join(home,rels.codex[1]);
-    if(!(prior[0]==="bash"&&prior[1]===hook))lines[index]="notify = "+JSON.stringify(["bash",hook,"--previous-notify",JSON.stringify(prior)]);
+    if(!hasCodexWrapper(prior,hook)) {
+      let previous=prior;
+      if(prior.includes(hook)) {
+        previous=[];let recovered=false;
+        const hookIndex=prior.indexOf(hook), previousIndex=prior.indexOf("--previous-notify",hookIndex+1);
+        if(previousIndex!==-1) {
+          try {const inner=JSON.parse(prior[previousIndex+1]);if(Array.isArray(inner)&&inner.every(value=>typeof value==="string")){previous=inner;recovered=true;}} catch (_) {}
+        }
+        if(!recovered) droppedCodexPreviousNotify=true;
+      }
+      lines[index]="notify = "+JSON.stringify(["bash",hook,"--previous-notify",JSON.stringify(previous)]);
+    }
     files.set(rel,lines.join("\n"));files.set(rels.codex[1],fs.readFileSync(path.join(root,"examples/codex-notify-emit.sh"),"utf8"));
   }return files;
 }
@@ -129,23 +152,23 @@ function removeEmptyHooksDir() {
   if(fs.readdirSync(dir).length===0)fs.rmdirSync(dir);
 }
 function lastInstalledAfter(history,rel) {
-  const manifest=history.find(m=>m.kind==="install"&&Array.isArray(m.entries)&&m.entries.some(e=>e.rel===rel));
+  const manifest=history.find(m=>Array.isArray(m.entries)&&m.entries.some(e=>e.rel===rel));
+  if(manifest?.kind!=="install")return undefined;
   return manifest?.entries.find(e=>e.rel===rel)?.after;
-}
-function restoredAfterInstall(history,target) {
-  const latest=history.find(m=>Array.isArray(m.entries)&&m.entries.some(e=>rels[target].includes(e.rel)));
-  return latest?.kind==="restore";
 }
 function hasClaudeCommand(value) {
   return Boolean(value&&Array.isArray(value.hooks)&&value.hooks.some(h=>h&&h.command===claudeCommand));
 }
+function hasCodexWrapper(prior,hook) {
+  if(!Array.isArray(prior)||prior.length!==4||prior[0]!=="bash"||prior[1]!==hook||prior[2]!=="--previous-notify")return false;
+  try {const previous=JSON.parse(prior[3]);return Array.isArray(previous)&&previous.every(value=>typeof value==="string");}
+  catch (_) {return false;}
+}
 function targetStatus(target,history) {
-  const restored=restoredAfterInstall(history,target);
   if(target==="sitter") {
     const rel=rels.sitter[0], actual=read(rel,true);
     const snippet=fs.readFileSync(path.join(root,"examples/sitter-on-fail.snippet.sh"),"utf8").trimEnd();
     const exactMarker="# errmeter host hook\n"+snippet;
-    if(restored)return {state:"not installed",note:false};
     if(actual.includes(exactMarker))return {state:"installed",note:lastInstalledAfter(history,rel)!==undefined&&lastInstalledAfter(history,rel)!==actual};
     return {state:actual.includes("# errmeter host hook")||actual.includes(snippet)?"drifted":"not installed",note:false};
   }
@@ -156,30 +179,22 @@ function targetStatus(target,history) {
     if(Object.hasOwn(obj,"hooks")&&(!obj.hooks||Array.isArray(obj.hooks)||typeof obj.hooks!=="object"))fail("Invalid hooks object");
     const events=obj.hooks?.PostToolUseFailure;
     if(events!==undefined&&!Array.isArray(events))fail("Invalid hook event list");
-    if(restored||hook===null)return {state:"not installed",note:false};
     const markedEntries=events?.filter(hasClaudeCommand)||[], marked=markedEntries.length>0;
     const exact=markedEntries.length===1&&JSON.stringify(markedEntries[0])===JSON.stringify(claudeEntry);
     const hookExample=fs.readFileSync(path.join(root,"examples/claude-code-emit.sh"),"utf8");
-    if(hook!==hookExample)return {state:"drifted",note:false};
-    if(exact)return {state:"installed",note:lastInstalledAfter(history,rel)!==undefined&&lastInstalledAfter(history,rel)!==actual};
-    return {state:marked?"drifted":"not installed",note:false};
+    if(exact&&hook===hookExample)return {state:"installed",note:lastInstalledAfter(history,rel)!==undefined&&lastInstalledAfter(history,rel)!==actual};
+    return {state:marked||hook!==null?"drifted":"not installed",note:false};
   }
   const rel=rels.codex[0], actual=read(rel,true), parsed=codexNotify(actual,false), hook=read(rels.codex[1]);
-  if(restored||hook===null)return {state:"not installed",note:false};
   const hookPath=path.join(home,rels.codex[1]);
-  const points=parsed.prior!==null&&parsed.prior[0]==="bash"&&parsed.prior[1]===hookPath;
+  const points=hasCodexWrapper(parsed.prior,hookPath);
   const hookExample=fs.readFileSync(path.join(root,"examples/codex-notify-emit.sh"),"utf8");
-  if(hook!==hookExample)return {state:"drifted",note:false};
   if(points&&hook===hookExample){
     const installed=lastInstalledAfter(history,rel);
-    if(installed!==undefined){
-      const prior=codexNotify(installed,false).prior;
-      const sameNotify=JSON.stringify(prior)===JSON.stringify(parsed.prior);
-      return sameNotify?{state:"installed",note:installed!==actual}:{state:"drifted",note:false};
-    }
-    return {state:"installed",note:false};
+    if(installed!==undefined&&codexNotify(installed).prior[3]!==parsed.prior[3])return {state:"drifted",note:false};
+    return {state:"installed",note:installed!==undefined&&installed!==actual};
   }
-  return {state:points?"drifted":"not installed",note:false};
+  return {state:points||hook!==null?"drifted":"not installed",note:false};
 }
 let previewRedact;
 try {
@@ -190,7 +205,17 @@ function minimalRedact(line) {
     .replace(/(["\x27]?[A-Za-z0-9_.-]*(?:token|secret|password|api[_-]?key)[A-Za-z0-9_.-]*["\x27]?\s*[:=]\s*)(["\x27])(?:\\.|(?!\2).)*\2/ig,"$1$2[REDACTED]$2")
     .replace(/([A-Za-z0-9_.-]*(?:token|secret|password|api[_-]?key)[A-Za-z0-9_.-]*\s*[:=]\s*)[^,;\s}]+/ig,"$1[REDACTED]");
 }
-function previewLine(line) {console.log(previewRedact?previewRedact(line,[]):minimalRedact(line));}
+function previewLine(line) {
+  const escapedHome=JSON.stringify(home).slice(1,-1);
+  const collapse=(text,prefix)=>text.split(prefix).map((part,index)=>index===0?part:(/^(?:\/|["\x27]|$)/.test(part)?"~":prefix)+part).join("");
+  const homeCollapsed=collapse(collapse(line,escapedHome),home);
+  // The shared redactor also collapses HOME without checking path boundaries.
+  // Protect remaining non-path occurrences while it redacts sensitive values.
+  let homeToken="\u0000ERRMETER_HOME\u0000";
+  while(homeCollapsed.includes(homeToken))homeToken+="\u0000";
+  const protectedLine=homeCollapsed.split(home).join(homeToken);
+  console.log((previewRedact?previewRedact(protectedLine,[]):minimalRedact(protectedLine)).split(homeToken).join(home));
+}
 function boundedDiff(rel,before,after) {
   const a=before.split("\n"),b=after.split("\n");let start=0;
   while(start<a.length&&start<b.length&&a[start]===b[start])start++;
@@ -212,10 +237,11 @@ function previewChange(change) {
     previewLine("--- ~/"+change.rel);previewLine("+++ ~/"+change.rel);previewLine("@@ JSON path $.hooks.PostToolUseFailure @@");previewLine("+ "+JSON.stringify(claudeEntry));return;
   }
   if(change.rel===".codex/config.toml"){
-    const oldNotify=codexNotify(before,false),newNotify=codexNotify(change.after);
+    const oldNotify=codexNotify(before,false);
     previewLine("--- ~/"+change.rel);previewLine("+++ ~/"+change.rel);previewLine("@@ top-level notify @@");
-    if(oldNotify.index>=0)previewLine("-"+oldNotify.lines[oldNotify.index]);
-    previewLine("+"+newNotify.lines[newNotify.index]);return;
+    const prefix=JSON.stringify(["bash","~/"+rels.codex[1],"--previous-notify"]);
+    previewLine("+notify = "+prefix.slice(0,-1)+", …]");
+    previewLine("@@ previous notify argv: "+oldNotify.prior.length+" entries, elided @@");return;
   }
   boundedDiff(change.rel,before||"",change.after);
 }
@@ -242,7 +268,7 @@ try {
     for(const t of targets)for(const [rel,after] of desired(t)){const before=read(rel);if(before!==after)changes.push({rel,after});}
     if(!changes.length){console.log("Already installed; no changes.");process.exit(0);}
     if(!apply){previewLine("Dry run: no files written. Planned changes (at most 3 context lines):");for(const c of changes)previewChange(c);previewLine("Run again with --apply to install selected targets.");}
-    else {const backup=saveBackup(changes,"install");write(backup.entries);console.log("Installed "+targets.join(", ")+". Backup: ~/.errmeter/backups/"+backup.id+"/");}
+    else {if(droppedCodexPreviousNotify)console.error("Note: previous notify payload was not a JSON string array and will be dropped ([]).");const backup=saveBackup(changes,"install");write(backup.entries);console.log("Installed "+targets.join(", ")+". Backup: ~/.errmeter/backups/"+backup.id+"/");}
   }
 }catch(error){console.error("Cannot continue: "+error.message);process.exitCode=3;}
 ' "$ROOT" "$@"

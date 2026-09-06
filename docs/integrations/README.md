@@ -1,6 +1,6 @@
-# Family integrations
+# Integrations
 
-Start with [fma job-heartbeat](fma-job-heartbeat.md): one owner-applied patch covers existing family jobs on every host, including successful runs and silence. Registration-gap checks belong to fma; errmeter observes their check job too.
+Start with [the fma job-heartbeat integration](fma-job-heartbeat.md) (a sibling project that writes per-job heartbeat files): one patch covers existing fma jobs on every host, including successful runs and silence. Registration-gap checks belong to fma; errmeter observes their check job too.
 
 | Source | Integration | Use when |
 | --- | --- | --- |
@@ -9,9 +9,9 @@ Start with [fma job-heartbeat](fma-job-heartbeat.md): one owner-applied patch co
 | cron / launchd jobs | [job wrappers](cron.md) | A scheduled command needs exit-status reporting |
 | Liveness | [heartbeats](heartbeat.md) | Detect an agent or host going silent |
 
-Owner tools require Bash (including macOS 3.2) and Node 18+, with zero npm dependencies. From this checkout, run `bash tools/host-hooks/errmeter-hooks-install.sh --all` to preview, then add `--apply`. Select only `--sitter`, `--claude-code`, or `--codex` as needed. Every changed destination is backed up before writing under `~/.errmeter/backups/<timestamp>/manifest.json`; original bytes are base64-encoded and originally absent files are recorded. `errmeter-hooks-restore.sh [--from <timestamp>]` restores the newest installation backup by default, saving replaced bytes in a separate restore backup. Restore removes only hook files recorded as originally absent. Review the backup before restoring after unrelated host edits. The installer never edits fma.
+Host-hook tools require Bash (including macOS 3.2) and Node 18+, with zero npm dependencies. From this checkout, run `bash tools/host-hooks/errmeter-hooks-install.sh --all` to preview, then add `--apply`. Select only `--sitter`, `--claude-code`, or `--codex` as needed. Every changed destination is backed up before writing under `~/.errmeter/backups/<timestamp>/manifest.json`; original bytes are base64-encoded and originally absent files are recorded. `errmeter-hooks-restore.sh [--from <timestamp>]` restores the newest installation backup by default, saving replaced bytes in a separate restore backup. Restore removes only hook files recorded as originally absent. When restore removes the final hook file, it also removes the emptied `~/.errmeter/hooks/` directory. Review the backup before restoring after unrelated host edits. The installer never edits fma. Dry-run previews collapse the absolute `$HOME` path to `~` through preview redaction, while written files use absolute paths.
 
-`errmeter-hooks-status.sh` reports installed / not installed / drifted, errmeter on PATH, and a local `errmeter status` summary. It checks each integration by its own marker or entry plus the shipped hook file, so an unrelated edit elsewhere in `settings.json`, the sitter script, or Codex config remains `installed` with the note `unrelated local edits present`. A modified errmeter-owned entry, marker block, or hook file is `drifted`; a restored or absent integration is `not installed`. Exit codes: 0 all inspected targets are installed, 1 at least one inspected target is not installed or drifted (also used when only some targets cannot be inspected), 2 usage, 3 every target failed inspection. Unsupported notify TOML formats fail without writing; use a single-line JSON-compatible string array. Existing config content, including `hooks = true`, remains unchanged except the notify line or inserted JSON hook entries. JSON is validated and edited through `node -e`, retaining original whitespace and all other bytes.
+`errmeter-hooks-status.sh` reports installed / not installed / drifted, errmeter on PATH, and a local `errmeter status` summary. It checks each integration by its own marker or entry plus the shipped hook file, so an unrelated edit elsewhere in `settings.json`, the sitter script, or Codex config remains `installed` with the note `unrelated local edits present`. A modified errmeter-owned entry, marker block, or hook file is `drifted`; an integration with none of its owned content present is `not installed`. The previous-notify payload is compared against the recorded install manifest under `~/.errmeter/backups/`; if that manifest is gone or superseded by a later restore, a byte-consistent wrapper reads `installed`. A drift detected through the manifest is reported by `status` only; a plain `--apply` does not rewrite a syntactically valid wrapper, so clear it with `errmeter-hooks-restore.sh` followed by `--apply`. Exit codes: 0 all inspected targets are installed, 1 at least one inspected target is not installed or drifted (also used when only some targets cannot be inspected), 2 usage, 3 every target failed inspection. Unsupported notify TOML formats fail without writing; use a single-line JSON-compatible string array. Existing config content, including `hooks = true`, remains unchanged except the notify line or inserted JSON hook entries. JSON is validated and edited through `node -e`, retaining original whitespace and all other bytes.
 
 Use `<agent>` as the emitter identity. Names are lower-cased and must fit `[a-z0-9._/-]{1,64}`. The board composite identity is `<agent>@<host>`; `@` is **not** in the literal `--agent` charset, despite the per-host shorthand in contract §2.1. For separate per-host error fingerprints, use a legal name such as `agent/host`; ordinary heartbeat Issues already separate host records. `--meta` accepts at most 16 entries, keys `[A-Za-z0-9_.-]{1,32}`, values at most 256 characters, and no `_`-prefixed keys. Values and detail pass emit redaction; never deliberately put credentials in message or metadata.
 
@@ -23,7 +23,7 @@ A repair hook MAY open PRs and comment with its own credentials. It MUST NOT mer
 
 ## Not done by this change
 
-This checkout does not apply the host-side changes, apply or commit the fma patch, fill in the family connection table on issue #8, or confirm live inbox heartbeats. The owner performs those operational steps on each host. From the errmeter checkout, the owner-run command block is:
+This checkout does not apply the host-side changes, apply or commit the fma patch, or confirm live inbox heartbeats. Perform those operational steps on each host. From the errmeter checkout, run:
 
 ```bash
 bash tools/host-hooks/errmeter-hooks-install.sh --all --apply
@@ -33,7 +33,7 @@ git -C /path/to/family-memory-architecture commit
 errmeter status --check
 ```
 
-Record the live result on issue #8 using this template; run `errmeter status --check` on every listed host before marking its heartbeat as seen.
+Record the live result using this template; run `errmeter status --check` on every listed host before marking its heartbeat as seen.
 
 | agent | host | connected path | heartbeat seen |
 | --- | --- | --- | --- |

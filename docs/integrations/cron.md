@@ -1,6 +1,6 @@
 # cron and launchd jobs
 
-Prefer fma `scripts/run-with-heartbeat <job> -- <cmd>` wherever available. Once the [stage-1 patch](fma-job-heartbeat.md) is applied, its standard heartbeat file also reaches errmeter. The wrapper preserves the wrapped exit status and records duration; its signal forwarding covers child process groups.
+Prefer fma `scripts/run-with-heartbeat <job> -- <cmd>` wherever available. Once the [fma job-heartbeat patch](fma-job-heartbeat.md) is applied, its standard heartbeat file also reaches errmeter. The wrapper preserves the wrapped exit status and records duration; its signal forwarding covers child process groups.
 
 A simple failure tail is useful for one-off commands, but preserve the command status explicitly:
 

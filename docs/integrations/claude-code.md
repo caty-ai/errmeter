@@ -1,6 +1,6 @@
 # Claude Code
 
-Copy `tools/host-hooks/examples/claude-code-emit.sh` to `~/.errmeter/hooks/claude-code-emit.sh`. Merge these entries into the existing `hooks` object in `~/.claude/settings.json` (the owner installer does this without replacing other settings):
+Copy `tools/host-hooks/examples/claude-code-emit.sh` to `~/.errmeter/hooks/claude-code-emit.sh`. Merge these entries into the existing `hooks` object in `~/.claude/settings.json` (the host-hook installer does this without replacing other settings):
 
 ```json
 {
