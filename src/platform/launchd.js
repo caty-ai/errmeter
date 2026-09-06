@@ -16,9 +16,9 @@ function artefactPath(role, scope, ctx = {}) {
 function plan(ctx) {
   const suffix = ctx.env.ERRMETER_INSTALL_LABEL_SUFFIX || '';
   if (suffix && !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(suffix)) throw new Error('invalid install label suffix');
-  const label = 'ai.caty.errmeter.' + ctx.role + (suffix ? '.' + suffix : '');
+  const label = ctx.label || 'ai.caty.errmeter.' + ctx.role + (suffix ? '.' + suffix : '');
   const domain = ctx.scope === 'system' ? 'system' : 'gui/' + ctx.uid;
-  const artefactPath = path.posix.join(ctx.scope === 'system' ? '/Library/LaunchDaemons' : path.posix.join(ctx.homedir, 'Library/LaunchAgents'), label + '.plist');
+  const artefactPath = ctx.artefactPath || path.posix.join(ctx.scope === 'system' ? '/Library/LaunchDaemons' : path.posix.join(ctx.homedir, 'Library/LaunchAgents'), label + '.plist');
   const args = [ctx.nodePath, ctx.binPath, 'watch', '--role', ctx.role, '--home', ctx.home, '--config', ctx.configPath];
   const content = '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n' +
     '  <key>Label</key><string>' + xml(label) + '</string>\n  <key>ProgramArguments</key>\n  <array>\n' + args.map(arg => '    <string>' + xml(arg) + '</string>\n').join('') +
@@ -43,14 +43,14 @@ async function execute(spec, runner, action) {
   let subcommand = item.args[0];
   if (result.code !== 0 && unavailable(result)) {
     subcommand = action === 'install' ? 'load' : 'unload';
-    result = await runner.exec('launchctl', [subcommand, '-w', artefactPath(spec.role, spec.scope, spec)]);
+    result = await runner.exec('launchctl', [subcommand, '-w', plan(spec).artefactPath]);
   }
   if (result.code !== 0) throw new Error('launchctl ' + subcommand + ' failed');
 }
 async function status(spec, runner) {
   const item = plan(spec).query;
   let result = await runner.exec(item.command, item.args);
-  if (result.code !== 0 && unavailable(result)) result = await runner.exec('launchctl', ['list', label(spec.role, spec.env)]);
+  if (result.code !== 0 && unavailable(result)) result = await runner.exec('launchctl', ['list', plan(spec).label]);
   return inspect(result);
 }
 function assertPrivilege(spec) { if (spec.scope === 'system' && spec.uid !== 0) throw new Error('system registration requires root'); }

@@ -142,6 +142,8 @@ async function status(argv, env = process.env, io = {}) {
         ', last flush: ' + (data.last_flush.ts || 'never') + ' pending=' + data.last_flush.pending_remaining + ' errors=' + data.last_flush.errors +
         ', last error: ' + (data.last_error || 'none') + ', watcher registered=' + data.watcher.registered +
         ' running=' + data.watcher.running + ' pid=' + (data.watcher.pid ?? 'none') +
+        ', registration record: ' + (data.registration_record || 'none') +
+        (data.watcher.linger ? ', linger: ' + data.watcher.linger : '') +
         ', last watch: ' + (data.last_watch.ts || 'never') + ' role=' + (data.last_watch.role || 'unknown') +
         ' dispatched=' + data.last_watch.dispatched + ' eligible=' + data.last_watch.eligible +
         ' scanned=' + data.last_watch.scanned + ' unscanned=' + data.last_watch.unscanned +
@@ -175,10 +177,12 @@ async function status(argv, env = process.env, io = {}) {
     const registration = await (io.registrationStatus || require('./install').registrationStatus)(flags, env, { ...io, resolved });
     const running = registration.running ?? null;
     const watcher = { registered: Boolean(registration.registered), running,
-      pid: registration.pid ?? (typeof running === 'number' ? running : null) };
+      pid: registration.pid ?? (typeof running === 'number' ? running : null),
+      ...(registration.linger ? { linger: registration.linger } : {}) };
     const flushFailed = Boolean(last.errors?.length || last.lookup_incomplete);
     const flushStale = last.ts ? (io.clock || Date.now)() - Date.parse(last.ts) > 2 * config.watch.interval_sec * 1000 : watcher.registered;
-    result = { config_path: resolved.configPath, role: config.watch.role,
+    result = { config_path: resolved.configPath, role: registration.role || flags.role || config.watch.role,
+      registration_record: registration.registrationRecord || null,
       pending: countPending(disk, home), pending_soft_limit: config.spool.pending_soft_limit,
       last_flush: { ts: last.ts || null, pending_remaining: last.pending_remaining ?? 0, errors: last.errors?.length || 0 },
       last_watch: { ts: lastWatch.ts || null, role: lastWatch.role || null, dispatched: lastWatch.dispatched ?? 0,
@@ -187,6 +191,9 @@ async function status(argv, env = process.env, io = {}) {
       last_error: Array.isArray(last.errors) ? last.errors.at(-1) || null : null,
       last_flush_failed: flushFailed, last_flush_stale: flushStale, watcher, watcher_heartbeats: null, gaps: null,
       warnings: resolved.warning ? [resolved.warning] : [] };
+    if (registration.registrationRecord && registration.installedRole !== config.watch.role) {
+      result.warnings.push('installed role ' + registration.installedRole + ' differs from config watch.role ' + config.watch.role);
+    }
     const ctx = { ...resolved, env, maskList: masks, http: io.http, sink: io.sink, clock: io.clock || Date.now };
     ctx.now = () => ctx.boardTime || new Date(ctx.clock()).toISOString();
     if (flags.check) {

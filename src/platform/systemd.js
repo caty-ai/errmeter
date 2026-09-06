@@ -1,5 +1,8 @@
 'use strict';
 
+// User units start at login unless loginctl enable-linger is enabled. Status
+// probes loginctl show-user <user> -p Linger; unavailable probes report unknown.
+
 const path = require('node:path');
 function quote(value) {
   return '"' + String(value).replace(/%/g, '%%').replace(/\$/g, () => '$$').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r') + '"';
@@ -13,8 +16,8 @@ function plan(ctx) {
   for (const value of [ctx.home, ctx.configPath, ctx.nodePath, ctx.binPath, ctx.homedir]) {
     if (typeof value === 'string' && /[\t\v\f\r\n]/.test(value)) throw new Error('unsupported systemd path whitespace');
   }
-  const label = 'errmeter-' + ctx.role + '.service';
-  const artefactPath = path.posix.join(ctx.scope === 'system' ? '/etc/systemd/system' : path.posix.join(ctx.homedir, '.config/systemd/user'), label);
+  const label = ctx.label || 'errmeter-' + ctx.role + '.service';
+  const artefactPath = ctx.artefactPath || path.posix.join(ctx.scope === 'system' ? '/etc/systemd/system' : path.posix.join(ctx.homedir, '.config/systemd/user'), label);
   const prefix = ctx.scope === 'system' ? [] : ['--user'];
   const command = args => ({ command: 'systemctl', args: [...prefix, ...args] });
   const args = [ctx.nodePath, ctx.binPath, 'watch', '--role', ctx.role, '--home', ctx.home, '--config', ctx.configPath];
@@ -43,19 +46,21 @@ async function execute(spec, runner, action) {
 }
 async function status(spec, runner) {
   const prefix = spec.scope === 'system' ? [] : ['--user'];
-  const enabled = await runner.exec('systemctl', [...prefix, 'is-enabled', label(spec.role)]);
+  const unit = spec.label || label(spec.role);
+  const enabled = await runner.exec('systemctl', [...prefix, 'is-enabled', unit]);
   if (enabled.code !== 0 && ![1, 4].includes(enabled.code)) throw new Error('systemctl is-enabled failed');
   if (enabled.code !== 0 && !/disabled|not-found|masked|static|indirect|linked|does not exist|could not be found|no such file/i.test((enabled.stdout || '') + (enabled.stderr || ''))) throw new Error('systemctl is-enabled failed');
   const registered = enabled.code === 0 || !/not-found|does not exist|could not be found|no such file/i.test((enabled.stdout || '') + (enabled.stderr || ''));
-  const active = await runner.exec('systemctl', [...prefix, 'is-active', label(spec.role)]);
+  const active = await runner.exec('systemctl', [...prefix, 'is-active', unit]);
   if (![0, 3, 4].includes(active.code)) throw new Error('systemctl is-active failed');
   if (!registered) return { registered: false, running: null };
-  const pidResult = await runner.exec('systemctl', [...prefix, 'show', label(spec.role), '-p', 'MainPID']);
+  const pidResult = await runner.exec('systemctl', [...prefix, 'show', unit, '-p', 'MainPID']);
   if (pidResult.code !== 0) throw new Error('systemctl show failed');
   const match = /(?:MainPID=)?(\d+)/.exec(pidResult.stdout || '');
   return { registered, running: active.code === 0 && match && Number(match[1]) > 0 ? Number(match[1]) : null };
 }
 async function prepare(spec, runner, { dryRun = false } = {}) {
+  if (spec.scope === 'user') spec.notes = ["note: user services start at login; run 'loginctl enable-linger " + (spec.username || require('node:os').userInfo().username) + "' to start at boot"];
   if (spec.systemdVersion !== undefined) return;
   try {
     const result = await runner.exec('systemctl', ['--version']);
@@ -64,7 +69,7 @@ async function prepare(spec, runner, { dryRun = false } = {}) {
     spec.systemdVersion = Number(version[1]);
   } catch (error) {
     if (!dryRun) throw error;
-    spec.notes = ['# systemd version unknown — StandardOutput shown as journal'];
+    spec.notes = ['# systemd version unknown — StandardOutput shown as journal', ...(spec.notes || [])];
   }
 }
 function assertPrivilege(spec) { if (spec.scope === 'system' && spec.uid !== 0) throw new Error('system registration requires root'); }

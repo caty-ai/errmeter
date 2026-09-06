@@ -11,22 +11,24 @@ function quote(value) {
   return '"' + value.replace(/%/g, '%%') + '"';
 }
 const label = role => 'errmeter-' + role;
-const artefactPath = (role, scope, ctx = {}) => path.win32.join(ctx.home || path.win32.join(require('node:os').homedir(), '.errmeter'), label(role) + '.cmd');
+const artefactPath = (role, scope, ctx = {}) => path.win32.join(scope === 'system' ?
+  path.win32.join((ctx.env || process.env).ProgramData || 'C:\\ProgramData', 'errmeter') :
+  ctx.home || path.win32.join(require('node:os').homedir(), '.errmeter'), label(role) + '.cmd');
 function plan(ctx) {
-  const label = 'errmeter-' + ctx.role;
-  const artefactPath = path.win32.join(ctx.home, label + '.cmd');
+  const label = ctx.label || 'errmeter-' + ctx.role;
+  const wrapperPath = ctx.artefactPath || artefactPath(ctx.role, ctx.scope, ctx);
   const args = [ctx.nodePath, ctx.binPath, 'watch', '--role', ctx.role, '--home', ctx.home, '--config', ctx.configPath];
   const content = '@echo off\r\nrem Task Scheduler default execution limit is 72 hours; adjust it for continuous operation.\r\nsetlocal DisableDelayedExpansion\r\nset "ERRMETER_HOME=' + quote(ctx.home).slice(1, -1) + '"\r\n:retry\r\n' + args.map(quote).join(' ') + '\r\ntimeout /t 5 /nobreak >nul 2>&1\r\nif errorlevel 1 ping -n 6 127.0.0.1 >nul 2>&1\r\ngoto retry\r\n';
   // The wrapper supplies --home/--config directly; no caller environment or
   // credential values are copied into the scheduled task.
   // Expansion happens in the outer cmd before the wrapper can protect itself;
   // reject those unusual home paths instead of registering a different path.
-  if (/%/.test(artefactPath)) throw new Error('unsupported scheduled task path');
-  const taskCommand = 'cmd.exe /d /v:off /s /c ""' + artefactPath + '""';
+  if (/["\r\n\0%]/.test(wrapperPath)) throw new Error('unsupported scheduled task path');
+  const taskCommand = 'cmd.exe /d /v:off /s /c ""' + wrapperPath + '""';
   const createArgs = ['/Create', '/TN', label, '/TR', taskCommand, '/SC', ctx.scope === 'system' ? 'ONSTART' : 'ONLOGON'];
   if (ctx.scope === 'system') createArgs.push('/RU', 'SYSTEM');
   createArgs.push('/RL', 'LIMITED', '/F');
-  return { label, artefactPath, content, query: { command: 'schtasks', args: ['/Query', '/TN', label, '/FO', 'LIST', '/V'] },
+  return { label, artefactPath: wrapperPath, content, query: { command: 'schtasks', args: ['/Query', '/TN', label, '/FO', 'LIST', '/V'] },
     install: [{ command: 'schtasks', args: createArgs }],
     uninstall: [{ command: 'schtasks', args: ['/Delete', '/TN', label, '/F'] }] };
 }

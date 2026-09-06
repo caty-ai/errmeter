@@ -40,7 +40,7 @@ for (const role of ['watcher', 'agent-host']) for (const scope of ['user', 'syst
   test('schtasks deterministic snapshot: ' + role + '/' + scope, () => {
     const spec = schtasks.plan({ ...context(role, scope), home: 'C:\\Users\\test\\.errmeter', configPath: 'C:\\Users\\test\\.errmeter\\config.json', nodePath: 'C:\\Program Files\\nodejs\\node.exe', binPath: 'C:\\errmeter\\bin\\errmeter.js' });
     assert.equal(spec.content, '@echo off\r\nrem Task Scheduler default execution limit is 72 hours; adjust it for continuous operation.\r\nsetlocal DisableDelayedExpansion\r\nset "ERRMETER_HOME=C:\\Users\\test\\.errmeter"\r\n:retry\r\n"C:\\Program Files\\nodejs\\node.exe" "C:\\errmeter\\bin\\errmeter.js" "watch" "--role" "' + role + '" "--home" "C:\\Users\\test\\.errmeter" "--config" "C:\\Users\\test\\.errmeter\\config.json"\r\ntimeout /t 5 /nobreak >nul 2>&1\r\nif errorlevel 1 ping -n 6 127.0.0.1 >nul 2>&1\r\ngoto retry\r\n');
-    assert.equal(spec.artefactPath, 'C:\\Users\\test\\.errmeter\\errmeter-' + role + '.cmd');
+    assert.equal(spec.artefactPath, (scope === 'system' ? 'C:\\ProgramData\\errmeter' : 'C:\\Users\\test\\.errmeter') + '\\errmeter-' + role + '.cmd');
     assert.equal(spec.install[0].args[4], 'cmd.exe /d /v:off /s /c ""' + spec.artefactPath + '""');
     assert.deepEqual(spec.install[0].args.slice(5), ['/SC', scope === 'system' ? 'ONSTART' : 'ONLOGON', ...(scope === 'system' ? ['/RU', 'SYSTEM'] : []), '/RL', 'LIMITED', '/F']);
   });
@@ -49,9 +49,9 @@ function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-install-test-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const home = path.join(root, '.errmeter'); fs.mkdirSync(home);
-  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ schema: 1, sink: { type: 'file' }, watch: { role: 'agent-host' } }));
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ schema: 1, sink: { type: 'file' }, watch: { role: 'agent-host', dispatch: { command: ['/usr/bin/true'] } } }));
   const calls = []; const output = []; const errors = [];
-  const io = { platform: 'darwin', homedir: root, uid: 501, stdout: text => output.push(text), stderr: text => errors.push(text),
+  const io = { platform: 'darwin', homedir: root, username: 'test-user', uid: 501, stdout: text => output.push(text), stderr: text => errors.push(text),
     runner: { async exec(command, args) { calls.push({ command, args }); return args[0] === 'print' ? { code: 113, stderr: 'Could not find service' } : { code: 0 }; } } };
   return { root, home, env: { ERRMETER_HOME: home }, calls, output, errors, io };
 }
@@ -184,9 +184,11 @@ for (const version of [239, 240, 256]) test('Linux dry-run matches installed uni
   assert.equal(await install(['--dry-run', '--json'], f.env, io), 0);
   assert.deepEqual(calls, [['--version']]);
   const preview = JSON.parse(f.output.pop());
+  assert.ok(preview.notes.includes("note: user services start at login; run 'loginctl enable-linger test-user' to start at boot"));
   assert.equal(fs.existsSync(preview.artefactPath), false);
   assert.match(preview.artefact.content, version >= 240 ? /StandardOutput=append:/ : /StandardOutput=journal/);
   assert.equal(await install(['--json'], f.env, io), 0);
+  assert.ok(JSON.parse(f.output.pop()).notes.includes("note: user services start at login; run 'loginctl enable-linger test-user' to start at boot"));
   assert.equal(fs.readFileSync(preview.artefactPath, 'utf8'), preview.artefact.content);
 });
 
@@ -209,10 +211,12 @@ test('unknown systemd version notes appear in text and JSON without leaking prob
 for (const platform of ['darwin', 'linux', 'win32']) test(platform + ' registration failure cleans artefact and permits retry', async t => {
   const f = fixture(t); const artifacts = new Map(); const calls = []; let fail = true;
   const fakeFs = {
+    readFileSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return artifacts.get(file); },
     lstatSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return {}; },
     mkdirSync() {},
     writeFileSync(file, content, options) { assert.equal(options.flag, 'wx'); artifacts.set(file, content); },
-    unlinkSync(file) { assert.ok(artifacts.has(file)); artifacts.delete(file); }
+    renameSync(from, to) { artifacts.set(to, artifacts.get(from)); artifacts.delete(from); },
+    unlinkSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); artifacts.delete(file); }
   };
   const io = { ...f.io, platform, fs: fakeFs, systemdVersion: 240, runner: { async exec(command, args) {
     calls.push(args);
@@ -233,13 +237,14 @@ for (const platform of ['darwin', 'linux', 'win32']) test(platform + ' registrat
   if (platform === 'linux') assert.equal(calls.filter(args => args.includes('daemon-reload')).length, 2);
   fail = false;
   assert.equal(await install(['--json'], f.env, io), 0);
-  assert.equal(artifacts.size, 1);
+  assert.equal(artifacts.size, 2);
 });
 
 test('existing artefacts distinguish absent and present registrations without overwriting', async t => {
   const f = fixture(t);
   assert.equal(await install(['--json'], f.env, f.io), 0);
   const result = JSON.parse(f.output.pop()); const original = fs.readFileSync(result.artefactPath, 'utf8');
+  fs.unlinkSync(path.join(f.home, 'state/install.json'));
   assert.equal(await install(['--json'], f.env, f.io), 4);
   const orphan = JSON.parse(f.output.pop());
   assert.equal(orphan.status, 'artefact-exists-unregistered');
@@ -301,4 +306,154 @@ test('systemd rejects control whitespace and guards trailing path whitespace in 
   assert.match(rendered, /WorkingDirectory=\/tmp\/a b \/\./);
   assert.match(rendered, /StandardOutput=append:\/tmp\/a b \/logs\/watch\.out\.log/);
   assert.doesNotMatch(rendered, /[ \t]+$/m);
+});
+
+test('recorded role and label survive config and suffix changes through status and uninstall', async t => {
+  const f = fixture(t); f.env.ERRMETER_INSTALL_LABEL_SUFFIX = 'original';
+  const configPath = path.join(f.home, 'config.json');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  config.watch.role = 'watcher';
+  fs.writeFileSync(configPath, JSON.stringify(config));
+  assert.equal(await install(['--role', 'agent-host', '--json'], f.env, f.io), 0);
+  const installed = JSON.parse(f.output.pop());
+  const recordPath = path.join(f.home, 'state/install.json');
+  const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+  assert.deepEqual(Object.keys(record), ['schema', 'platform', 'role', 'scope', 'label', 'artefactPath', 'nodePath', 'binPath', 'installedAt']);
+  assert.equal(record.schema, 1); assert.equal(record.role, 'agent-host');
+  assert.equal(record.artefactPath, installed.artefactPath);
+  assert.ok(Number.isFinite(Date.parse(record.installedAt)));
+  assert.equal(fs.statSync(recordPath).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(path.dirname(recordPath)), ['install.json']);
+  f.env.ERRMETER_INSTALL_LABEL_SUFFIX = 'changed';
+  let registered = true;
+  f.io.runner.exec = async (command, args) => {
+    f.calls.push({ command, args });
+    if (args[0] === 'print') { assert.equal(args[1], 'gui/501/' + record.label); return { code: registered ? 0 : 113, stdout: 'pid = 123' }; }
+    if (args[0] === 'bootout') { assert.equal(args[1], 'gui/501/' + record.label); registered = false; }
+    return { code: 0 };
+  };
+  assert.equal(await install(['--json'], f.env, f.io), 4);
+  assert.equal(JSON.parse(f.output.pop()).status, 'already-installed; uninstall first');
+  const { status } = require('../src/status');
+  assert.equal(await status(['--json'], f.env, f.io), 1);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.role, 'agent-host');
+  assert.equal(result.registration_record, recordPath);
+  assert.ok(result.warnings.includes('installed role agent-host differs from config watch.role watcher'));
+  assert.equal(await uninstall([], f.env, f.io), 0);
+  assert.equal(fs.existsSync(recordPath), false);
+  assert.equal(fs.existsSync(installed.artefactPath), false);
+});
+
+test('stale record blocks reinstall until uninstall and dry-run never writes a record', async t => {
+  const f = fixture(t); const recordPath = path.join(f.home, 'state/install.json');
+  assert.equal(await install(['--dry-run'], f.env, f.io), 0);
+  assert.equal(fs.existsSync(recordPath), false);
+  assert.equal(await install([], f.env, f.io), 0);
+  const bytes = fs.readFileSync(recordPath, 'utf8');
+  assert.equal(await install(['--json'], f.env, f.io), 4);
+  assert.equal(JSON.parse(f.output.pop()).message, 'stale install record at ' + recordPath + '; run uninstall to clean up');
+  assert.equal(await uninstall(['--dry-run'], f.env, f.io), 0);
+  assert.equal(fs.readFileSync(recordPath, 'utf8'), bytes);
+  assert.equal(await uninstall([], f.env, f.io), 0);
+  assert.equal(fs.existsSync(recordPath), false);
+  assert.equal(await install([], f.env, f.io), 0);
+});
+
+test('explicit uninstall target wins with warnings and preserves another registration record', async t => {
+  const f = fixture(t);
+  assert.equal(await install(['--role', 'watcher'], f.env, f.io), 0);
+  assert.equal(await uninstall(['--role', 'agent-host', '--system', '--dry-run', '--json'], f.env, { ...f.io, uid: 0 }), 0);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.role, 'agent-host'); assert.equal(result.scope, 'system');
+  assert.ok(result.notes.includes('explicit role agent-host differs from installed role watcher'));
+  assert.ok(result.notes.includes('explicit scope system differs from installed scope user'));
+  assert.equal(await uninstall(['--role', 'agent-host'], f.env, f.io), 0);
+  assert.ok(fs.existsSync(path.join(f.home, 'state/install.json')));
+});
+
+test('record rename failure unregisters service and removes only newly created artefacts', async t => {
+  const f = fixture(t); const calls = [];
+  const io = { ...f.io, fs: new Proxy(fs, { get(target, key) {
+    if (key === 'renameSync') return () => { throw Object.assign(new Error(), { code: 'EACCES' }); };
+    return target[key];
+  } }), runner: { async exec(command, args) { calls.push(args); return { code: args[0] === 'print' ? 113 : 0 }; } } };
+  assert.equal(await install(['--json'], f.env, io), 3);
+  assert.equal(JSON.parse(f.output.pop()).rollback, 'removed-created-artefact');
+  assert.deepEqual(calls.map(args => args[0]), ['print', 'bootstrap', 'bootout']);
+  assert.deepEqual(fs.readdirSync(path.join(f.home, 'state')), []);
+});
+
+test('Windows system wrapper honors ProgramData while retaining the configured home', () => {
+  const ctx = { ...context('watcher', 'system'), env: { ProgramData: 'D:\\Shared Data' }, home: 'C:\\Users\\test\\.errmeter' };
+  const spec = schtasks.plan(ctx);
+  assert.equal(spec.artefactPath, 'D:\\Shared Data\\errmeter\\errmeter-watcher.cmd');
+  assert.match(spec.content, /ERRMETER_HOME=C:\\Users\\test\\.errmeter/);
+  assert.equal(schtasks.artefactPath(ctx.role, ctx.scope, ctx), spec.artefactPath);
+});
+
+for (const linger of ['yes', 'no', 'unknown']) test('Linux user status reports linger ' + linger, async t => {
+  const f = fixture(t); const calls = [];
+  const io = { ...f.io, platform: 'linux', username: 'test-user', runner: { async exec(command, args) {
+    calls.push({ command, args });
+    if (command === 'loginctl') {
+      if (linger === 'unknown') throw Object.assign(new Error(), { code: 'ENOENT' });
+      return { code: 0, stdout: 'Linger=' + linger + '\n' };
+    }
+    return args.includes('is-enabled') ? { code: 4, stdout: 'not-found' } : { code: 4 };
+  } } };
+  assert.equal((await registrationStatus({}, f.env, io)).linger, linger);
+  assert.deepEqual(calls.at(-1), { command: 'loginctl', args: ['show-user', 'test-user', '-p', 'Linger'] });
+  assert.equal(await require('../src/status').status([], f.env, io), 1);
+  assert.match(f.output.pop(), new RegExp('linger: ' + linger));
+});
+
+test('status explicit role overrides the recorded role while preserving recorded scope', async t => {
+  const f = fixture(t);
+  assert.equal(await install([], f.env, f.io), 0);
+  const recordPath = path.join(f.home, 'state/install.json');
+  const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+  record.scope = 'system';
+  fs.writeFileSync(recordPath, JSON.stringify(record));
+  const io = { ...f.io, runner: { async exec(command, args) {
+    assert.deepEqual(args, ['print', 'system/ai.caty.errmeter.watcher']);
+    return { code: 113 };
+  } } };
+  assert.equal(await require('../src/status').status(['--role', 'watcher', '--json'], f.env, io), 1);
+  assert.equal(JSON.parse(f.output.pop()).role, 'watcher');
+  assert.equal(await require('../src/status').status(['--role', 'invalid'], f.env, io), 2);
+});
+
+test('status without a record reports absence and honors explicit role', async t => {
+  const f = fixture(t);
+  assert.equal(await require('../src/status').status(['--role', 'watcher'], f.env, f.io), 1);
+  assert.match(f.output.pop(), /role=watcher.*registration record: none/);
+  assert.equal(f.calls.at(-1).args[1], 'gui/501/ai.caty.errmeter.watcher');
+});
+
+test('implicit uninstall uses the record when watcher config has no dispatch', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify({ schema: 1, sink: { type: 'file' }, watch: { role: 'watcher' } }));
+  assert.equal(await install(['--role', 'agent-host', '--json'], f.env, f.io), 0);
+  const installed = JSON.parse(f.output.pop());
+  f.io.runner.exec = async (command, args) => {
+    f.calls.push({ command, args });
+    return { code: 0 };
+  };
+  assert.equal(await uninstall([], f.env, f.io), 0);
+  assert.ok(f.calls.some(call => call.args[0] === 'bootout' && call.args[1] === 'gui/501/' + installed.label));
+  assert.equal(fs.existsSync(installed.artefactPath), false);
+  assert.equal(fs.existsSync(path.join(f.home, 'state/install.json')), false);
+});
+
+for (const configState of ['missing', 'invalid']) test('stale uninstall cleans recorded registration with ' + configState + ' config', async t => {
+  const f = fixture(t);
+  assert.equal(await install(['--json'], f.env, f.io), 0);
+  const installed = JSON.parse(f.output.pop());
+  const configPath = path.join(f.home, 'config.json');
+  if (configState === 'missing') fs.unlinkSync(configPath);
+  else fs.writeFileSync(configPath, '{');
+  assert.equal(await uninstall([], f.env, { ...f.io, resolveConfig: () => assert.fail('must not validate config for recorded uninstall') }), 0);
+  assert.equal(fs.existsSync(installed.artefactPath), false);
+  assert.equal(fs.existsSync(path.join(f.home, 'state/install.json')), false);
 });

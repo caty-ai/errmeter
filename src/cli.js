@@ -4,7 +4,7 @@ const USAGE = 'Usage: errmeter <emit|flush|watch|init|status|install|uninstall> 
   'emit: --agent NAME --kind error|heartbeat --message TEXT [--detail-file PATH | --detail -] [--tail N] [--task TEXT] [--meta k=v] [--no-flush]\n' +
   'watch: [--role watcher|agent-host] [--once] [--interval SEC]\n' +
   'init: [--repo OWNER/REPO] [--family NAME] [--host NAME] [--role watcher|agent-host] [--force] [--check]\n' +
-  'status: [--check] [--notify-test]\n' +
+  'status: [--check] [--notify-test] [--role watcher|agent-host]\n' +
   'install/uninstall: [--role watcher|agent-host] [--dry-run] [--user|--system]\n' +
   'Values starting with -- must be passed as --flag=value.\n';
 class UsageError extends Error {}
@@ -144,9 +144,10 @@ function parseStatus(argv) {
       if (match[2] !== undefined) throw new UsageError('status: boolean flags take no value');
       result[key] = true;
     } else {
-      if (key !== 'home' && key !== 'config') throw new UsageError('status: unknown flag');
+      if (key !== 'home' && key !== 'config' && key !== 'role') throw new UsageError('status: unknown flag');
       const value = match[2] === undefined ? argv[++i] : match[2];
       if (!value || (match[2] === undefined && value.startsWith('--'))) throw new UsageError('status: missing flag value');
+      if (key === 'role' && !['watcher', 'agent-host'].includes(value)) throw new UsageError('status: invalid role');
       result[key] = value;
     }
   }
