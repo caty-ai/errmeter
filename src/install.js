@@ -127,13 +127,30 @@ async function command(action, argv, env, io) {
     }
     let spec;
     if (record) {
-      // Existing registration identity is sufficient for removal or a reinstall
-      // preview/refusal, even when the current config or credentials are broken.
+      // Registration identity permits removal/refusal even with broken config.
       const configPath = path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json'));
       spec = buildSpec(flags, env, { ...io, nodePath: record.nodePath, binPath: record.binPath,
         resolved: { home, configPath, config: { watch: { role: record.role } } } });
     }
-    if (!spec && (action === 'uninstall' || flags['dry-run'])) {
+    if (record && action === 'install') {
+      const existing = await registrationStatus(flags, env, { ...io, spec: recordedSpec(spec, record) });
+      if (existing.registered || !flags['dry-run']) return report({ command: action, status: existing.registered ? 'already-installed; uninstall first' : 'stale-install-record',
+        ...(!existing.registered ? { message: staleMessage } : {}) }, 4);
+      warnings.push(staleMessage);
+      spec = undefined;
+    }
+    if (!spec && action === 'install' && flags['dry-run']) {
+      try { spec = buildSpec(flags, env, io); }
+      catch (error) {
+        if (!(error instanceof ConfigError) || error.code === 'EPERM_TOKEN_FILE_MODE' ||
+            !['watch: cannot read credential file', 'watch: credential file is required'].includes(error.message)) throw error;
+        const resolved = (io.resolveConfig || resolveConfig)(flags, env, { command: 'status' });
+        require('./status').localConfig(flags, env, io);
+        warnings.push('credential file not found; install will need it');
+        spec = buildSpec(flags, env, { ...io, resolved });
+      }
+    }
+    if (!spec && action === 'uninstall') {
       let resolved;
       try {
         resolved = io.resolved || (io.resolveConfig || resolveConfig)(flags, env, { command: 'status' });
@@ -142,7 +159,7 @@ async function command(action, argv, env, io) {
         if (!io.resolved) require('./status').localConfig(flags, env, io);
       } catch (error) {
         if (!(error instanceof ConfigError)) throw error;
-        if (!flags.role || !(flags.user || flags.system)) throw new ConfigError(action + ': pass --role and --user|--system, or fix the config');
+        if (!flags.role || !(flags.user || flags.system)) throw new ConfigError('pass --role and --user|--system, or fix the config');
         resolved = { home, configPath: path.resolve(flags.config ?? env.ERRMETER_CONFIG ?? path.join(home, 'config.json')),
           config: { watch: { role: flags.role } } };
       }
@@ -153,12 +170,6 @@ async function command(action, argv, env, io) {
       if (flags.role && flags.role !== record.role) warnings.push('explicit role ' + flags.role + ' differs from installed role ' + record.role);
       if ((flags.user || flags.system) && spec.scope !== record.scope) warnings.push('explicit scope ' + spec.scope + ' differs from installed scope ' + record.scope);
       spec = recordedSpec(spec, record, flags);
-    }
-    if (record && action === 'install') {
-      const existing = await registrationStatus(flags, env, { ...io, spec: recordedSpec(spec, record) });
-      if (!flags['dry-run']) return report({ command: action, status: existing.registered ? 'already-installed; uninstall first' : 'stale-install-record',
-        ...(!existing.registered ? { message: staleMessage } : {}) }, 4);
-      if (!existing.registered) warnings.push(staleMessage);
     }
     if (!flags['dry-run'] && spec.adapter.assertPrivilege) await spec.adapter.assertPrivilege(spec, io.runner || runner);
     if (spec.adapter.prepare) {
@@ -223,7 +234,15 @@ async function command(action, argv, env, io) {
       }
     } else {
       if (state.registered) await spec.adapter.uninstall(spec, io.runner || runner);
-      if (exists) files.unlinkSync(spec.artefactPath);
+      if (exists) {
+        try { files.unlinkSync(spec.artefactPath); }
+        catch (error) {
+          if (error.code !== 'ENOENT') {
+            notes.push('warning: could not remove artefact at ' + spec.artefactPath + '; ' + safeReason(error));
+            summary.notes = notes;
+          }
+        }
+      }
       for (const item of spec.afterRemove || []) await exec(item);
       removeRecord();
     }
