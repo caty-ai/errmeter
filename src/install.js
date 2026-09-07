@@ -23,8 +23,8 @@ function safeReason(error) {
   return 'invalid configuration or platform operation failed';
 }
 function artefactLeftBehind(spec) {
-  if (spec.platform === 'darwin') return '; launchd re-bootstraps it at next login — remove it by hand';
-  if (spec.platform === 'linux') return '; the unit is disabled but its file remains — remove it by hand, then run \'systemctl ' + (spec.scope === 'user' ? '--user ' : '') + 'daemon-reload\'';
+  if (spec.platform === 'darwin') return '; launchd re-bootstraps it at next ' + (spec.scope === 'system' ? 'boot' : 'login') + ' — remove it by hand';
+  if (spec.platform === 'linux') return '; the unit is disabled but its file remains — remove it by hand, then run \'systemctl ' + (spec.scope === 'system' ? '' : '--user ') + 'daemon-reload\'';
   if (spec.platform === 'win32') return '; the task is deleted but the wrapper file remains — remove it by hand';
   return '; remove it by hand';
 }
@@ -245,10 +245,8 @@ async function command(action, argv, env, io) {
         try { files.unlinkSync(spec.artefactPath); }
         catch (error) {
           if (error.code !== 'ENOENT') {
-            let stillExists = false;
-            try { files.lstatSync(spec.artefactPath); stillExists = true; }
-            catch (statError) { if (statError.code !== 'ENOENT') throw statError; }
-            if (stillExists) artefactError = error;
+            try { files.lstatSync(spec.artefactPath); artefactError = error; }
+            catch (statError) { if (statError.code !== 'ENOENT') artefactError = error; }
           }
         }
       }

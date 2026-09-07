@@ -56,24 +56,34 @@ function fixture(t) {
   return { root, home, env: { ERRMETER_HOME: home }, calls, output, errors, io };
 }
 test('artefact-left-behind clauses are platform-specific', () => {
+  assert.equal(artefactLeftBehind({ platform: 'darwin', scope: 'user' }), '; launchd re-bootstraps it at next login — remove it by hand');
+  assert.equal(artefactLeftBehind({ platform: 'darwin', scope: 'system' }), '; launchd re-bootstraps it at next boot — remove it by hand');
   assert.equal(artefactLeftBehind({ platform: 'darwin' }), '; launchd re-bootstraps it at next login — remove it by hand');
   assert.equal(artefactLeftBehind({ platform: 'linux', scope: 'user' }), "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'");
   assert.equal(artefactLeftBehind({ platform: 'linux', scope: 'system' }), "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl daemon-reload'");
+  assert.equal(artefactLeftBehind({ platform: 'linux' }), "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'");
   assert.equal(artefactLeftBehind({ platform: 'win32' }), '; the task is deleted but the wrapper file remains — remove it by hand');
   assert.equal(artefactLeftBehind({ platform: 'other' }), '; remove it by hand');
 });
 
-async function installedArtefactFailure(t, platform, scope, afterRemoveFails = false) {
+async function installedArtefactFailure(t, platform, scope, afterRemoveFails = false, statAfterUnlinkCode) {
   const f = fixture(t); const artifacts = new Map(); const calls = [];
-  let artefactPath; let rejectArtefactRemoval = false; let registered = false; let removedRegistration = false;
+  let artefactPath; let rejectArtefactRemoval = false; let artefactUnlinkFailed = false; let registered = false; let removedRegistration = false;
   const disk = {
     readFileSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return artifacts.get(file); },
-    lstatSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return {}; },
+    lstatSync(file) {
+      if (artefactUnlinkFailed && file === artefactPath && statAfterUnlinkCode) throw Object.assign(new Error('private-stat-failure'), { code: statAfterUnlinkCode });
+      if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' });
+      return {};
+    },
     mkdirSync() {},
     writeFileSync(file, content, options) { assert.equal(options.flag, 'wx'); artifacts.set(file, content); },
     renameSync(from, to) { artifacts.set(to, artifacts.get(from)); artifacts.delete(from); },
     unlinkSync(file) {
-      if (rejectArtefactRemoval && file === artefactPath) throw Object.assign(new Error('private-failure'), { code: 'EPERM' });
+      if (rejectArtefactRemoval && file === artefactPath) {
+        artefactUnlinkFailed = true;
+        throw Object.assign(new Error('private-failure'), { code: 'EPERM' });
+      }
       if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' });
       artifacts.delete(file);
     }
@@ -107,9 +117,11 @@ async function installedArtefactFailure(t, platform, scope, afterRemoveFails = f
 
 for (const [platform, scope, clause] of [
   ['darwin', 'user', '; launchd re-bootstraps it at next login — remove it by hand'],
+  ['darwin', 'system', '; launchd re-bootstraps it at next boot — remove it by hand'],
   ['linux', 'user', "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'"],
   ['linux', 'system', "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl daemon-reload'"],
-  ['win32', 'user', '; the task is deleted but the wrapper file remains — remove it by hand']
+  ['win32', 'user', '; the task is deleted but the wrapper file remains — remove it by hand'],
+  ['win32', 'system', '; the task is deleted but the wrapper file remains — remove it by hand']
 ]) test('uninstall reports retained ' + platform + '/' + scope + ' artefact precisely', async t => {
   const f = await installedArtefactFailure(t, platform, scope);
   assert.equal(await uninstall(f.args, f.env, f.io), 3);
@@ -126,6 +138,22 @@ for (const [platform, scope, clause] of [
     assert.deepEqual(f.calls[reload].args, ['--user', 'daemon-reload']);
     assert.ok(disable < reload);
   }
+});
+
+test('uninstall preserves the artefact failure when lstat after unlink also fails', async t => {
+  const f = await installedArtefactFailure(t, 'linux', 'user', false, 'EACCES');
+  assert.equal(await uninstall(f.args, f.env, f.io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.status, 'failed');
+  assert.ok(result.reason.startsWith('artefact still present at ' + f.installed.artefactPath + ': platform or filesystem operation failed (EPERM)'));
+  assert.ok(result.reason.endsWith("; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'"));
+  assert.equal(result.reason.includes('EACCES'), false);
+  assert.equal(result.reason.includes('private-stat-failure'), false);
+  assert.equal(f.artifacts.has(f.recordPath), true);
+  const disable = f.calls.findIndex(call => call.args.includes('disable'));
+  const reload = f.calls.findLastIndex(call => call.args.includes('daemon-reload'));
+  assert.deepEqual(f.calls[reload].args, ['--user', 'daemon-reload']);
+  assert.ok(disable < reload);
 });
 
 test('uninstall reports afterRemove failure without losing the retained-artefact reason', async t => {

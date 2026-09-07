@@ -439,7 +439,7 @@ The watch text summary line carries `scanned=` / `unscanned=` and, when a tick r
 
 ## Changelog
 
-- v1.7 note (2026-09-07, #24 follow-ups a–c): platform-specific artefact-left-behind hint on uninstall; afterRemove (systemd daemon-reload) runs even when the artefact cannot be deleted; §11 now documents the uninstall failure path and the token-less dry-run note. Exit-code meanings, event schema, spool format, config keys and defaults unchanged; no version bump of the contract.
+- v1.7 note (2026-09-07, #24 follow-ups a–c): platform-specific artefact-left-behind hint on uninstall; afterRemove (systemd daemon-reload) runs even when the artefact cannot be deleted; §11 now documents the uninstall failure path and the token-less dry-run note; safeReason now returns the constant 'registration command failed' for a bare post-removal/rollback command failure (previously 'invalid configuration or platform operation failed'), still exit 3. Exit-code meanings, event schema, spool format, config keys and defaults unchanged; no version bump of the contract.
 
 - v1.7 note (2026-09-06, #24): token-less uninstall and install/uninstall dry-run; stale install dry-run previews, while registered records still refuse with exit 4; Linux user loginctl probes only with --check or registered degraded status; init --api-base selects the existing sink.api_base setting. The `linger` status value gains `not probed (use --check)`; event schema, spool format, config keys and exit-code meanings unchanged; an artefact that cannot be removed on uninstall exits 3 and keeps the install record.
 
