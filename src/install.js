@@ -18,9 +18,15 @@ function safeReason(error) {
   if (error instanceof ConfigError) return error.message;
   // Never echo tool output, command arguments, or filesystem paths in errors.
   const message = String(error?.message || '');
-  if (/^(?:unsupported platform|invalid role|invalid registration path|invalid install label suffix|unsupported Windows path|unsupported scheduled task path|unsupported systemd path whitespace|system registration requires (?:root|administrator)|system registration privilege could not be determined|(?:launchctl|systemctl|schtasks) [A-Za-z/-]+(?: [A-Za-z/-]+)? failed|registration command failed: (?:systemctl (?:daemon-reload|enable --now|disable --now)|schtasks \/(?:Create|Delete)))$/.test(message)) return message;
+  if (/^(?:unsupported platform|invalid role|invalid registration path|invalid install label suffix|unsupported Windows path|unsupported scheduled task path|unsupported systemd path whitespace|system registration requires (?:root|administrator)|system registration privilege could not be determined|(?:launchctl|systemctl|schtasks) [A-Za-z/-]+(?: [A-Za-z/-]+)? failed|registration command failed(?:: (?:systemctl (?:daemon-reload|enable --now|disable --now)|schtasks \/(?:Create|Delete)))?)$/.test(message)) return message;
   if (['ENOENT', 'EACCES', 'EPERM', 'ENOSPC', 'EROFS'].includes(error?.code)) return 'platform or filesystem operation failed (' + error.code + ')';
   return 'invalid configuration or platform operation failed';
+}
+function artefactLeftBehind(spec) {
+  if (spec.platform === 'darwin') return '; launchd re-bootstraps it at next login — remove it by hand';
+  if (spec.platform === 'linux') return '; the unit is disabled but its file remains — remove it by hand, then run \'systemctl ' + (spec.scope === 'user' ? '--user ' : '') + 'daemon-reload\'';
+  if (spec.platform === 'win32') return '; the task is deleted but the wrapper file remains — remove it by hand';
+  return '; remove it by hand';
 }
 function buildSpec(flags, env = process.env, io = {}) {
   const platform = io.platform || process.platform;
@@ -234,6 +240,7 @@ async function command(action, argv, env, io) {
       }
     } else {
       if (state.registered) await spec.adapter.uninstall(spec, io.runner || runner);
+      let artefactError;
       if (exists) {
         try { files.unlinkSync(spec.artefactPath); }
         catch (error) {
@@ -241,11 +248,16 @@ async function command(action, argv, env, io) {
             let stillExists = false;
             try { files.lstatSync(spec.artefactPath); stillExists = true; }
             catch (statError) { if (statError.code !== 'ENOENT') throw statError; }
-            if (stillExists) return report({ ...summary, status: 'failed', reason: 'artefact still present at ' + spec.artefactPath + ': ' + safeReason(error) + '; the service returns at next login — remove it by hand' }, 3);
+            if (stillExists) artefactError = error;
           }
         }
       }
-      for (const item of spec.afterRemove || []) await exec(item);
+      try { for (const item of spec.afterRemove || []) await exec(item); }
+      catch (afterRemoveError) {
+        if (!artefactError) throw afterRemoveError;
+        return report({ ...summary, status: 'failed', reason: 'artefact still present at ' + spec.artefactPath + ': ' + safeReason(artefactError) + artefactLeftBehind(spec) + '; also: ' + safeReason(afterRemoveError) }, 3);
+      }
+      if (artefactError) return report({ ...summary, status: 'failed', reason: 'artefact still present at ' + spec.artefactPath + ': ' + safeReason(artefactError) + artefactLeftBehind(spec) }, 3);
       removeRecord();
     }
     return report({ ...summary, status: action === 'install' ? 'installed' : 'uninstalled' }, 0);
@@ -260,4 +272,4 @@ function uninstall(argv, env = process.env, io = {}) { return command('uninstall
 function main(argv, action = 'install') {
   return (action === 'uninstall' ? uninstall : install)(argv).then(code => { process.exitCode = code; }, () => { process.exitCode = 3; });
 }
-module.exports = { install, uninstall, main, buildSpec, registrationStatus, probeLinger };
+module.exports = { install, uninstall, main, buildSpec, registrationStatus, probeLinger, artefactLeftBehind };
