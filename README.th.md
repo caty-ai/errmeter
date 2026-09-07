@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[🇺🇸 English](https://github.com/caty-ai/errmeter/blob/main/README.md) ｜ [🇯🇵 日本語](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.ja.md) ｜ [🇨🇳 简体中文](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.zh.md) ｜ **🇹🇭 ไทย**
+[🇺🇸 English](https://github.com/caty-ai/errmeter/blob/main/README.md) ｜ [🇯🇵 日本語](https://github.com/caty-ai/errmeter/blob/main/README.ja.md) ｜ [🇨🇳 简体中文](https://github.com/caty-ai/errmeter/blob/main/README.zh.md) ｜ **🇹🇭 ไทย**
 
 ![errmeter: เสียงตะโกนที่ไม่มีวันหายไป โหนดที่เชื่อมต่อกันทั้งสี่จุดนำการแจ้งเตือนจาก emit ผ่าน spool ในเครื่อง และ sink ไปจนถึง watch](https://github.com/caty-ai/errmeter/raw/main/assets/readme/hero.png)
 
@@ -194,7 +194,31 @@ fine-grained personal access token คือข้อมูลรับรอง
 | Agent hook, job wrapper และ heartbeat | [Integrations](https://github.com/caty-ai/errmeter/blob/main/docs/integrations/README.md) |
 | การทดสอบในเครื่องและขั้นตอนการมีส่วนร่วม | [Contributing](https://github.com/caty-ai/errmeter/blob/main/CONTRIBUTING.md) |
 | การรายงานช่องโหว่แบบส่วนตัว | [Security policy](https://github.com/caty-ai/errmeter/blob/main/SECURITY.md) |
-| README ฉบับภาษาอื่น | [English](https://github.com/caty-ai/errmeter/blob/main/README.md) / [日本語](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.ja.md) / [简体中文](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.zh.md) / [ไทย](https://github.com/caty-ai/errmeter/blob/main/docs/i18n/README.th.md) |
+| README ฉบับภาษาอื่น | [English](https://github.com/caty-ai/errmeter/blob/main/README.md) / [日本語](https://github.com/caty-ai/errmeter/blob/main/README.ja.md) / [简体中文](https://github.com/caty-ai/errmeter/blob/main/README.zh.md) / [ไทย](https://github.com/caty-ai/errmeter/blob/main/README.th.md) |
+
+<!-- family:generated:family-footer:start -->
+
+---
+
+รีโพนี้เป็นส่วนหนึ่งของ **ครอบครัว Caty AI** — ชุดเครื่องมือโอเพนซอร์สสำหรับดูแลครอบครัวเอเจนต์ AI แผนที่ฉบับเต็ม (รวมโมดูลที่กำลังเตรียมเปิด) อยู่ที่ [Family OS](https://github.com/caty-ai/family-os)
+
+| แกน | โมดูล | ทำอะไร | สถานะ |
+| --- | --- | --- | --- |
+| แผนที่ | [Family OS](https://github.com/caty-ai/family-os) | แผนที่ของทั้งครอบครัว — โมดูล สถานะ และโครงสร้าง | เปิดแล้ว・MIT |
+| กติกา | [Family Dev Handbook](https://github.com/caty-ai/family-dev-handbook) | กติกากลางของการพัฒนา — Issue, PR, worktree, การส่งงานต่อ และการทำงานคู่ขนาน | เปิดแล้ว・MIT |
+| แกนตั้ง · รากฐาน | [Caty Agent Harness](https://github.com/caty-ai/caty-agent-harness) | แกนงานของเอเจนต์ AI — การลองใหม่ เช็คพอยต์ และการตัดสินว่าเสร็จจริง | เปิดแล้ว・MIT |
+| แกนตั้ง | [context-kit](https://github.com/caty-ai/context-kit) | ชุดดูแลคอนเท็กซ์ 6 ชิ้นสำหรับเอเจนต์หนึ่งตัว — จำกัดเอาต์พุตขนาดใหญ่, ตรวจ brief การมอบงาน, การ์ดความปลอดภัย, ค้นความทรงจำ, snapshot ของ worktree | เปิดแล้ว・MIT |
+| แกนตั้ง | [Persona Engine](https://github.com/caty-ai/persona-engine) | ซ้อนเลเยอร์ความสัมพันธ์และอารมณ์บนบุคลิกเดิมของเอเจนต์ | เปิดแล้ว・MIT |
+| แกนตั้ง | [Persona Growth Loop](https://github.com/caty-ai/persona-growth-loop) | พัฒนาบุคลิกของเอเจนต์ — สร้างข้อเสนอแบบน้อยที่สุดและทำซ้ำได้ | เปิดแล้ว・MIT |
+| แกนตั้ง | [X Collector](https://github.com/caty-ai/x-collector) | รวบรวมข้อมูลจาก X และเว็บเป็นสรุปวันละฉบับ — สำหรับคนและเอเจนต์ | เปิดแล้ว・MIT |
+| แกนตั้ง | [Self Growth Loop](https://github.com/caty-ai/self-growth-loop) | วงจรให้เอเจนต์พัฒนาความสามารถของตัวเอง — ข้อเสนอ ธรรมาภิบาล และบันทึกการนำไปใช้ | เปิดแล้ว・MIT |
+| แกนนอน · รากฐาน | [Family Memory Architecture](https://github.com/caty-ai/family-memory-architecture) | บัสความทรงจำ — ชั้นที่ครอบครัวใช้แบ่งปันสิ่งที่รู้ | เปิดแล้ว・MIT |
+| แกนนอน | [Sitter](https://github.com/caty-ai/sitter) | พี่เลี้ยงของงานที่มอบหมายให้เอเจนต์ — เฝ้าดู เก็บหลักฐาน และรีสตาร์ตเฉพาะในขอบเขตที่ประกาศไว้ | เปิดแล้ว・MIT |
+| แกนนอน | [Alpha Nightshift](https://github.com/caty-ai/alpha-nightshift) | ลูปบำรุงรักษาอัตโนมัติยามค่ำคืน — เลนกลางคืนทำงานหลังการ์ดแบบปฏิเสธโดยปริยาย ตอนเช้ามนุษย์เลือก cherry-pick | เปิดแล้ว・MIT |
+| แกนนอน | **errmeter** | รายงาน AI agent และงานตั้งเวลาที่ล้มเหลวหรือเงียบหายข้ามเครื่อง — emit, spool, บอร์ดกลาง, repair hook; เสียงตะโกนที่ไม่มีวันหายไป | เปิดแล้ว・MIT |
+| แกนตั้ง | [Caty Gateway](https://github.com/caty-ai/caty-gateway) | เกตเวย์ฝั่ง PC ของ CatyPhone — ติดตั้งด้วยคำสั่งบรรทัดเดียว เชื่อมโทรศัพท์กับเอเจนต์ที่รันบนเครื่องของคุณ (Claude Code / Codex CLI / OpenClaw / Hermes / OpenAI-compatible) | เปิดแล้ว・MIT |
+
+<!-- family:generated:family-footer:end -->
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "errmeter",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Error meter reading for AI agent families: emit, spool, sink, watch. Zero deps, Node 18+.",
   "license": "MIT",
   "publishConfig": { "access": "public" },
