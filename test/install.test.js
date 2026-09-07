@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { install, uninstall, registrationStatus } = require('../src/install');
+const { install, uninstall, registrationStatus, artefactLeftBehind } = require('../src/install');
 const launchd = require('../src/platform/launchd');
 const systemd = require('../src/platform/systemd');
 const schtasks = require('../src/platform/schtasks');
@@ -55,6 +55,119 @@ function fixture(t) {
     runner: { async exec(command, args) { calls.push({ command, args }); return args[0] === 'print' ? { code: 113, stderr: 'Could not find service' } : { code: 0 }; } } };
   return { root, home, env: { ERRMETER_HOME: home }, calls, output, errors, io };
 }
+test('artefact-left-behind clauses are platform-specific', () => {
+  assert.equal(artefactLeftBehind({ platform: 'darwin', scope: 'user' }), '; launchd re-bootstraps it at next login — remove it by hand');
+  assert.equal(artefactLeftBehind({ platform: 'darwin', scope: 'system' }), '; launchd re-bootstraps it at next boot — remove it by hand');
+  assert.equal(artefactLeftBehind({ platform: 'darwin' }), '; launchd re-bootstraps it at next login — remove it by hand');
+  assert.equal(artefactLeftBehind({ platform: 'linux', scope: 'user' }), "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'");
+  assert.equal(artefactLeftBehind({ platform: 'linux', scope: 'system' }), "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl daemon-reload'");
+  assert.equal(artefactLeftBehind({ platform: 'linux' }), "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'");
+  assert.equal(artefactLeftBehind({ platform: 'win32' }), '; the task is deleted but the wrapper file remains — remove it by hand');
+  assert.equal(artefactLeftBehind({ platform: 'other' }), '; remove it by hand');
+});
+
+async function installedArtefactFailure(t, platform, scope, afterRemoveFails = false, statAfterUnlinkCode) {
+  const f = fixture(t); const artifacts = new Map(); const calls = [];
+  let artefactPath; let rejectArtefactRemoval = false; let artefactUnlinkFailed = false; let registered = false; let removedRegistration = false;
+  const disk = {
+    readFileSync(file) { if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return artifacts.get(file); },
+    lstatSync(file) {
+      if (artefactUnlinkFailed && file === artefactPath && statAfterUnlinkCode) throw Object.assign(new Error('private-stat-failure'), { code: statAfterUnlinkCode });
+      if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' });
+      return {};
+    },
+    mkdirSync() {},
+    writeFileSync(file, content, options) { assert.equal(options.flag, 'wx'); artifacts.set(file, content); },
+    renameSync(from, to) { artifacts.set(to, artifacts.get(from)); artifacts.delete(from); },
+    unlinkSync(file) {
+      if (rejectArtefactRemoval && file === artefactPath) {
+        artefactUnlinkFailed = true;
+        throw Object.assign(new Error('private-failure'), { code: 'EPERM' });
+      }
+      if (!artifacts.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' });
+      artifacts.delete(file);
+    }
+  };
+  const runner = { async exec(command, args) {
+    calls.push({ command, args });
+    if (command === 'launchctl') {
+      if (args[0] === 'print') return registered ? { code: 0, stdout: 'pid = 123' } : { code: 113, stderr: 'Could not find service' };
+      if (args[0] === 'bootstrap') registered = true;
+      if (args[0] === 'bootout') { registered = false; removedRegistration = true; }
+    } else if (command === 'systemctl') {
+      if (args.includes('is-enabled')) return registered ? { code: 0 } : { code: 4, stdout: 'not-found' };
+      if (args.includes('is-active')) return { code: registered ? 0 : 4 };
+      if (args.includes('show')) return { code: 0, stdout: 'MainPID=123' };
+      if (args.includes('enable')) registered = true;
+      if (args.includes('disable')) { registered = false; removedRegistration = true; }
+      if (afterRemoveFails && removedRegistration && args.includes('daemon-reload')) return { code: 1 };
+    } else if (command === 'schtasks') {
+      if (args[0] === '/Query') return registered ? { code: 0, stdout: 'Status: Running' } : { code: 1, stderr: 'not found' };
+      if (args[0] === '/Create') registered = true;
+      if (args[0] === '/Delete') { registered = false; removedRegistration = true; }
+    }
+    return { code: 0 };
+  } };
+  const args = [...(scope === 'system' ? ['--system'] : []), '--json'];
+  const io = { ...f.io, platform, uid: scope === 'system' ? 0 : 501, isElevated: true, systemdVersion: 240, fs: disk, runner };
+  assert.equal(await install(args, f.env, io), 0);
+  const installed = JSON.parse(f.output.pop()); artefactPath = installed.artefactPath; rejectArtefactRemoval = true;
+  return { ...f, artifacts, calls, io, args, installed, recordPath: path.join(f.home, 'state/install.json') };
+}
+
+for (const [platform, scope, clause] of [
+  ['darwin', 'user', '; launchd re-bootstraps it at next login — remove it by hand'],
+  ['darwin', 'system', '; launchd re-bootstraps it at next boot — remove it by hand'],
+  ['linux', 'user', "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'"],
+  ['linux', 'system', "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl daemon-reload'"],
+  ['win32', 'user', '; the task is deleted but the wrapper file remains — remove it by hand'],
+  ['win32', 'system', '; the task is deleted but the wrapper file remains — remove it by hand']
+]) test('uninstall reports retained ' + platform + '/' + scope + ' artefact precisely', async t => {
+  const f = await installedArtefactFailure(t, platform, scope);
+  assert.equal(await uninstall(f.args, f.env, f.io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.status, 'failed');
+  assert.ok(result.reason.startsWith('artefact still present at ' + f.installed.artefactPath + ': '));
+  assert.ok(result.reason.endsWith(clause));
+  assert.equal(result.reason, 'artefact still present at ' + f.installed.artefactPath + ': platform or filesystem operation failed (EPERM)' + clause);
+  assert.equal(f.artifacts.has(f.recordPath), true);
+  if (platform === 'linux' && scope === 'user') {
+    const disable = f.calls.findIndex(call => call.args.includes('disable'));
+    const reload = f.calls.findLastIndex(call => call.args.includes('daemon-reload'));
+    assert.deepEqual(f.calls[disable].args, ['--user', 'disable', '--now', f.installed.label]);
+    assert.deepEqual(f.calls[reload].args, ['--user', 'daemon-reload']);
+    assert.ok(disable < reload);
+  }
+});
+
+test('uninstall preserves the artefact failure when lstat after unlink also fails', async t => {
+  const f = await installedArtefactFailure(t, 'linux', 'user', false, 'EACCES');
+  assert.equal(await uninstall(f.args, f.env, f.io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.status, 'failed');
+  assert.ok(result.reason.startsWith('artefact still present at ' + f.installed.artefactPath + ': platform or filesystem operation failed (EPERM)'));
+  assert.ok(result.reason.endsWith("; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'"));
+  assert.equal(result.reason.includes('EACCES'), false);
+  assert.equal(result.reason.includes('private-stat-failure'), false);
+  assert.equal(f.artifacts.has(f.recordPath), true);
+  const disable = f.calls.findIndex(call => call.args.includes('disable'));
+  const reload = f.calls.findLastIndex(call => call.args.includes('daemon-reload'));
+  assert.deepEqual(f.calls[reload].args, ['--user', 'daemon-reload']);
+  assert.ok(disable < reload);
+});
+
+test('uninstall reports afterRemove failure without losing the retained-artefact reason', async t => {
+  const f = await installedArtefactFailure(t, 'linux', 'user', true);
+  assert.equal(await uninstall(f.args, f.env, f.io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.status, 'failed');
+  assert.ok(result.reason.startsWith('artefact still present at ' + f.installed.artefactPath + ': '));
+  assert.ok(result.reason.endsWith('; also: registration command failed'));
+  assert.equal(result.reason, 'artefact still present at ' + f.installed.artefactPath + ': platform or filesystem operation failed (EPERM)' +
+    "; the unit is disabled but its file remains — remove it by hand, then run 'systemctl --user daemon-reload'; also: registration command failed");
+  assert.equal(f.artifacts.has(f.recordPath), true);
+});
+
 test('tokenless uninstall and previews retain strict real install validation', async t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify({ schema: 1, sink: {
@@ -265,7 +378,7 @@ for (const code of ['EPERM', 'EACCES']) test('uninstall artefact cleanup fails w
     if (args[0] === 'bootout') registered = false;
     return { code: 0 };
   } } };
-  const reason = 'artefact still present at ' + installed.artefactPath + ': platform or filesystem operation failed (' + code + '); the service returns at next login — remove it by hand';
+  const reason = 'artefact still present at ' + installed.artefactPath + ': platform or filesystem operation failed (' + code + '); launchd re-bootstraps it at next login — remove it by hand';
   for (let attempt = 0; attempt < 2; attempt++) {
     assert.equal(await uninstall(['--json'], f.env, io), 3);
     const result = JSON.parse(f.output.pop());
