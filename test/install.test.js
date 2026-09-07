@@ -282,6 +282,25 @@ for (const [name, mutate] of [
   assert.equal(f.calls.length, 0);
 });
 
+for (const [name, mutate, reason] of [
+  ['notify webhook URL', config => { config.notify = [{ type: 'webhook', url: 'not a url' }]; }, 'watch: invalid notify webhook URL'],
+  ['sink URL', config => { config.sink.api_base = 'ftp://x'; }, 'watch: invalid sink URL'],
+  ['GitHub repo', config => { config.sink.repo = 'bad'; }, 'watch: invalid GitHub repo']
+]) test('tokenless install preview rejects an invalid ' + name, async t => {
+  const f = fixture(t);
+  const config = { schema: 1, sink: {
+    type: 'github-issue', repo: 'test/inbox', token_file: path.join(f.home, 'missing-token')
+  }, watch: { role: 'agent-host' } };
+  mutate(config);
+  fs.writeFileSync(path.join(f.home, 'config.json'), JSON.stringify(config));
+  assert.equal(await install(['--role', 'agent-host', '--user', '--dry-run', '--json'], f.env, f.io), 3);
+  const result = JSON.parse(f.output.pop());
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, reason);
+  assert.equal(f.calls.length, 0);
+  assert.equal(fs.existsSync(path.join(f.home, 'state/install.json')), false);
+});
+
 test('install preview rejects an unconfigured credential file', async t => {
   const f = fixture(t);
   for (const config of [

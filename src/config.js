@@ -151,6 +151,26 @@ function flushConfig(result, env, options, flags) {
       throw error;
     }
   }
+  function checkURL(value, label) {
+    try {
+      const url = new URL(value);
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error();
+    } catch (_) { throw invalid('invalid ' + label + ' URL'); }
+  }
+  // Validate every non-secret setting before reading any credential file.
+  if (config.sink.type === 'github-issue' &&
+      (typeof config.sink.repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.sink.repo))) throw invalid('invalid GitHub repo');
+  if (config.sink.type !== 'file') checkURL(config.sink.type === 'github-issue' ? config.sink.api_base : config.sink.url, 'sink');
+  for (const entry of config.notify) {
+    // Notify types were already validated above, so the terminal branch is webhook.
+    if (entry.type === 'telegram') {
+      if (!['string', 'number'].includes(typeof entry.chat_id) || !String(entry.chat_id).trim()) throw invalid('invalid Telegram chat_id');
+    } else if (entry.type === 'slack') {
+      // The Slack URL is read from its credential file below.
+    } else {
+      checkURL(entry.url, 'notify webhook');
+    }
+  }
   // Inline credentials are never accepted as sources.
   delete config.sink.token;
   delete config.sink.headers;
@@ -160,7 +180,6 @@ function flushConfig(result, env, options, flags) {
     if (typeof token !== 'string' || !token.trim() || /[\r\n]/.test(token)) throw invalid('missing or invalid GitHub credential');
     config.sink.token = token.trim();
     secrets.push(config.sink.token);
-    if (typeof config.sink.repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.sink.repo)) throw invalid('invalid GitHub repo');
   }
   function readHeaders(file) {
     let headers;
@@ -171,13 +190,6 @@ function flushConfig(result, env, options, flags) {
     return headers;
   }
   if (config.sink.type === 'webhook' && config.sink.headers_file) config.sink.headers = readHeaders(config.sink.headers_file);
-  function checkURL(value, label) {
-    try {
-      const url = new URL(value);
-      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error();
-    } catch (_) { throw invalid('invalid ' + label + ' URL'); }
-  }
-  if (config.sink.type !== 'file') checkURL(config.sink.type === 'github-issue' ? config.sink.api_base : config.sink.url, 'sink');
   for (const entry of config.notify) {
     delete entry.token;
     delete entry.bot_token;
@@ -186,14 +198,12 @@ function flushConfig(result, env, options, flags) {
     if (entry.type === 'telegram') {
       entry.token = readSecret(entry.bot_token_file);
       if (!entry.token || /[\s/?#]/.test(entry.token)) throw invalid('invalid Telegram credential');
-      if (!['string', 'number'].includes(typeof entry.chat_id) || !String(entry.chat_id).trim()) throw invalid('invalid Telegram chat_id');
       secrets.push(entry.token);
     } else if (entry.type === 'slack') {
       entry.webhook_url = readSecret(entry.webhook_url_file);
       checkURL(entry.webhook_url, 'Slack webhook');
       secrets.push(entry.webhook_url);
     } else {
-      checkURL(entry.url, 'notify webhook');
       if (entry.headers_file !== undefined) entry.headers = readHeaders(entry.headers_file);
     }
   }
