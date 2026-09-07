@@ -129,7 +129,7 @@ errmeter --help
 errmeter init --repo <owner>/<inbox> --role agent-host
 ```
 
-如果需要自定义的 HTTPS API 端点，使用 `init --api-base URL`（只有 localhost/127.0.0.1 允许使用 HTTP）；卸载以及安装/卸载的 dry-run 都不需要令牌，过期的安装记录会在 dry-run 预览中提示。Linux 上的用户状态探测进程只有在使用 `--check`，或某个已注册服务的状态处于 degraded（异常）时才会持续存在。
+如果需要自定义的 HTTPS API 端点，使用 `init --api-base URL`（只有 localhost/127.0.0.1 允许使用 HTTP）；卸载以及安装/卸载的 dry-run 都不需要令牌，过时的安装记录会在 dry-run 预览中提示。Linux 上的用户状态探测进程只有在使用 `--check`，或某个已注册服务的状态处于 degraded（降级）时才会持续存在。
 
 把你的细粒度令牌以纯文本形式保存在 `~/.errmeter/github-token` 中；在 macOS/Linux 上，文件权限设为 **0600**（只有你自己的用户能读写）。在 Windows 上，使用 `%USERPROFILE%\.errmeter\github-token`，并将该目录的访问控制限制为你自己的用户。不要把令牌留在 shell 历史记录、消息或日志中。
 
