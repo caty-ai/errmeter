@@ -439,7 +439,7 @@ The watch text summary line carries `scanned=` / `unscanned=` and, when a tick r
 
 ## Changelog
 
-- v1.7 note (2026-09-07, #39): strict config resolution validates all non-secret settings (sink repo/URL, notify types, chat_id, plain webhook URLs) before reading any credential file, so a config fault is reported ahead of a missing or unreadable credential and token-less install --dry-run no longer previews a config that watch would reject. Messages, exit codes, fields, formats, config keys and defaults unchanged.
+- v1.7 note (2026-09-07, #39): strict config resolution validates all non-secret settings (sink repo/URL, Telegram chat_id, plain webhook URLs) before reading any credential file, so a config fault is reported ahead of a missing or unreadable credential and token-less install --dry-run no longer previews a config that watch would reject. Messages, exit codes, fields, formats, config keys and defaults unchanged.
 
 - v1.7 note (2026-09-07, #24 follow-ups a–c): platform-specific artefact-left-behind hint on uninstall; afterRemove (systemd daemon-reload) runs even when the artefact cannot be deleted; §11 now documents the uninstall failure path and the token-less dry-run note; safeReason now returns the constant 'registration command failed' for a bare post-removal/rollback command failure (previously 'invalid configuration or platform operation failed'), still exit 3. Exit-code meanings, event schema, spool format, config keys and defaults unchanged; no version bump of the contract.
 
