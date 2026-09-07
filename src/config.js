@@ -162,9 +162,12 @@ function flushConfig(result, env, options, flags) {
       (typeof config.sink.repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.sink.repo))) throw invalid('invalid GitHub repo');
   if (config.sink.type !== 'file') checkURL(config.sink.type === 'github-issue' ? config.sink.api_base : config.sink.url, 'sink');
   for (const entry of config.notify) {
+    // Notify types were already validated above, so the terminal branch is webhook.
     if (entry.type === 'telegram') {
       if (!['string', 'number'].includes(typeof entry.chat_id) || !String(entry.chat_id).trim()) throw invalid('invalid Telegram chat_id');
-    } else if (entry.type === 'webhook') {
+    } else if (entry.type === 'slack') {
+      // The Slack URL is read from its credential file below.
+    } else {
       checkURL(entry.url, 'notify webhook');
     }
   }
