@@ -27,17 +27,23 @@ test('invalid flags, kind, meta and tail are usage errors', () => {
   assert.equal(parse(['--message=']).message, '');
 });
 test('entry help, version, flush stub and unknown commands have prescribed codes', () => {
-  for (const args of [[], ['--help'], ['emit', '--help']]) {
-    const result = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8' });
-    assert.equal(result.status, 0); assert.match(result.stdout, /Usage:/); assert.match(result.stdout, /Values starting with -- must be passed as --flag=value/); assert.equal(result.stderr, '');
-  }
-  const version = spawnSync(process.execPath, [bin, '--version'], { encoding: 'utf8' });
-  assert.equal(version.stdout.trim(), require('../package.json').version); assert.equal(version.status, 0);
-  for (const [args, code] of [[['flush'], 3], [['bogus'], 2], [['emit', '--kind=bogus', '--message=x'], 2]]) {
-    const result = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8' });
-    assert.equal(result.status, code); assert.equal(result.stdout, '');
-    assert.equal(result.stderr.trim().split('\n').length, 1);
-  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-cli-'));
+  const env = { ...process.env, ERRMETER_HOME: dir };
+  delete env.ERRMETER_CONFIG;
+  try {
+    for (const args of [[], ['--help'], ['emit', '--help']]) {
+      const result = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8', env });
+      assert.equal(result.status, 0); assert.match(result.stdout, /Usage:/); assert.match(result.stdout, /Values starting with -- must be passed as --flag=value/); assert.equal(result.stderr, '');
+    }
+    const version = spawnSync(process.execPath, [bin, '--version'], { encoding: 'utf8', env });
+    assert.equal(version.stdout.trim(), require('../package.json').version); assert.equal(version.status, 0);
+    for (const [args, code] of [[['flush'], 3], [['bogus'], 2], [['emit', '--kind=bogus', '--message=x'], 2]]) {
+      const result = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8', env });
+      assert.equal(result.status, code); assert.equal(result.stdout, '');
+      assert.equal(result.stderr.trim().split('\n').length, 1);
+      if (args[0] === 'flush') assert.equal(result.stderr.trim(), 'flush: invalid configuration');
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 test('version guard executes before loading any module on old Node', () => {
   let error = ''; let status;
