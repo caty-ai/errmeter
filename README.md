@@ -84,7 +84,7 @@ Start on one agent machine with these three things.
 | Linux, user-scope systemd | ⚠️ Unverified | Starts at login; boot needs user lingering; real-host validation pending |
 | Linux, system-scope systemd | ⚠️ Unverified | Requires validation on a real host |
 | Windows | ⚠️ Unverified | Native Task Scheduler path; real-host validation pending |
-| Node.js 18 / 20 / 22 / 24 | ✅ Local matrix | Tests run locally; no GitHub Actions |
+| Node.js 18 / 20 / 22 / 24 | ✅ Local matrix | Tests run locally on macOS (all four majors) and on a Linux VPS (Node 22, 2026-09-09); no GitHub Actions |
 | Any process that can run a command | ✅ Command interface | Call `errmeter emit` |
 | Claude Code | ✅ Hook integration | Owner-applied hooks; see integrations |
 | Codex | ✅ Notify integration | Owner-applied notify hook; see integrations |

@@ -38,6 +38,12 @@ Focused or `--allow-missing` runs do not satisfy this requirement.
 GitHub Actions is intentionally not used (owner constraint). Run the matrix on
 a VPS or a developer machine and paste its evidence into the PR.
 
+Linux evidence so far: the family VPS ran the matrix on 2026-09-09 with only
+Node 22 installed (490 passed, 0 failed; `check-node18` PASS; 18/20/24
+MISSING, see issue #14). That run confirms the suite on Linux but is not the
+four-major merge evidence; until the VPS has all four majors, that evidence
+comes from a machine that does.
+
 The deny list in `scripts/check-node18.sh` mirrors the two lists in
 [the contract, section 10](docs/contract.md#10-nodejs-18-floor-frozen):
 A covers APIs absent or experimental at Node 18.0; B covers project policy.

@@ -84,7 +84,7 @@ flowchart LR
 | Linux（用户级 systemd） | ⚠️ 未经验证 | 登录时启动；开机启动需要用户 lingering；真机验证待完成 |
 | Linux（系统级 systemd） | ⚠️ 未经验证 | 需要在真机上验证 |
 | Windows | ⚠️ 未经验证 | 原生任务计划程序路径；真机验证待完成 |
-| Node.js 18 / 20 / 22 / 24 | ✅ 本地矩阵测试 | 测试在本地运行，不使用 GitHub Actions |
+| Node.js 18 / 20 / 22 / 24 | ✅ 本地矩阵测试 | 测试在 macOS（全部四个主版本）和 Linux VPS（Node 22，2026-09-09）上本地运行，不使用 GitHub Actions |
 | 任何可执行命令的进程 | ✅ 命令行接口 | 调用 `errmeter emit` 即可 |
 | Claude Code | ✅ 钩子集成 | 由使用者自行配置钩子；详见集成文档 |
 | Codex | ✅ 通知集成 | 由使用者自行配置通知钩子；详见集成文档 |
