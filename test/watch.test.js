@@ -244,6 +244,40 @@ test('every stalled tick records the error while one context logs and emits the 
   assert.equal(emits.filter(args => args.includes('--message=' + message)).length, 2);
 });
 
+test('watcher loop failure with an HTTP transport code records the code in the emit meta and the log line, not the message', async t => {
+  const f = fixture(t), logs = [], emits = [];
+  const error = new Error('HTTP request failed');
+  error.code = 'ETIMEDOUT';
+  const { ctx } = context({ home: f.home, log: message => logs.push(message),
+    emit: args => { if (args.includes('error')) emits.push(args); return 0; }, sink: {
+      listOpenFailures: async () => { throw error; }
+    } });
+  const summary = await tick(ctx);
+  assert.deepEqual(summary.errors, ['HTTP request failed']);
+  assert.deepEqual(logs, ['HTTP request failed (ETIMEDOUT)']);
+  assert.equal(emits.length, 1);
+  assert.ok(emits[0].includes('--message=HTTP request failed'));
+  const metaIndex = emits[0].indexOf('--meta');
+  assert.ok(metaIndex >= 0);
+  assert.equal(emits[0][metaIndex + 1], 'code=ETIMEDOUT');
+  assert.equal(emits[0].some(arg => arg.startsWith('--message=') && arg.includes('(ETIMEDOUT)')), false);
+  const saved = JSON.parse(fs.readFileSync(path.join(f.home, 'state', 'last_watch.json')));
+  assert.deepEqual(saved.errors, summary.errors);
+});
+
+test('watcher loop failure without a code emits no meta and logs the bare message', async t => {
+  const f = fixture(t), logs = [], emits = [];
+  const { ctx } = context({ home: f.home, log: message => logs.push(message),
+    emit: args => { if (args.includes('error')) emits.push(args); return 0; }, sink: {
+      listOpenFailures: async () => { throw new Error('plain loop failure'); }
+    } });
+  const summary = await tick(ctx);
+  assert.deepEqual(summary.errors, ['plain loop failure']);
+  assert.deepEqual(logs, ['plain loop failure']);
+  assert.equal(emits.length, 1);
+  assert.equal(emits[0].includes('--meta'), false);
+});
+
 for (const board of ['empty', 'claimed-only', 'repaired-only']) test('budgets 17 and 60 stay silent for ' +
   (board === 'empty' ? 'an ' : 'a ') + board + ' board', async t => {
   const stamp = '2026-09-06T00:00:00.000Z';
