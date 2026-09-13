@@ -439,7 +439,7 @@ The watch text summary line carries `scanned=` / `unscanned=` and, when a tick r
 
 ## Changelog
 
-- v1.7 note (2026-09-13, #46): watcher loop errors that carry a transport `code` (`src/http.js`) now emit it as the optional meta key `code=<ETIMEDOUT|ECONNRESET|…>` and suffix the `errmeter.log` line as `<message> (<code>)`; `message` and the fingerprint are unchanged. Optional meta key added under §2 — no `fpv` bump, no versioned-surface change.
+- v1.7 note (2026-09-13, #46): watcher loop errors that carry an `error.code` (typically the transport codes set by `src/http.js`: `ETIMEDOUT|ECONNRESET|ENOTFOUND|…`; any other string code such as fs `EACCES` is carried the same way) now emit it as the optional meta key `code=<code>` and suffix the `errmeter.log` line as `<message> (<code>)`; `message` and the fingerprint are unchanged. The key is an ordinary optional meta entry already permitted by §2's generic meta rule (§2 itself is not edited) — no `fpv` bump, no versioned-surface change.
 
 - v1.7 note (2026-09-07, #39): strict config resolution validates all non-secret settings (sink repo/URL, Telegram chat_id, plain webhook URLs) before reading any credential file, so a config fault is reported ahead of a missing or unreadable credential and token-less install --dry-run no longer previews a config that watch would reject. Messages, exit codes, fields, formats, config keys and defaults unchanged.
 
