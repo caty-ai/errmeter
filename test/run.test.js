@@ -10,6 +10,7 @@ const { PassThrough } = require('node:stream');
 const { spawn, spawnSync, execFileSync } = require('node:child_process');
 const { run } = require('../src/run');
 const { parseRun: parse } = require('../src/cli');
+const { cleanEnv } = require('./fixtures/env');
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-run-test-'));
@@ -284,7 +285,7 @@ test('spawn failures return 125 and do not leave active timers', async t => {
 function subprocess(t, file, script, overrides = {}) {
   const command = args(file, { wall: Date.now() + 10000, mono: 10000, timeout: 10, script, ...overrides });
   const child = spawn(process.execPath, [path.join(__dirname, '../bin/errmeter.js'), '_run', ...command],
-    { detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+    { detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'], env: cleanEnv() });
   t.after(() => { try { child.kill('SIGKILL'); } catch (_) {} });
   let stdout = ''; let stderr = '';
   child.stdout.on('data', data => { stdout += data; }); child.stderr.on('data', data => { stderr += data; });
@@ -344,7 +345,7 @@ test('real runner survives watcher SIGKILL and independently terminates its hook
   })];
   const script = 'const p=require("node:child_process").spawn(process.execPath,' + JSON.stringify(argv) +
     ',{detached:true,stdio:["pipe","pipe","pipe"]});p.stdin.end("{}\\n");setInterval(()=>{},100);';
-  const watcher = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+  const watcher = spawn(process.execPath, ['-e', script], { stdio: 'ignore', env: cleanEnv() });
   let recorded = {};
   t.after(() => {
     watcher.kill('SIGKILL');
