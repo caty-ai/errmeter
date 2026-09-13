@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
+const { cleanEnv } = require('./fixtures/env');
 const root = path.resolve(__dirname, '..');
 const tools = path.join(root, 'tools/host-hooks');
 function fixture(t) {
@@ -19,7 +20,7 @@ function fixture(t) {
   const bin = path.join(dir, 'fake-bin'); fs.mkdirSync(bin);
   const record = path.join(dir, 'argv.jsonl');
   fs.writeFileSync(path.join(bin, 'errmeter'), '#!' + process.execPath + '\nconst fs=require("node:fs");fs.appendFileSync(process.env.RECORD,JSON.stringify({args:process.argv.slice(2),detail:process.argv.includes("--detail")?fs.readFileSync(0,"utf8"):null})+"\\n");console.log("local status");process.exit(Number(process.env.FAKE_RC||0));\n', { mode: 0o755 });
-  const env = { ...process.env, HOME: dir, TMPDIR: dir, USER: 'fixture', PATH: bin + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH, RECORD: record };
+  const env = cleanEnv({ HOME: dir, TMPDIR: dir, USER: 'fixture', PATH: bin + path.delimiter + path.dirname(process.execPath) + path.delimiter + process.env.PATH, RECORD: record });
   const run = (name, args = [], extra = {}) => spawnSync('bash', [path.join(tools, name), ...args], { env, encoding: 'utf8', ...extra });
   return { dir, original, env, run, record };
 }

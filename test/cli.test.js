@@ -6,6 +6,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const vm = require('node:vm');
+const { cleanEnv } = require('./fixtures/env');
 const { parse, UsageError } = require('../src/cli');
 const { resolveConfig, DEFAULTS } = require('../src/config');
 const bin = path.resolve(__dirname, '../bin/errmeter.js');
@@ -28,8 +29,7 @@ test('invalid flags, kind, meta and tail are usage errors', () => {
 });
 test('entry help, version, flush stub and unknown commands have prescribed codes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-cli-'));
-  const env = { ...process.env, ERRMETER_HOME: dir };
-  delete env.ERRMETER_CONFIG;
+  const env = cleanEnv({ ERRMETER_HOME: dir });
   try {
     for (const args of [[], ['--help'], ['emit', '--help']]) {
       const result = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8', env });
