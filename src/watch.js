@@ -19,17 +19,18 @@ function recordError(ctx, error, errors = ctx.errors) {
   errors.push(message);
   return message;
 }
-function emitError(ctx, message) {
-  ctx.log(message);
+function emitError(ctx, message, code) {
+  ctx.log(code ? message + ' (' + code + ')' : message);
   try {
     ctx.emit([...commandFlags(ctx), '--agent', 'watcher/' + ctx.config.watch.watcher_id,
-      '--kind', 'error', '--message=' + message, '--no-flush', '--quiet'], ctx.env,
+      '--kind', 'error', '--message=' + message, ...(code ? ['--meta', 'code=' + code] : []), '--no-flush', '--quiet'], ctx.env,
     { stderr: ctx.log, stdout: () => {} });
   } catch (_) { /* Reporting a loop error must not recurse. */ }
 }
 function reportError(ctx, error, errors = ctx.errors) {
   const message = recordError(ctx, error, errors);
-  emitError(ctx, message);
+  const code = error && error.code != null ? String(error.code) : '';
+  emitError(ctx, message, code || undefined);
 }
 async function upsertNeedsHuman(ctx, issue, summary, failures = ctx.config.watch.escalate_after) {
   const url = issue.url || (ctx.config.sink?.repo ? 'https://github.com/' + ctx.config.sink.repo + '/issues/' + issue.ref : 'issue ' + issue.ref);
