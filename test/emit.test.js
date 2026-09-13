@@ -11,6 +11,7 @@ process.once('exit', () => {
 const { spawn } = require('node:child_process');
 const { emit } = require('../src/emit');
 const { fingerprint } = require('../src/fingerprint');
+const { cleanEnv } = require('./fixtures/env');
 function workspace(t, config) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-emit-'));
   temporaryHomes.push(home);
@@ -98,7 +99,7 @@ test('unreadable detail and write failure produce at most one diagnostic; quiet 
 test('20 concurrent CLI emits write 20 distinct valid pending events', async t => {
   const home = workspace(t); const bin = path.resolve(__dirname, '../bin/errmeter.js');
   await Promise.all(Array.from({ length: 20 }, (_, i) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [bin, 'emit', '--message=event ' + i, '--no-flush', '--quiet'], { env: { ...process.env, ERRMETER_HOME: home, ERRMETER_CONFIG: path.join(home, 'config.json') }, stdio: 'pipe' });
+    const child = spawn(process.execPath, [bin, 'emit', '--message=event ' + i, '--no-flush', '--quiet'], { env: cleanEnv({ ERRMETER_HOME: home, ERRMETER_CONFIG: path.join(home, 'config.json') }), stdio: 'pipe' });
     let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
     child.on('error', reject); child.on('close', code => { try { assert.equal(code, 0); assert.equal(stderr, ''); resolve(); } catch (error) { reject(error); } });
   })));

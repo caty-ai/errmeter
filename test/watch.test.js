@@ -15,6 +15,7 @@ const { parseWatch, parseRun } = require('../src/cli');
 const { request } = require('../src/http');
 const githubSink = require('../src/sinks/github-issue');
 const { createGithubFake } = require('./fixtures/github-fake');
+const { cleanEnv } = require('./fixtures/env');
 
 function fixture(t, config = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'errmeter-watch-test-'));
@@ -695,7 +696,7 @@ test('real watch CLI reports a tiny watcher budget as exit 3 before startup', t 
   const f = fixture(t, { watch: { role: 'watcher', watcher_id: 'test',
     dispatch: { command: [process.execPath, '-e', ''] } }, max_api_calls_per_pass: 5 });
   const result = spawnSync(process.execPath, [path.resolve(__dirname, '../bin/errmeter.js'), 'watch', '--once'], {
-    env: { ...process.env, ...f.env }, encoding: 'utf8'
+    env: cleanEnv(f.env), encoding: 'utf8'
   });
   assert.equal(result.status, 3, result.stderr);
   assert.equal(result.stdout, '');
@@ -952,7 +953,7 @@ test('two full GitHub watchers elect one claim and run exactly one hook', async 
   });
   function launch(home) {
     const child = spawn(process.execPath, [cli, 'watch', '--once', '--quiet'],
-      { env: { ...process.env, ERRMETER_HOME: home, ERRMETER_GITHUB_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
+      { env: cleanEnv({ ERRMETER_HOME: home, ERRMETER_GITHUB_TOKEN: token }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = ''; child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
     return new Promise((resolve, reject) => { child.once('error', reject); child.once('close', code => resolve({ code, stdout, stderr })); });
   }
